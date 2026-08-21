@@ -1,0 +1,324 @@
+// src/elevate_client.pdx -- libpdx-elevate.M1-002 (paideia-os/libpdx-elevate#2)
+//
+// svc.elevate-broker binding + block-on-reply skeleton.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The client half of the R48.M7 elevate protocol:
+//
+//   * Canonical name binding for svc.elevate-broker (mirror of the
+//     paideia-os ElevateBroker.elevate_broker_name constant at
+//     src/kernel/core/ipc/elevate_broker.pdx:50) so a client library
+//     user does not need to spell the string themselves and cannot
+//     accidentally register under a shifted name.
+//   * elevate_client_lookup_broker() -- wraps svc_lookup with the
+//     canonical (name_ptr, name_len) pair.  Returns the u16 endpoint_id
+//     (zero-extended to u64) on hit or SVC_LOOKUP_NONE on miss.
+//   * elevate_client_request(caps, dur, req_buf, reply_buf) -- the
+//     M1 block-on-reply SKELETON: assemble the REQ frame into req_buf
+//     (via elevate_request_write_frame), resolve the broker via
+//     elevate_client_lookup_broker, and return ELVC_STUB.  The actual
+//     endpoint_invoke + block-on-recv arrive at M2 alongside the
+//     policy-consult (auto-approve) and human-approve paths.
+//   * _elevate_client_stats -- eight-word counter table so the client's
+//     own health is observable independently of the broker's stats.
+//     Same shape as ElevateBroker._elevate_broker_stats.
+//
+// =============================================================================
+// WHY "STUB" IS THE HAPPY PATH AT M1
+// =============================================================================
+//
+// The paideia-os broker itself only lands the SEAM at R48b substrate-
+// prep (#1627): elevate_broker_dispatch is a stub that recognises the
+// three wire ops (REQ / APR / EXP) and returns ELVB_DISPATCH_STUB
+// (0xFFFFEBFB) for every one of them, without a daemon body to consume
+// them.  A client that "sends a REQ and blocks on reply" against that
+// broker cannot receive a real APR -- there is no policy consult and
+// no approver hop yet.  Rather than fake an APR at M1, this skeleton
+// stops one step short: everything up to and INCLUDING the endpoint
+// resolution happens, and the return is ELVC_STUB.  At M2 the same
+// entry point is extended to actually invoke the endpoint (once the
+// broker's daemon body exists) and the return codes shift to
+// ELVC_OK / ELVC_ERR_TIMEOUT / ELVC_ERR_DENIED.
+//
+// =============================================================================
+// ERROR BAND 0xFFFFEA00..0xFFFFEA0F
+// =============================================================================
+//
+//   0xFFFFEA00  ELVC_STUB            -- M1 happy path (validated + resolved)
+//   0xFFFFEA0B  ELVC_ERR_BAD_BUF     -- req_buf or reply_buf is 0
+//   0xFFFFEA0C  ELVC_ERR_RECV_FAIL   -- M2+: block-on-reply gave up
+//   0xFFFFEA0D  ELVC_ERR_SEND_FAIL   -- M2+: endpoint_invoke refused
+//   0xFFFFEA0E  ELVC_ERR_PACK_FAIL   -- underlying elevate_request pack refused
+//   0xFFFFEA0F  ELVC_ERR_LOOKUP_FAIL -- svc.elevate-broker not registered
+//
+// The band sits above the 0xFFFFE5E* wire-error band (ELV_ERR_*) so a
+// caller can inspect a single return value and tell "the request could
+// not be built" (ELV_ERR_*) from "the request could not be delivered"
+// (ELVC_ERR_*) without knowing the internal call graph.
+
+module ElevateClient = structure {
+
+  // ---- Canonical name -- mirror of paideia-os ElevateBroker.elevate_broker_name ----
+  //
+  // 20 bytes = "svc.elevate-broker" (18) + NUL + pad.  The pad exists so
+  // the constant is a whole multiple of 4 bytes (the assembler prefers
+  // this for .rodata placement) and so a future rename to a slightly
+  // longer name does not immediately have to grow the buffer.
+  pub let elevate_broker_name : [u8; 20] = "svc.elevate-broker\0\0"
+  pub let ELEVATE_BROKER_NAME_LEN : u64 = 18   // strlen("svc.elevate-broker")
+
+  // ---- Result codes ----
+
+  pub let ELVC_OK                : u64 = 0
+  pub let ELVC_STUB              : u64 = 0xFFFFEA00
+  pub let ELVC_ERR_BAD_BUF       : u64 = 0xFFFFEA0B
+  pub let ELVC_ERR_RECV_FAIL     : u64 = 0xFFFFEA0C
+  pub let ELVC_ERR_SEND_FAIL     : u64 = 0xFFFFEA0D
+  pub let ELVC_ERR_PACK_FAIL     : u64 = 0xFFFFEA0E
+  pub let ELVC_ERR_LOOKUP_FAIL   : u64 = 0xFFFFEA0F
+
+  // ---- Sentinel mirrored from paideia-os SvcBroker.SVC_LOOKUP_NONE ----
+
+  pub let SVC_LOOKUP_NONE : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ---- Client-side stats table ----
+  //
+  // Same shape as ElevateBroker._elevate_broker_stats: eight u64 slots,
+  // cache-line aligned, bounded increment via elevate_client_note,
+  // bounded read via elevate_client_stat.  Slots:
+  //
+  //   0 ELVC_ST_LOOKUPS   svc_lookup calls that returned a live id
+  //   1 ELVC_ST_REQUESTS  REQ frames successfully assembled
+  //   2 ELVC_ST_REPLIES   APR frames successfully received (M2+)
+  //   3 ELVC_ST_ERRORS    any error path taken
+  //   4 ELVC_ST_STUBS     M1 happy path (validated + resolved, no dispatch)
+  //   5..7 reserved       for M2/M3 (auto-approve hits, human timeouts,
+  //                       journal write failures)
+
+  pub let mut _elevate_client_stats : [u64; 8] = uninit @align(64)
+
+  pub let ELVC_ST_LOOKUPS  : u64 = 0
+  pub let ELVC_ST_REQUESTS : u64 = 1
+  pub let ELVC_ST_REPLIES  : u64 = 2
+  pub let ELVC_ST_ERRORS   : u64 = 3
+  pub let ELVC_ST_STUBS    : u64 = 4
+  pub let ELVC_ST_MAX      : u64 = 8
+
+  pub let elevate_client_stats_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M1-002 (#2): clear the eight-word client counter table. Startup + teardown only (a live counter reset would race any concurrent elevate_client_note). Same shape as elevate_broker_stats_reset at src/kernel/core/ipc/elevate_broker.pdx:70. Labels prefixed elc_rs_.",
+      block: {
+        lea r10, [rip + _elevate_client_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      elc_rs_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  elc_rs_loop;
+        ret
+      }
+    }
+
+  pub let elevate_client_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M1-002 (#2): bounded increment; out-of-range which is a no-op (not an error) so a caller passing a slot from a newer library version against an older linker snapshot cannot corrupt live counters. Same shape as elevate_broker_note. Labels prefixed elc_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae elc_nt_out;
+        lea r10, [rip + _elevate_client_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      elc_nt_out:
+        ret
+      }
+    }
+
+  pub let elevate_client_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M1-002 (#2): bounded read; out-of-range which returns 0 (not an error sentinel -- a slot's count IS zero if it has never been incremented, so 0 is the correct answer for both 'never touched' and 'out of range'). Same shape as elevate_broker_stat. Labels prefixed elc_st_.",
+      block: {
+        cmp rdi, 8;
+        jae elc_st_zero;
+        lea r10, [rip + _elevate_client_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      elc_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_lookup_broker() -> endpoint_id | SVC_LOOKUP_NONE
+  //
+  // Resolve the canonical "svc.elevate-broker" name to its endpoint_id
+  // via the R20b service registry (svc_lookup at
+  // src/kernel/core/ipc/svc_broker.pdx:281).
+  //
+  // Returns:
+  //   endpoint_id      u16 zero-extended to u64 (valid range [0..127])
+  //   SVC_LOOKUP_NONE  0xFFFFFFFFFFFFFFFF -- the broker is not registered
+  //                    (elevate_broker_register at R48b substrate-prep
+  //                    has not yet been called at boot, or the entry was
+  //                    displaced by a future unregister path)
+  //
+  // Bumps ELVC_ST_LOOKUPS on the OK path; ELVC_ST_ERRORS on miss.
+  // ==========================================================================
+
+  pub let elevate_client_lookup_broker : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M1-002 (#2): call svc_lookup with the canonical (name_ptr, name_len) pair. One callee-save push (r12 = raw svc_lookup return, so the miss discriminator has a stable operand across the elevate_client_note call) + sub rsp, 8 aligns the stack for the nested calls. SVC_LOOKUP_NONE (0xFFFFFFFFFFFFFFFF) exceeds imm32 so it is staged in r10 for the compare. Labels prefixed elc_lb_.",
+      block: {
+        push r12;
+        sub rsp, 8;                      // align
+
+        lea rdi, [rip + elevate_broker_name];
+        mov rsi, 18;                     // ELEVATE_BROKER_NAME_LEN
+        call svc_lookup;
+        mov r12, rax;
+
+        mov r10, 0xFFFFFFFFFFFFFFFF;     // SVC_LOOKUP_NONE
+        cmp r12, r10;
+        je  elc_lb_miss;
+
+        // Hit -- bump ELVC_ST_LOOKUPS.
+        mov rdi, 0;                      // ELVC_ST_LOOKUPS
+        call elevate_client_note;
+        mov rax, r12;
+        add rsp, 8;
+        pop r12;
+        ret;
+
+      elc_lb_miss:
+        // Miss -- bump ELVC_ST_ERRORS and return the sentinel.
+        mov rdi, 3;                      // ELVC_ST_ERRORS
+        call elevate_client_note;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        mov rax, r10;
+        add rsp, 8;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_request(caps, dur, req_buf, reply_buf) -> ELVC_*
+  //
+  // The M1 skeleton for the send-and-block-on-reply flow.  Sequence:
+  //
+  //   (1) Gate req_buf != 0 AND reply_buf != 0 -> ELVC_ERR_BAD_BUF.
+  //   (2) elevate_request_write_frame(req_buf, caps, dur) -- assemble
+  //       the REQ frame into caller-provided scratch.  Any pack error
+  //       propagates as ELVC_ERR_PACK_FAIL (the specific ELV_ERR_* is
+  //       observable in the caller's own error path via a second call
+  //       to the packer if they need the sub-classification -- keeping
+  //       the client return band flat).
+  //   (3) elevate_client_lookup_broker() -- resolve svc.elevate-broker
+  //       to an endpoint id.  Miss -> ELVC_ERR_LOOKUP_FAIL.
+  //   (4) M1 stop: return ELVC_STUB.  At M2 this is where
+  //       endpoint_invoke(broker_ep, req_buf) + block-on-recv(reply_buf)
+  //       land, and the return band shifts to
+  //       ELVC_OK / ELVC_ERR_SEND_FAIL / ELVC_ERR_RECV_FAIL.
+  //
+  // reply_buf is validated non-null at M1 (see (1)) but not touched
+  // beyond that, so a caller migrating from M1 to M2 does not need to
+  // change their call site to pass an additional buffer.
+  //
+  // Register plan:
+  //   r12 = caps         (saved across nested calls)
+  //   r13 = dur
+  //   r14 = req_buf
+  //   r15 = reply_buf    (M1: gate-only; M2: recv-into)
+  // Four callee-save pushes = 32 bytes; keeps rsp%16 stable across
+  // three nested calls (write_frame, lookup_broker, client_note).
+  // ==========================================================================
+
+  pub let elevate_client_request : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (caps: u64) (dur: u64) (req_buf: u64) (reply_buf: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M1-002 (#2): the client-side skeleton for the send-then-block flow. Four callee-save pushes (r12=caps, r13=dur, r14=req_buf, r15=reply_buf) preserve the args across three nested calls (elevate_request_write_frame, elevate_client_lookup_broker, elevate_client_note) so the argument sources are unambiguous at every fork. Each error path bumps ELVC_ST_ERRORS before returning so the client's own stats table records the failure without needing the caller to touch the journal. The reply_buf gate at M1 refuses a 0 pointer up-front so a caller migrating to M2's block-on-recv cannot accidentally write to address 0; M1 does not touch reply_buf beyond the gate. SVC_LOOKUP_NONE (0xFFFFFFFFFFFFFFFF) is staged in r10 for the miss compare. Labels prefixed elc_rq_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                    // caps
+        mov r13, rsi;                    // dur
+        mov r14, rdx;                    // req_buf
+        mov r15, rcx;                    // reply_buf
+
+        cmp r14, 0;
+        je  elc_rq_bad_buf;
+        cmp r15, 0;
+        je  elc_rq_bad_buf;
+
+        // (2) Assemble REQ frame into req_buf.
+        mov rdi, r14;
+        mov rsi, r12;
+        mov rdx, r13;
+        call elevate_request_write_frame;
+        cmp rax, 0;
+        jne elc_rq_pack_fail;
+
+        // Frame assembled -- bump ELVC_ST_REQUESTS.
+        mov rdi, 1;                      // ELVC_ST_REQUESTS
+        call elevate_client_note;
+
+        // (3) Resolve broker endpoint.
+        call elevate_client_lookup_broker;
+        mov r10, 0xFFFFFFFFFFFFFFFF;     // SVC_LOOKUP_NONE
+        cmp rax, r10;
+        je  elc_rq_lookup_fail;
+
+        // (4) M1 stop -- endpoint resolved; real dispatch is M2.
+        mov rdi, 4;                      // ELVC_ST_STUBS
+        call elevate_client_note;
+        mov rax, 0xFFFFEA00;             // ELVC_STUB
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elc_rq_pack_fail:
+        mov rdi, 3;                      // ELVC_ST_ERRORS
+        call elevate_client_note;
+        mov rax, 0xFFFFEA0E;             // ELVC_ERR_PACK_FAIL
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elc_rq_lookup_fail:
+        mov rdi, 3;                      // ELVC_ST_ERRORS
+        call elevate_client_note;
+        mov rax, 0xFFFFEA0F;             // ELVC_ERR_LOOKUP_FAIL
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elc_rq_bad_buf:
+        mov rdi, 3;                      // ELVC_ST_ERRORS
+        call elevate_client_note;
+        mov rax, 0xFFFFEA0B;             // ELVC_ERR_BAD_BUF
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}
