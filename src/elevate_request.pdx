@@ -1,0 +1,310 @@
+// src/elevate_request.pdx -- libpdx-elevate.M1-001 (paideia-os/libpdx-elevate#1)
+//
+// Client-side elevate request builder.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The library-side mirror of paideia-os's ElevateChannel wire schema
+// (src/kernel/core/ipc/elevate_channel.pdx, R48.M7-001 #1549).  Provides:
+//
+//   * The wire constants (ELV_OP_*, ELV_CAP_MASK_VALID, ELV_DUR_MIN/MAX_NS,
+//     ELV_ERR_* band) so a client library user does not need to link the
+//     paideia-os kernel tree to name them.
+//   * The REQ-frame layout offsets (ELEVATE_REQ_OFF_*) and total size
+//     (ELEVATE_REQ_FRAME_BYTES).
+//   * Client-side validators (elevate_request_cap_mask_valid,
+//     elevate_request_duration_valid) that mirror the kernel's
+//     elv_mask_valid / elv_dur_valid so an ill-formed request can be
+//     refused before the broker sees it (a mis-behaved client wastes
+//     both a broker cycle and an audit-journal entry otherwise).
+//   * elevate_request_pack_op_word(caps, dur) -- the op-word packer
+//     that mirrors the kernel's elv_pack_req at
+//     src/kernel/core/ipc/elevate_channel.pdx:171.  Returns the packed
+//     op word (op | (caps << 8)) on success or an ELV_ERR_* code.
+//   * elevate_request_write_frame(buf, caps, dur) -- assembles a full
+//     32-byte REQ frame (op_word + caps body + duration body + reserved
+//     body) into a caller-provided buffer.  This is the "build a
+//     request struct, pack it" half of the M1 baseline; the "send to
+//     svc.elevate-broker, block on reply" half lives in
+//     elevate_client.pdx (M1-002 / issue #2).
+//
+// =============================================================================
+// WHY REDECLARE THE WIRE CONSTANTS
+// =============================================================================
+//
+// paideia-os owns the authoritative declarations in ElevateChannel.
+// This library ships as a SEPARATE repo (paideia-os/libpdx-elevate) that
+// is not obligated to link against the kernel .o graph at build time --
+// a downstream tool (pkg, cp, mv, rm) links libpdx-elevate but does not
+// necessarily link every ipc/*.o.  Redeclaring the wire constants here
+// with an explicit "mirror of kernel ElevateChannel.<name>" pointer
+// keeps the client library self-sufficient AND documents the invariant
+// that the two must move together.  Any drift is caught at M4 by the
+// smoke matrix comparing packer outputs against the kernel's own
+// elv_pack_req over the same (caps, dur) inputs.
+//
+// =============================================================================
+// WIRE FRAME (REQ)
+// =============================================================================
+//
+// A REQ frame is 32 bytes on the wire:
+//
+//   [0..8)   op_word     packed: [7:0]=ELV_OP_REQ, [23:8]=caps, [63:24]=0
+//   [8..16)  caps        u64 body word 0 -- authoritative caps bitmask
+//   [16..24) duration_ns u64 body word 1 -- requested duration in ns
+//   [24..32) reserved    u64 body word 2 -- always 0
+//
+// The op_word encoding is redundant with body word 0 (caps appears in
+// both) by design: the kernel packer keeps the caps bitmask in the op
+// word so a fast-path approver can classify a REQ without decoding the
+// body.  The body carries the same value so the audit journal has a
+// single canonical source when the record is materialised.
+//
+// =============================================================================
+// ERROR BAND 0xFFFFE5E0..0xFFFFE5EF (shared with kernel ElevateChannel)
+// =============================================================================
+//
+//   0xFFFFE5EA  ELV_ERR_BAD_BUF   (NEW -- client-side: buf pointer null)
+//   0xFFFFE5EB  ELV_ERR_BAD_GRANT (kernel: approver invariant violated)
+//   0xFFFFE5EC  ELV_ERR_BAD_RSV   (kernel: reserved-bit set)
+//   0xFFFFE5ED  ELV_ERR_BAD_DUR   (both: duration out of [1s, 1h])
+//   0xFFFFE5EE  ELV_ERR_BAD_MASK  (both: reserved-bit set or mask == 0)
+//   0xFFFFE5EF  ELV_ERR_BAD_OP    (kernel: op not in [1,3])
+//
+// Codes 0xFFFFE5E0..0xFFFFE5E9 stay reserved for future client-side
+// errors (see also libpdx-elevate ELVC_* band in elevate_client.pdx,
+// which occupies 0xFFFFEA00..0xFFFFEA0F).
+
+module ElevateRequest = structure {
+
+  // ---- Wire constants -- mirror of paideia-os ElevateChannel ----
+
+  pub let ELV_OP_REQ    : u64 = 0x01
+  pub let ELV_OP_APR    : u64 = 0x02
+  pub let ELV_OP_EXP    : u64 = 0x03
+  pub let ELV_OP_MAX    : u64 = 0x03
+
+  pub let ELV_CAP_MASK_VALID : u64 = 0x00FF   // bits 0..7
+
+  pub let ELV_DUR_MIN_NS : u64 = 1000000000            // 1 sec
+  pub let ELV_DUR_MAX_NS : u64 = 3600000000000         // 1 hour
+
+  pub let ELV_OK             : u64 = 0
+  pub let ELV_ERR_BAD_BUF    : u64 = 0xFFFFE5EA
+  pub let ELV_ERR_BAD_GRANT  : u64 = 0xFFFFE5EB
+  pub let ELV_ERR_BAD_RSV    : u64 = 0xFFFFE5EC
+  pub let ELV_ERR_BAD_DUR    : u64 = 0xFFFFE5ED
+  pub let ELV_ERR_BAD_MASK   : u64 = 0xFFFFE5EE
+  pub let ELV_ERR_BAD_OP     : u64 = 0xFFFFE5EF
+
+  // ---- REQ frame layout ----
+
+  pub let ELEVATE_REQ_FRAME_BYTES : u64 = 32
+  pub let ELEVATE_REQ_OFF_OP      : u64 = 0
+  pub let ELEVATE_REQ_OFF_CAPS    : u64 = 8
+  pub let ELEVATE_REQ_OFF_DUR     : u64 = 16
+  pub let ELEVATE_REQ_OFF_RSV     : u64 = 24
+
+  // ==========================================================================
+  // elevate_request_cap_mask_valid(mask) -> 1 | 0
+  //
+  // 1 iff mask != 0 AND no reserved bits (8..63) are set.
+  //
+  // Mirror of kernel elv_mask_valid at
+  // src/kernel/core/ipc/elevate_channel.pdx:114.  Same discipline: a REQ
+  // that names no caps is not honoured (nothing to grant), and a mask
+  // with a reserved bit is refused rather than silently masked.
+  // ==========================================================================
+
+  pub let elevate_request_cap_mask_valid : (u64) -> u64 !{} @{} =
+    fn (mask: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-elevate.M1-001 (#1): mirror of kernel elv_mask_valid. 1 iff mask != 0 AND (mask & 0xFF) == mask (no reserved bits). Uses `mov r10, 0xFF; and rax, r10; cmp rax, rdi` to detect reserved bits without a NOT instruction -- same trick as the kernel mirror. Leaf function; no callee-save writes. Labels prefixed elreq_mv_.",
+      block: {
+        cmp rdi, 0;
+        je  elreq_mv_no;
+        mov rax, rdi;
+        mov r10, 0xFF;
+        and rax, r10;
+        cmp rax, rdi;
+        jne elreq_mv_no;
+        mov rax, 1;
+        ret;
+      elreq_mv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_request_duration_valid(dur) -> 1 | 0
+  //
+  // 1 iff dur in [ELV_DUR_MIN_NS, ELV_DUR_MAX_NS].
+  //
+  // Mirror of kernel elv_dur_valid at
+  // src/kernel/core/ipc/elevate_channel.pdx:141.  Both endpoints exceed
+  // imm32 so they are staged in r10/r11 per the paideia-as compliance
+  // discipline (no `cmp reg, imm64`).
+  // ==========================================================================
+
+  pub let elevate_request_duration_valid : (u64) -> u64 !{} @{} =
+    fn (dur: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-elevate.M1-001 (#1): mirror of kernel elv_dur_valid. Both bounds (1e9 ns and 3.6e12 ns) exceed imm32; staged in r10 / r11 for the compare. Leaf function. Labels prefixed elreq_dv_.",
+      block: {
+        mov r10, 1000000000;             // ELV_DUR_MIN_NS
+        cmp rdi, r10;
+        jb  elreq_dv_no;
+        mov r11, 3600000000000;          // ELV_DUR_MAX_NS
+        cmp rdi, r11;
+        ja  elreq_dv_no;
+        mov rax, 1;
+        ret;
+      elreq_dv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_request_pack_op_word(caps, dur) -> op_word | ELV_ERR_*
+  //
+  // Op-word encoding:
+  //   [7:0]  op = ELV_OP_REQ
+  //   [23:8] caps_bitmask (16 bits, but constrained to 8 by mask valid)
+  //   [63:24] reserved 0
+  //
+  // Mirror of kernel elv_pack_req at
+  // src/kernel/core/ipc/elevate_channel.pdx:171.  Note: the packer only
+  // produces the op word.  The duration is validated here but is carried
+  // separately in body word 1 (see elevate_request_write_frame).
+  // ==========================================================================
+
+  pub let elevate_request_pack_op_word : (u64, u64) -> u64 !{} @{} =
+    fn (caps: u64) (dur: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-elevate.M1-001 (#1): mirror of kernel elv_pack_req. Gates: (1) elevate_request_cap_mask_valid -> BAD_MASK. (2) elevate_request_duration_valid -> BAD_DUR. Composition: op | (caps & 0xFF) << 8. Two callee-save pushes (r12, r13) preserve caps + dur across the nested validator calls; r12 = caps, r13 = dur. Two pushes = 16 bytes, keeps rsp%16 stable across the nested calls (same disipline as elevate_broker_register / elev_pack_req). Labels prefixed elreq_po_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rdi;                    // caps
+        mov r13, rsi;                    // dur
+
+        mov rdi, r12;
+        call elevate_request_cap_mask_valid;
+        cmp rax, 0;
+        je  elreq_po_bad_mask;
+
+        mov rdi, r13;
+        call elevate_request_duration_valid;
+        cmp rax, 0;
+        je  elreq_po_bad_dur;
+
+        mov rax, 1;                      // ELV_OP_REQ
+        mov r10, r12;
+        and r10, 0xFF;
+        shl r10, 8;
+        or  rax, r10;
+        pop r13;
+        pop r12;
+        ret;
+
+      elreq_po_bad_mask:
+        mov rax, 0xFFFFE5EE;             // ELV_ERR_BAD_MASK
+        pop r13;
+        pop r12;
+        ret;
+      elreq_po_bad_dur:
+        mov rax, 0xFFFFE5ED;             // ELV_ERR_BAD_DUR
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_request_write_frame(buf, caps, dur) -> ELV_OK | ELV_ERR_*
+  //
+  // Assemble a full 32-byte REQ frame at the caller-provided buffer:
+  //
+  //   [buf +  0]  op_word    from elevate_request_pack_op_word
+  //   [buf +  8]  caps       body word 0 -- authoritative caps bitmask
+  //   [buf + 16]  duration   body word 1 -- requested duration in ns
+  //   [buf + 24]  reserved   body word 2 -- always 0
+  //
+  // Return codes:
+  //   ELV_OK           frame written; every field validated.
+  //   ELV_ERR_BAD_BUF  buf is 0 (nullptr) -- the library never writes to 0.
+  //   ELV_ERR_BAD_MASK caps mask invalid; buf UNCHANGED.
+  //   ELV_ERR_BAD_DUR  duration out of range; buf UNCHANGED.
+  //
+  // The discriminator for pack failure vs success: a valid packed op
+  // word has bits [63:24] == 0 (op fits in 8 bits + caps mask fits in
+  // 16 bits = 24 bits total).  Every ELV_ERR_* code is in the 0xFFFF...
+  // band, so `shr rax, 24; jnz` cleanly discriminates.
+  // ==========================================================================
+
+  pub let elevate_request_write_frame : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (buf: u64) (caps: u64) (dur: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M1-001 (#1): assemble a full 32-byte REQ frame into caller-provided buf. Three callee-save pushes (r12=buf, r13=caps, r14=dur) + one alignment pad (sub rsp, 8) = 32 bytes, keeps rsp aligned across the nested pack call. Buf gate refuses buf==0 up-front, so a null-deref never reaches the store instructions. On pack failure the ELV_ERR_* code from the packer propagates unchanged; buf is left UNMODIFIED so the caller can distinguish 'nothing written' from 'partial write' (there is no partial-write path -- the four stores happen only after every gate passes). Labels prefixed elreq_wf_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;                      // align
+
+        cmp rdi, 0;
+        je  elreq_wf_bad_buf;
+
+        mov r12, rdi;                    // buf
+        mov r13, rsi;                    // caps
+        mov r14, rdx;                    // dur
+
+        mov rdi, r13;
+        mov rsi, r14;
+        call elevate_request_pack_op_word;
+        // rax = op_word (valid: bits [63:24] == 0) OR ELV_ERR_* (0xFFFF... band).
+        mov r10, rax;
+        shr r10, 24;
+        cmp r10, 0;
+        jne elreq_wf_pack_err;
+
+        // op_word -> [buf + 0]
+        mov [r12 + 0], rax;
+        // caps -> [buf + 8]
+        mov [r12 + 8], r13;
+        // dur -> [buf + 16]
+        mov [r12 + 16], r14;
+        // reserved (0) -> [buf + 24]
+        xor rax, rax;
+        mov [r12 + 24], rax;
+
+        xor rax, rax;                    // ELV_OK
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elreq_wf_pack_err:
+        // rax already carries the ELV_ERR_* value from the packer.
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elreq_wf_bad_buf:
+        mov rax, 0xFFFFE5EA;             // ELV_ERR_BAD_BUF
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}
