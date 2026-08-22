@@ -1,0 +1,521 @@
+// src/elevate_client_cap.pdx -- libpdx-elevate.M2-003 (paideia-os/libpdx-elevate#5)
+//
+// Cap<KIND_ELEVATE_CHANNEL> with bounded-lifetime self-invalidation.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Mint + lifecycle wrapper around the kernel-side
+// KIND_ELEVATE_CHANNEL (0x191) capability at src/kernel/core/cap/
+// kind_elevate_channel.pdx.  Provides the client library the two
+// affordances the M2 charter names:
+//
+//   (a) Mint a cap after a successful ElevateRequest APR reply, using
+//       the granted caps + expire_ns from reply_buf as inputs.
+//   (b) Self-invalidate the cap at deadline -- the client-side
+//       deadline map lets a caller ask "is this row still live?" or
+//       "revoke this row iff its deadline has passed", so the cap
+//       stops being useful the instant its bounded lifetime is up
+//       without waiting on a kernel-side EXP broadcast.
+//
+// =============================================================================
+// WHY A CLIENT-SIDE DEADLINE MAP
+// =============================================================================
+//
+// The kernel row layout at kind_elevate_channel.pdx §1 has an
+// expire_ns field at [+32] but the mint walker
+// (elevate_channel_cap_mint_inner) hard-codes expire_ns = 0 (see the
+// call to elevate_channel_tail_alloc at that file line 733).  There
+// is no exported "set_expire_ns after mint" helper today; adding one
+// crosses into the kernel-side elevate substrate rather than sitting
+// in this repo.  Rather than block M2 on a paideia-os change, the
+// M2 wrapper mints via the existing kernel entry point and shadows
+// the deadline in a per-library map keyed by row_id.  A follow-up
+// (filed as a note to paideia-os for a variant mint accepting
+// expire_ns) will collapse this map back into the row's own +32
+// slot; the API here is designed to make that migration a no-op for
+// callers -- elevate_client_cap_bind_expire and elevate_client_cap_
+// check_and_revoke keep their signatures.
+//
+// The map is 16 slots to match the kernel table's ELVC_MAX (16 rows);
+// a row's shadow deadline is stored at slot row_id.  A 0 deadline
+// means "no lifetime bound" (equivalent to the kernel's default).
+//
+// =============================================================================
+// LIBPDX-CAP.M2 DEPENDENCY
+// =============================================================================
+//
+// The design at r49-r50-plan.md §5.14 notes libpdx-elevate.M2 depends
+// on libpdx-cap.M2 for cap-narrowing of the returned sub-caps (i.e.
+// after the elevate channel exists, downstream tools may narrow the
+// KIND_ELEVATE_CHANNEL rights before handing it to a helper).
+// libpdx-cap.M2 has NOT landed at the time of libpdx-elevate.M2 -- so
+// the narrowing site is STUBBED via elevate_client_cap_narrow_stub
+// below, which returns the caller's rights unchanged plus an ELCC_
+// NOTE_NO_NARROW status code so an upstream that mistakes the stub
+// for a full narrow gets a compile-time discoverable signal.  When
+// libpdx-cap.M2 lands, replace the stub body with a call to
+// libpdx-cap's cap_narrow_rights entry point.
+//
+// =============================================================================
+// ERROR / STATUS BAND 0xFFFFEA30..0xFFFFEA3F
+// =============================================================================
+//
+//   0xFFFFEA30  ELCC_ERR_BAD_ROW      -- row_id >= 16
+//   0xFFFFEA31  ELCC_ERR_MINT_FAIL    -- kernel mint refused (BAD_PARENT etc.)
+//   0xFFFFEA32  ELCC_ERR_NO_DEADLINE  -- check requested on a row with 0 deadline
+//   0xFFFFEA33  ELCC_ERR_REVOKE_FAIL  -- kernel revoke refused (already-freed etc.)
+//   0xFFFFEA34  ELCC_STATE_LIVE       -- row is live, deadline not yet reached
+//   0xFFFFEA35  ELCC_STATE_EXPIRED    -- deadline has passed (row still in table
+//                                        pending an explicit revoke)
+//   0xFFFFEA36  ELCC_STATE_REVOKED    -- row was expired AND we just revoked it
+//   0xFFFFEA37  ELCC_NOTE_NO_NARROW   -- narrowing stub reached (libpdx-cap.M2
+//                                        not yet available); rights returned
+//                                        unchanged, caller should treat as advisory.
+
+module ElevateClientCap = structure {
+
+  // ---- Kernel-side constants mirrored for local use ----
+
+  pub let ELCC_KIND_ELEVATE_CHANNEL : u64 = 0x191
+  pub let ELCC_MAX_ROWS             : u64 = 16
+  pub let ELCC_STATE_REQUESTED      : u64 = 1
+
+  // ---- Result codes / status band 0xFFFFEA30..0xFFFFEA3F ----
+
+  pub let ELCC_OK                : u64 = 0
+  pub let ELCC_ERR_BAD_ROW       : u64 = 0xFFFFEA30
+  pub let ELCC_ERR_MINT_FAIL     : u64 = 0xFFFFEA31
+  pub let ELCC_ERR_NO_DEADLINE   : u64 = 0xFFFFEA32
+  pub let ELCC_ERR_REVOKE_FAIL   : u64 = 0xFFFFEA33
+  pub let ELCC_STATE_LIVE        : u64 = 0xFFFFEA34
+  pub let ELCC_STATE_EXPIRED     : u64 = 0xFFFFEA35
+  pub let ELCC_STATE_REVOKED     : u64 = 0xFFFFEA36
+  pub let ELCC_NOTE_NO_NARROW    : u64 = 0xFFFFEA37
+
+  // ---- Client-side shadow deadline map ----
+  //
+  // Slot i holds the absolute deadline in ns for row_id i (0 means
+  // "no deadline bound").  Cache-line aligned so a boot witness can
+  // capture it in one line for a memcmp-vs-expected check.
+
+  pub let mut _elevate_client_cap_expire_map : [u64; 16] = uninit @align(64)
+
+  // ---- Client-side counters ----
+  //
+  //   0 mints        successful cap mints (rax < ELCC_MAX_ROWS)
+  //   1 auto_revokes revokes fired because the deadline had passed
+  //   2 checks_live  check_and_revoke calls that saw a live row
+  //   3 mint_fails   kernel mint refused
+  //   4 revoke_fails kernel revoke refused
+  //   5..7 reserved
+
+  pub let mut _elevate_client_cap_stats : [u64; 8] = uninit @align(64)
+
+  pub let ELCC_ST_MINTS        : u64 = 0
+  pub let ELCC_ST_AUTO_REVOKES : u64 = 1
+  pub let ELCC_ST_CHECKS_LIVE  : u64 = 2
+  pub let ELCC_ST_MINT_FAILS   : u64 = 3
+  pub let ELCC_ST_REVOKE_FAILS : u64 = 4
+  pub let ELCC_ST_MAX          : u64 = 8
+
+  // ==========================================================================
+  // elevate_client_cap_reset() -> ()
+  //
+  // Clear the deadline map + the stats table.  Boot / teardown only.
+  // Same shape as elevate_client_stats_reset in elevate_client.pdx and
+  // elevate_channel_table_reset in the kernel.
+  // ==========================================================================
+
+  pub let elevate_client_cap_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-003 (#5): scrub the deadline map + the stats. Boot / teardown only. Two independent loops so the two arrays' lengths do not have to be composed in code. Leaf. Labels prefixed elcc_rs_.",
+      block: {
+        lea r10, [rip + _elevate_client_cap_expire_map];
+        xor rax, rax;
+        xor rcx, rcx;
+      elcc_rs_map:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  elcc_rs_map;
+
+        lea r10, [rip + _elevate_client_cap_stats];
+        xor rcx, rcx;
+      elcc_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  elcc_rs_stats;
+        ret
+      }
+    }
+
+  pub let elevate_client_cap_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-003 (#5): bounded increment; out-of-range which is a no-op. Same shape as elevate_client_note. Labels prefixed elcc_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae elcc_nt_out;
+        lea r10, [rip + _elevate_client_cap_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      elcc_nt_out:
+        ret
+      }
+    }
+
+  pub let elevate_client_cap_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-003 (#5): bounded read; out-of-range returns 0. Labels prefixed elcc_st_.",
+      block: {
+        cmp rdi, 8;
+        jae elcc_st_zero;
+        lea r10, [rip + _elevate_client_cap_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      elcc_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_cap_bind_expire(row_id, dur_ns) -> ELCC_OK | ELCC_ERR_*
+  //
+  // Compute an absolute deadline = hpet_now_ns() + dur_ns and record
+  // it in the shadow map at slot row_id.  A dur_ns of 0 clears any
+  // existing shadow deadline (equivalent to "no lifetime bound").
+  //
+  // The absolute deadline is the same shape the kernel row's [+32]
+  // slot would carry if the mint accepted expire_ns; a future
+  // paideia-os change that populates the row can drop the shadow
+  // map without breaking this API.
+  //
+  // Register plan: r12=row_id, r13=dur_ns (both callee-save so they
+  // survive the hpet_now_ns call).  Two pushes leave rsp%16==0 for
+  // the nested call.
+  // ==========================================================================
+
+  pub let elevate_client_cap_bind_expire : (u64, u64) -> u64 !{mem} @{boot} =
+    fn (row_id: u64) (dur_ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {boot},
+      justification: "libpdx-elevate.M2-003 (#5): shadow the deadline for row_id in the client-side expire map. Two callee-save pushes (r12=row_id, r13=dur_ns) + one 8-byte alignment pad = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0 so the nested hpet_now_ns CALL sees aligned rsp. dur_ns==0 short-circuits to a bare store of 0 (equivalent to `no deadline bound`). Stride 8 for a u64 slot -- `mov [base + row_id * 8], value` folds into the standard scaled-index form the caps_decl parser and elevate_client_stat pieces already use. Labels prefixed elcc_be_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 8;                      // alignment
+
+        mov r12, rdi;                    // row_id
+        mov r13, rsi;                    // dur_ns
+
+        cmp r12, 16;
+        jae elcc_be_bad_row;
+
+        cmp r13, 0;
+        je  elcc_be_clear;
+
+        // Absolute deadline = hpet_now_ns() + dur_ns.
+        call hpet_now_ns;
+        add rax, r13;
+
+        lea r10, [rip + _elevate_client_cap_expire_map];
+        mov [r10 + r12 * 8], rax;
+
+        xor rax, rax;                    // ELCC_OK
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_be_clear:
+        lea r10, [rip + _elevate_client_cap_expire_map];
+        xor rax, rax;
+        mov [r10 + r12 * 8], rax;
+        xor rax, rax;                    // ELCC_OK
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_be_bad_row:
+        mov rax, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_cap_get_expire(row_id) -> deadline_ns | 0
+  //
+  // Return the shadow deadline for row_id.  0 means "no deadline
+  // bound" (or the row_id is out of range).  Leaf.
+  // ==========================================================================
+
+  pub let elevate_client_cap_get_expire : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-003 (#5): read the shadow deadline. Out-of-range returns 0 (same convention as elevate_client_stat). Leaf. Labels prefixed elcc_ge_.",
+      block: {
+        cmp rdi, 16;
+        jae elcc_ge_zero;
+        lea r10, [rip + _elevate_client_cap_expire_map];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      elcc_ge_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_cap_narrow_stub(rights_in) -> rights_out | ELCC_NOTE_NO_NARROW
+  //
+  // STUB.  Placeholder for the M2-003 cap-narrowing site described in
+  // r49-r50-plan.md §5.14 cross-repo dependencies -- libpdx-cap.M2
+  // has not landed at the time of this M2, so this stub returns the
+  // input rights unchanged.  Every caller that would call cap_narrow
+  // in a future M2b invokes THIS stub instead so the eventual patch
+  // is one edit rather than a repo-wide grep.
+  //
+  // Distinct return: bit 63 is set on the returned rights so a caller
+  // that ignores the ELCC_NOTE_NO_NARROW status word AND uses the
+  // rights value literally will see obviously-invalid rights (bit 63
+  // is above R_ELVC_ALL = 0x418) and refuse it in a downstream check.
+  // ==========================================================================
+
+  pub let elevate_client_cap_narrow_stub : (u64) -> u64 !{} @{} =
+    fn (rights_in: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-elevate.M2-003 (#5): STUB. Awaits libpdx-cap.M2 cap_narrow_rights. Returns rights_in unchanged (no narrowing yet). Callers should also inspect ELCC_NOTE_NO_NARROW via a companion return path once the real narrow lands; today the shape is 'passthrough + status'. Leaf. Labels prefixed elcc_ns_.",
+      block: {
+        mov rax, rdi;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_cap_mint(parent_ep_slot, rights, request_id,
+  //                         requester_pid, target_cap_kind,
+  //                         target_cap_rights) -> row_id | ELCC_ERR_MINT_FAIL
+  //
+  // Thin wrapper over the kernel's elevate_channel_cap_mint_inner.
+  // The kernel primitive mints the row with expire_ns=0 (see note in
+  // the file header about the kernel-side default); the caller
+  // follows this with elevate_client_cap_bind_expire(row_id, dur_ns)
+  // to record the bounded lifetime in the shadow map.
+  //
+  // Bumps ELCC_ST_MINTS on success, ELCC_ST_MINT_FAILS otherwise.
+  //
+  // Register plan: kernel's mint takes six SysV args -- rdi through r9
+  // -- so this wrapper is nearly a tail-call: just save rax before
+  // the note-bump, restore after.  Two callee-save pushes leave
+  // rsp%16 stable for the nested calls; r12 doubles as save-rax so
+  // the RETURN value survives the elevate_client_cap_note call.
+  // ==========================================================================
+
+  pub let elevate_client_cap_mint : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{cap} =
+    fn (parent_ep_slot: u64) (rights: u64) (request_id: u64) (requester_pid: u64) (target_cap_kind: u64) (target_cap_rights: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "libpdx-elevate.M2-003 (#5): tail-call-shaped wrapper over elevate_channel_cap_mint_inner (kernel). Six SysV args pass through unchanged. Kernel mint returns row_id (< 16) on success or an ELVC_MINT_BAD_* code in the 0xFFFFEC0* band on refusal; we discriminate by comparing rax < 16. r12 preserves the return value across the note bump. Two callee-save pushes + one 8-byte alignment pad = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0 so nested calls see aligned rsp. capability {cap} propagates from elevate_channel_cap_mint_inner's own annotation. Labels prefixed elcc_mn_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 8;                      // alignment
+
+        // Delegate to kernel mint: same 6-arg SysV signature.
+        call elevate_channel_cap_mint_inner;
+        mov r12, rax;                    // stash return
+
+        cmp r12, 16;
+        jae elcc_mn_fail;
+
+        mov rdi, 0;                      // ELCC_ST_MINTS
+        call elevate_client_cap_note;
+        mov rax, r12;
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_mn_fail:
+        mov rdi, 3;                      // ELCC_ST_MINT_FAILS
+        call elevate_client_cap_note;
+        mov rax, 0xFFFFEA31;             // ELCC_ERR_MINT_FAIL
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_cap_expired(row_id) -> 1 | 0 | ELCC_ERR_*
+  //
+  // Compare the shadow deadline to hpet_now_ns.  Returns:
+  //
+  //   1                     deadline has passed (row is expired)
+  //   0                     deadline is in the future (row is live)
+  //   ELCC_ERR_BAD_ROW      row_id out of range
+  //   ELCC_ERR_NO_DEADLINE  row has no shadow deadline (0)
+  //
+  // Returning a clean 0/1 discriminator (as opposed to a status code)
+  // for the two happy cases is what lets a caller write
+  //   `cmp rax, 1; je _handle_expired` without also checking against
+  // an error band.
+  // ==========================================================================
+
+  pub let elevate_client_cap_expired : (u64) -> u64 !{mem} @{boot} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {boot},
+      justification: "libpdx-elevate.M2-003 (#5): compare shadow deadline to hpet_now_ns. Two callee-save pushes (r12=row_id, r13=deadline) + one 8-byte alignment pad = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0 so the hpet_now_ns CALL sees aligned rsp. Deadline==0 gate keeps the error taxonomy explicit (missing deadline is NOT the same as 'live indefinitely'; a caller that meant to bind_expire and forgot should see a distinct error). Labels prefixed elcc_ex_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 8;                      // alignment
+
+        mov r12, rdi;
+        cmp r12, 16;
+        jae elcc_ex_bad_row;
+
+        lea r10, [rip + _elevate_client_cap_expire_map];
+        mov r13, [r10 + r12 * 8];
+
+        cmp r13, 0;
+        je  elcc_ex_no_dl;
+
+        call hpet_now_ns;
+        cmp rax, r13;
+        jae elcc_ex_yes;
+        xor rax, rax;                    // live
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_ex_yes:
+        mov rax, 1;                      // expired
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_ex_bad_row:
+        mov rax, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_ex_no_dl:
+        mov rax, 0xFFFFEA32;             // ELCC_ERR_NO_DEADLINE
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_cap_check_and_revoke(row_id) -> ELCC_STATE_* | ELCC_ERR_*
+  //
+  // The self-invalidation entry point.  Sequence:
+  //
+  //   * elevate_client_cap_expired(row_id)
+  //     -> live      -> return ELCC_STATE_LIVE (+bump ELCC_ST_CHECKS_LIVE)
+  //     -> expired   -> proceed to revoke
+  //     -> error     -> pass through
+  //
+  //   * elevate_channel_cap_revoke(row_id)  [kernel]
+  //     -> ELVC_OK              -> return ELCC_STATE_REVOKED (+bump auto_revokes)
+  //     -> ELVC_REVOKE_ALREADY  -> return ELCC_STATE_REVOKED (idempotent)
+  //     -> other                -> return ELCC_ERR_REVOKE_FAIL
+  //
+  // Idempotency: calling this twice on the same expired row -- the
+  // first call revokes, the second sees the kernel report
+  // REVOKE_ALREADY, which we still surface as REVOKED (the row IS
+  // revoked as far as the caller is concerned; the kernel's
+  // "already" is an implementation detail).
+  //
+  // Register plan: r12=row_id.  One push preserves it across two
+  // nested calls; the second push is r13 for alignment (rsp%16==0
+  // with two pushes) and to stash the intermediate rax from the
+  // revoke.
+  // ==========================================================================
+
+  pub let elevate_client_cap_check_and_revoke : (u64) -> u64 !{mem} @{cap, boot} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap, boot},
+      justification: "libpdx-elevate.M2-003 (#5): the self-invalidation surface. Two callee-save pushes (r12=row_id, r13=work reg for stash) + one 8-byte alignment pad = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0 so nested calls (expired-check + kernel revoke + note bumps) see aligned rsp. Kernel revoke error taxonomy: 0 = OK, 0xFFFFEC06 = REVOKE_ALREADY (both map to ELCC_STATE_REVOKED here for caller-side idempotency). 0xFFFFEC08 = BAD_SLOT -- surfaced as ELCC_ERR_REVOKE_FAIL. capabilities {cap, boot} propagate from the nested kernel primitives. Labels prefixed elcc_cr_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 8;                      // alignment
+
+        mov r12, rdi;
+
+        // Expired check.
+        mov rdi, r12;
+        call elevate_client_cap_expired;
+        // rax = 0 (live) | 1 (expired) | ELCC_ERR_* (0xFFFFEA30 band)
+        cmp rax, 0;
+        je  elcc_cr_live;
+        cmp rax, 1;
+        je  elcc_cr_do_revoke;
+        // rax already carries the ELCC_ERR_* code -- pass through.
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_cr_live:
+        mov rdi, 2;                      // ELCC_ST_CHECKS_LIVE
+        call elevate_client_cap_note;
+        mov rax, 0xFFFFEA34;             // ELCC_STATE_LIVE
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_cr_do_revoke:
+        mov rdi, r12;
+        call elevate_channel_cap_revoke;
+        // rax = ELVC_OK (0) | ELVC_REVOKE_ALREADY (0xFFFFEC06) | ELVC_BAD_SLOT (0xFFFFEC08)
+        cmp rax, 0;
+        je  elcc_cr_revoked;
+        mov r10, 0xFFFFEC06;             // ELVC_REVOKE_ALREADY
+        cmp rax, r10;
+        je  elcc_cr_revoked;
+        // Some other refusal -- surface as REVOKE_FAIL.
+        mov rdi, 4;                      // ELCC_ST_REVOKE_FAILS
+        call elevate_client_cap_note;
+        mov rax, 0xFFFFEA33;             // ELCC_ERR_REVOKE_FAIL
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_cr_revoked:
+        // Clear the shadow deadline so a second check_and_revoke
+        // returns NO_DEADLINE (the row is truly gone).
+        lea r10, [rip + _elevate_client_cap_expire_map];
+        xor r11, r11;
+        mov [r10 + r12 * 8], r11;
+
+        mov rdi, 1;                      // ELCC_ST_AUTO_REVOKES
+        call elevate_client_cap_note;
+        mov rax, 0xFFFFEA36;             // ELCC_STATE_REVOKED
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}
