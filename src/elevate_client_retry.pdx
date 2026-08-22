@@ -1,0 +1,510 @@
+// src/elevate_client_retry.pdx -- libpdx-elevate.M3-002 (paideia-os/libpdx-elevate#7)
+//
+// Retry-with-backoff for transient broker unavailability.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Wraps elevate_client_request_ex_j (M3-001) with a bounded retry
+// loop.  Fires when the broker returns a transient-unavailability
+// symptom: the broker is not yet registered (svc.elevate-broker
+// lookup miss), the broker's endpoint refuses the publish (busy or
+// mid-restart), or the broker times out (crash or overload).  Every
+// retry attempt goes through the FULL journal wrapper -- REQ audit
+// record before the wire hop, APR audit record on success -- so the
+// audit trail records the whole retry sequence, one record per
+// attempt.  A per-op consent that a broker restart makes fail once
+// still shows in the journal as (REQ, REQ, APR) with a single
+// operation and two REQ attempts.
+//
+// =============================================================================
+// RETRIABLE ERROR SET
+// =============================================================================
+//
+// Three codes from the ELVC_* transport band trigger a retry:
+//
+//   0xFFFFEA01  ELVC_ERR_TIMEOUT      -- broker never replied within the
+//                                        deadline.  A crashed / stalled
+//                                        broker resumes and the next
+//                                        attempt succeeds.
+//   0xFFFFEA0D  ELVC_ERR_SEND_FAIL    -- endpoint_write_pending refused
+//                                        (usually EAGAIN: the broker's
+//                                        inbox is full).  Backoff lets
+//                                        the broker drain.
+//   0xFFFFEA0F  ELVC_ERR_LOOKUP_FAIL  -- svc.elevate-broker not
+//                                        registered.  Startup ordering:
+//                                        the broker registration may
+//                                        lag a client's first request.
+//
+// Every OTHER return -- ELVC_OK (0), the client-side gate errors
+// (ELVC_ERR_BAD_BUF / BAD_REPLY / BAD_EXPIRE / BAD_REPLY_EP /
+// GRANT_INVALID / PACK_FAIL), the policy-band errors (ELCP_ERR_*),
+// the journal errors (ELVJ_ERR_*) -- passes through unchanged.  A
+// caller-side bug does not become retriable by wrapping it; a full
+// audit journal does not free up by retrying.
+//
+// =============================================================================
+// BACKOFF SCHEDULE
+// =============================================================================
+//
+// A fixed monotone table -- slot i holds the delay to wait AFTER
+// attempt (i+1) FAILED and BEFORE attempt (i+2) fires (1-indexed
+// attempts, zero-indexed table):
+//
+//   after attempt 1 (before 2)   ->   100_000_000 ns   (100 ms)
+//   after attempt 2 (before 3)   ->   400_000_000 ns   (400 ms)
+//   after attempt 3 (before 4)   -> 1_600_000_000 ns   (1.6 s)
+//   after attempt 4+ (cap)       -> 1_600_000_000 ns   (a broker that
+//                                    has not recovered in 2 s is
+//                                    unlikely to recover in 6 s either)
+//
+// The wrapper never waits BEFORE the first attempt (nothing has
+// failed yet), so slot 0 is what a caller sees after the very first
+// failure -- not the "no wait" slot.
+//
+// Kept as a pre-initialised table rather than `shl base, cl` so a
+// caller reading a golden log against the sequence has a stable
+// per-attempt delay to grep for; a variable-shift form would drift
+// the sample values every time a caller retuned the base backoff.
+//
+// The DEFAULT max attempts is 3 (first try + two retries).  A caller
+// with different tolerance calls elevate_client_retry_set_max_attempts
+// with a value in [1, 8].  1 means "no retries" (the wrapper still
+// runs one attempt); 8 saturates the backoff table.
+//
+// =============================================================================
+// SLEEP MECHANIC
+// =============================================================================
+//
+// Bounded busy-poll on hpet_now_ns until now >= start + backoff_ns.
+// The same idiom as elevate_client_recv_reply's timeout loop (see
+// elevate_client_send.pdx L438-L457).  A kernel-level sleep primitive
+// is not yet exposed to userspace at R48; when it lands (paideia-os
+// R51 scheduler-wait syscall), elevate_client_retry_delay becomes a
+// thin wrapper over it and the polling loop disappears.
+//
+// If hpet_now_ns returns 0 (called before hpet_init), the delay
+// collapses to a single-iteration no-op -- matches the "no monotonic
+// clock" branch in elevate_client_recv_reply.  Retries then happen
+// back-to-back until the max attempt count exhausts them.
+//
+// =============================================================================
+// ERROR BAND 0xFFFFEA20..0xFFFFEA2F
+// =============================================================================
+//
+//   0xFFFFEA20  ELVR_ERR_EXHAUSTED    -- all retriable attempts failed
+//                                        with a retriable code; caller
+//                                        should surface as "broker
+//                                        persistently unavailable".
+//   0xFFFFEA21  ELVR_ERR_BAD_ARG      -- setter rejected an out-of-
+//                                        range value (max_attempts
+//                                        outside [1, 8]).
+
+module ElevateClientRetry = structure {
+
+  // ---- Bounds ----
+
+  pub let ELVR_MAX_ATTEMPTS_MIN     : u64 = 1
+  pub let ELVR_MAX_ATTEMPTS_MAX     : u64 = 8
+  pub let ELVR_MAX_ATTEMPTS_DEFAULT : u64 = 3
+
+  // ---- Retriable ELVC_* codes (see elevate_client_send.pdx) ----
+
+  pub let ELVR_RETRIABLE_TIMEOUT     : u64 = 0xFFFFEA01
+  pub let ELVR_RETRIABLE_SEND_FAIL   : u64 = 0xFFFFEA0D
+  pub let ELVR_RETRIABLE_LOOKUP_FAIL : u64 = 0xFFFFEA0F
+
+  // ---- Result codes / error band 0xFFFFEA20..0xFFFFEA2F ----
+
+  pub let ELVR_OK              : u64 = 0
+  pub let ELVR_ERR_EXHAUSTED   : u64 = 0xFFFFEA20
+  pub let ELVR_ERR_BAD_ARG     : u64 = 0xFFFFEA21
+
+  // ---- Backoff table -- one u64 per (attempt-1), 0-indexed ----
+  //
+  // Slot i is the delay after attempt (i+1) failed and before attempt
+  // (i+2) fires.  Slot 0 == 100 ms because that is the wait AFTER the
+  // FIRST failed attempt -- the wrapper never waits BEFORE the first
+  // call (nothing has failed yet), so a "no wait" slot 0 would be
+  // dead weight and would silently skip the first retry backoff.
+  // Slots 2..7 are the saturated cap (1.6 s).  All values fit imm32
+  // so a caller-side sample-log check can `cmp rax, imm32` directly.
+  //
+  // Sizeof = 8 * 8 = 64 bytes, one cache line.  Read-only after link.
+
+  pub let _elevate_client_retry_backoff_ns : [u64; 8] =
+    [ 100000000, 400000000, 1600000000, 1600000000, 1600000000, 1600000000, 1600000000, 1600000000 ]
+
+  // ---- Configurable max-attempts (0 == "not yet set, use default") ----
+
+  pub let mut _elevate_client_retry_max_attempts : u64 = 0
+
+  // ---- Stats ----
+  //
+  //   0 attempts        every elevate_client_request_ex_j call issued
+  //   1 successes       attempt returned ELVC_OK
+  //   2 retries         retriable failure led to a follow-up attempt
+  //   3 exhausted       max_attempts reached with retriable failures
+  //   4 passthroughs    non-retriable failure returned unchanged
+  //   5..7 reserved
+
+  pub let mut _elevate_client_retry_stats : [u64; 8] = uninit @align(64)
+
+  pub let ELVR_ST_ATTEMPTS     : u64 = 0
+  pub let ELVR_ST_SUCCESSES    : u64 = 1
+  pub let ELVR_ST_RETRIES      : u64 = 2
+  pub let ELVR_ST_EXHAUSTED    : u64 = 3
+  pub let ELVR_ST_PASSTHROUGHS : u64 = 4
+  pub let ELVR_ST_MAX          : u64 = 8
+
+  // ==========================================================================
+  // elevate_client_retry_reset() -> ()
+  //
+  // Scrub the stats table + clear the configured max-attempts (so the
+  // next get resolves the default).  Boot / teardown discipline.
+  // ==========================================================================
+
+  pub let elevate_client_retry_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M3-002 (#7): scrub retry stats + config slot. Two independent zero loops (stats table + max_attempts slot) so the two arrays' lengths do not have to compose. Leaf. Labels prefixed elcr_rs_.",
+      block: {
+        lea r10, [rip + _elevate_client_retry_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      elcr_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  elcr_rs_stats;
+
+        lea r10, [rip + _elevate_client_retry_max_attempts];
+        xor rax, rax;
+        mov [r10 + 0], rax;
+        ret
+      }
+    }
+
+  pub let elevate_client_retry_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M3-002 (#7): bounded increment; out-of-range which is a no-op. Same shape as elevate_client_note. Labels prefixed elcr_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae elcr_nt_out;
+        lea r10, [rip + _elevate_client_retry_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      elcr_nt_out:
+        ret
+      }
+    }
+
+  pub let elevate_client_retry_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M3-002 (#7): bounded read; out-of-range returns 0 (same convention as elevate_client_stat). Labels prefixed elcr_st_.",
+      block: {
+        cmp rdi, 8;
+        jae elcr_st_zero;
+        lea r10, [rip + _elevate_client_retry_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      elcr_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_retry_set_max_attempts(n) -> ELVR_OK | ELVR_ERR_BAD_ARG
+  //
+  // Rejects values outside [1, 8] so a caller cannot disable the
+  // retry cap (0 or huge) and starve a caller of interactive time.
+  // Leaf.
+  // ==========================================================================
+
+  pub let elevate_client_retry_set_max_attempts : (u64) -> u64 !{mem} @{} =
+    fn (n: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M3-002 (#7): set _elevate_client_retry_max_attempts. Bounds gate rejects 0 (no attempts = never runs) and > 8 (would index past the backoff table). Values in [1, 8] are stored as-is; the getter treats a 0 slot as 'not yet set' and substitutes the default. Leaf. Labels prefixed elcr_sm_.",
+      block: {
+        cmp rdi, 1;
+        jb  elcr_sm_bad;
+        cmp rdi, 8;
+        ja  elcr_sm_bad;
+        lea r10, [rip + _elevate_client_retry_max_attempts];
+        mov [r10 + 0], rdi;
+        xor rax, rax;                    // ELVR_OK
+        ret;
+      elcr_sm_bad:
+        mov rax, 0xFFFFEA21;             // ELVR_ERR_BAD_ARG
+        ret
+      }
+    }
+
+  pub let elevate_client_retry_get_max_attempts : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M3-002 (#7): return _elevate_client_retry_max_attempts. A stored 0 means 'not yet configured' and resolves to ELVR_MAX_ATTEMPTS_DEFAULT (3). Leaf. Labels prefixed elcr_gm_.",
+      block: {
+        lea r10, [rip + _elevate_client_retry_max_attempts];
+        mov rax, [r10 + 0];
+        cmp rax, 0;
+        jne elcr_gm_out;
+        mov rax, 3;                      // ELVR_MAX_ATTEMPTS_DEFAULT
+      elcr_gm_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_retry_backoff_ns_for_attempt(attempt) -> u64
+  //
+  // Look up the backoff delay after `attempt` failed (i.e. before
+  // attempt+1 fires).  attempt is 1-indexed:
+  //   attempt=0 or >8 -> 0 (caller-side gate; no wait)
+  //   attempt=1..8 -> _elevate_client_retry_backoff_ns[attempt-1]
+  //
+  // The table starts at 100 ms (slot 0) -- the wrapper never waits
+  // BEFORE the first attempt, so slot 0 is the delay after the FIRST
+  // failure.  Slot 7 caps at 1.6 s so max_attempts=8 saturates the
+  // schedule without an out-of-range lookup.
+  //
+  // Leaf.
+  // ==========================================================================
+
+  pub let elevate_client_retry_backoff_ns_for_attempt : (u64) -> u64 !{mem} @{} =
+    fn (attempt: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M3-002 (#7): table lookup. Bounds gate refuses attempt==0 (invalid caller state; 1-indexed) and attempt > 8 (past the table) with a 0 return -- the loop treats 0 as 'no wait' and proceeds directly, which is the strictly-conservative answer for 'we cannot look up this delay'. Leaf. Labels prefixed elcr_bo_.",
+      block: {
+        cmp rdi, 1;
+        jb  elcr_bo_zero;
+        cmp rdi, 8;
+        ja  elcr_bo_zero;
+        // idx = attempt - 1
+        mov r10, rdi;
+        sub r10, 1;
+        lea r11, [rip + _elevate_client_retry_backoff_ns];
+        mov rax, [r11 + r10 * 8];
+        ret;
+      elcr_bo_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_retry_delay(dur_ns) -> ()
+  //
+  // Bounded busy-poll on hpet_now_ns until now >= start + dur_ns.
+  // Same idiom as elevate_client_recv_reply's timeout loop.  A
+  // dur_ns of 0 returns immediately (used by the first-attempt slot
+  // in the backoff table).  A hpet_now_ns == 0 (called before
+  // hpet_init) short-circuits to a single-iteration no-op -- the
+  // "no monotonic clock" branch mirrors elevate_client_recv_reply
+  // L437.
+  //
+  // Register plan: r12=dur, r13=deadline; two callee-save pushes +
+  // one 8-byte alignment pad = 24 bytes; entry rsp%16==8 ->
+  // (8-24) mod 16 == 0 so the nested hpet_now_ns CALL sees aligned
+  // rsp.
+  // ==========================================================================
+
+  pub let elevate_client_retry_delay : (u64) -> () !{mem} @{boot} =
+    fn (dur_ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {boot},
+      justification: "libpdx-elevate.M3-002 (#7): bounded busy-poll delay. Two callee-save pushes (r12=dur, r13=deadline) + one 8-byte alignment pad = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0 so hpet_now_ns CALL sees aligned rsp on every iteration. dur_ns==0 short-circuits before any nested call (skip the hpet hop entirely). hpet_now_ns==0 short-circuits with deadline=0 so the first now>=deadline compare always fires (matches elevate_client_recv_reply L437 discipline). capability {boot} propagates from hpet_now_ns's own {boot} annotation. Labels prefixed elcr_dl_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 8;                      // alignment
+
+        mov r12, rdi;                    // dur_ns
+        cmp r12, 0;
+        je  elcr_dl_out;
+
+        // deadline = hpet_now_ns() + dur_ns; no-clock -> deadline=0.
+        call hpet_now_ns;
+        cmp rax, 0;
+        je  elcr_dl_no_clock;
+        add rax, r12;
+        mov r13, rax;
+        jmp elcr_dl_loop;
+
+      elcr_dl_no_clock:
+        xor r13, r13;
+
+      elcr_dl_loop:
+        call hpet_now_ns;
+        cmp rax, r13;
+        jae elcr_dl_out;
+        jmp elcr_dl_loop;
+
+      elcr_dl_out:
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_request_ex_r(caps, dur, req_buf, reply_ep_id,
+  //                             reply_buf, timeout_ns)
+  //   -> ELVC_* | ELVJ_ERR_* | ELVR_ERR_*
+  //
+  // The M3-002 retry-wrapped entry point.  Wraps
+  // elevate_client_request_ex_j (which itself wraps the M2
+  // elevate_client_request_ex + REQ/APR audit journaling) with a
+  // bounded retry loop for the three retriable ELVC_* codes.  Every
+  // attempt runs through the FULL journal wrapper so the audit trail
+  // has one REQ record per attempt and one APR record on the
+  // eventual success -- which is exactly what "audit trail
+  // integration" + "per-op consent re-consulted" require from M3.
+  //
+  // Return taxonomy:
+  //   ELVC_OK (0)               -- eventual success
+  //   any ELVC_* non-retriable  -- passed through unchanged
+  //   any ELVJ_ERR_*            -- passed through unchanged
+  //   ELVR_ERR_EXHAUSTED        -- all retriable attempts failed
+  //                                (max_attempts reached with the
+  //                                 last attempt still retriable)
+  //
+  // Register plan matches elevate_client_request_ex_j: six callee-
+  // save pushes + one 8-byte pad = 56 bytes; entry rsp%16==8 ->
+  // (8-56) mod 16 == 0.  The pad slot at [rsp+0] doubles as the
+  // attempt counter (1-indexed; initialised to 0 pre-loop and pre-
+  // incremented at the top of every iteration).
+  //
+  //   rbx = caps         (passed through)
+  //   r12 = dur          (passed through)
+  //   r13 = req_buf      (passed through)
+  //   r14 = reply_ep_id  (passed through)
+  //   r15 = reply_buf    (passed through)
+  //   rbp = timeout_ns   (passed through)
+  //   [rsp+0] = attempt  (1-indexed, initially 0)
+  //
+  // Retriable-code compares stage the 0xFFFFEA0_ constants into r11
+  // per the paideia-as compliance rule (imm32 sign-extension makes a
+  // direct `cmp rax, 0xFFFFEA0F` illegal).
+  // ==========================================================================
+
+  pub let elevate_client_request_ex_r : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{boot} =
+    fn (caps: u64) (dur: u64) (req_buf: u64) (reply_ep_id: u64) (reply_buf: u64) (timeout_ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {boot},
+      justification: "libpdx-elevate.M3-002 (#7): retry-wrapped full-flow entry point. Six callee-save pushes (rbx=caps, r12=dur, r13=req_buf, r14=reply_ep_id, r15=reply_buf, rbp=timeout_ns) + one 8-byte alignment pad = 56 bytes; entry rsp%16==8 -> (8-56) mod 16 == 0 across every nested call (elevate_client_request_ex_j, get/set/note helpers, elevate_client_retry_delay). The pad slot at [rsp+0] holds the 1-indexed attempt counter (0 pre-loop, pre-incremented at loop top). Retriable set is exactly {ELVC_ERR_TIMEOUT (0xFFFFEA01), ELVC_ERR_SEND_FAIL (0xFFFFEA0D), ELVC_ERR_LOOKUP_FAIL (0xFFFFEA0F)}; every other return (ELVC_OK, ELVJ_ERR_*, any other ELVC_ERR_*, any ELCP_ERR_*) passes through unchanged. Retriable-code compares stage the constant into r11 first per paideia-as compliance rule (imm32 sign-extend forbids direct `cmp rax, 0xFFFFEA0F`). The retry loop always calls elevate_client_request_ex_j -- not the M2 elevate_client_request_ex -- so every attempt writes its own REQ audit record and the eventual success writes its APR record, satisfying the M3 'audit trail integration' + 'per-op consent re-consulted' requirements at r49-r50-plan.md §5.14. ELVR_ERR_EXHAUSTED fires only when max_attempts is reached AND the final attempt was retriable (i.e. we ran out of budget on a broker-side symptom, not on a client-side gate). capability {boot} propagates from elevate_client_request_ex_j and elevate_client_retry_delay. Labels prefixed elcr_rx_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;                      // align + slot for attempt counter
+
+        mov rbx, rdi;                    // caps
+        mov r12, rsi;                    // dur
+        mov r13, rdx;                    // req_buf
+        mov r14, rcx;                    // reply_ep_id
+        mov r15, r8;                     // reply_buf
+        mov rbp, r9;                     // timeout_ns
+
+        // attempt counter <- 0 (pre-incremented in the loop).
+        xor rax, rax;
+        mov [rsp + 0], rax;
+
+      elcr_rx_loop:
+        // Bump attempt counter -- 1-indexed inside the loop body.
+        mov rax, [rsp + 0];
+        add rax, 1;
+        mov [rsp + 0], rax;
+
+        // Note the attempt in stats.
+        mov rdi, 0;                      // ELVR_ST_ATTEMPTS
+        call elevate_client_retry_note;
+
+        // Fire the audit-wrapped elevate.
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        mov rcx, r14;
+        mov r8,  r15;
+        mov r9,  rbp;
+        call elevate_client_request_ex_j;
+
+        // Success?
+        cmp rax, 0;
+        je  elcr_rx_success;
+
+        // Retriable?  Three-way discriminator via staged constants.
+        mov r11, 0xFFFFEA01;             // ELVC_ERR_TIMEOUT
+        cmp rax, r11;
+        je  elcr_rx_retriable;
+        mov r11, 0xFFFFEA0D;             // ELVC_ERR_SEND_FAIL
+        cmp rax, r11;
+        je  elcr_rx_retriable;
+        mov r11, 0xFFFFEA0F;             // ELVC_ERR_LOOKUP_FAIL
+        cmp rax, r11;
+        je  elcr_rx_retriable;
+
+        // Non-retriable -- pass through.  Bump ELVR_ST_PASSTHROUGHS
+        // for observability; the caller's rax survives across the
+        // note bump because elevate_client_retry_note preserves rax
+        // (it only touches r10, its own arg, and its scratch load).
+        // Save rax anyway to be defensive against a future note
+        // implementation that clobbers rax.
+        push rax;
+        sub rsp, 8;                      // realign
+        mov rdi, 4;                      // ELVR_ST_PASSTHROUGHS
+        call elevate_client_retry_note;
+        add rsp, 8;
+        pop rax;
+        jmp elcr_rx_out;
+
+      elcr_rx_retriable:
+        // Check budget: attempt >= max_attempts -> exhausted.
+        call elevate_client_retry_get_max_attempts;
+        mov r11, rax;                    // max
+        mov rax, [rsp + 0];              // current attempt (1-indexed)
+        cmp rax, r11;
+        jae elcr_rx_exhausted;
+
+        // Backoff before the next attempt.  Table lookup indexed by
+        // the current attempt (i.e. delay AFTER this attempt failed).
+        mov rdi, rax;                    // attempt (1-indexed)
+        call elevate_client_retry_backoff_ns_for_attempt;
+        mov rdi, rax;                    // dur_ns
+        call elevate_client_retry_delay;
+
+        // Bump ELVR_ST_RETRIES and loop.
+        mov rdi, 2;                      // ELVR_ST_RETRIES
+        call elevate_client_retry_note;
+        jmp elcr_rx_loop;
+
+      elcr_rx_success:
+        mov rdi, 1;                      // ELVR_ST_SUCCESSES
+        call elevate_client_retry_note;
+        xor rax, rax;                    // ELVC_OK
+        jmp elcr_rx_out;
+
+      elcr_rx_exhausted:
+        mov rdi, 3;                      // ELVR_ST_EXHAUSTED
+        call elevate_client_retry_note;
+        mov rax, 0xFFFFEA20;             // ELVR_ERR_EXHAUSTED
+
+      elcr_rx_out:
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

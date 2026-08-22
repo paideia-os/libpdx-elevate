@@ -1,7 +1,7 @@
 # libpdx-elevate — status
 
 **Wave:** R49 shared library
-**Current milestone:** M3 (audit + retry integration) — M3-001 landed, M3-002 in progress
+**Current milestone:** M3 (audit + retry integration) — complete
 
 See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full breakdown.
 
@@ -15,7 +15,7 @@ See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full breakdown
 | M2-002 (#4)     | human-approve path with timeout (default 30s, per-request configurable)        | LANDED |
 | M2-003 (#5)     | Cap<KIND_ELEVATE_CHANNEL=0x191> with bounded-lifetime self-invalidation        | LANDED |
 | M3-001 (#6)     | request + response journal via libpdx-audit (extends UEJ_KIND_ELEVATE)         | LANDED |
-| M3-002 (#7)     | retry-with-backoff for transient broker unavailability                         | OPEN   |
+| M3-002 (#7)     | retry-with-backoff for transient broker unavailability                         | LANDED |
 
 ## M1 — design + skeleton (complete)
 
@@ -101,7 +101,7 @@ See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full breakdown
   (`ELCC_ERR_BAD_ROW`, `MINT_FAIL`, `NO_DEADLINE`, `REVOKE_FAIL`,
   `ELCC_STATE_LIVE`, `EXPIRED`, `REVOKED`, `ELCC_NOTE_NO_NARROW`).
 
-## M3 — audit + retry integration (in progress)
+## M3 — audit + retry integration (complete)
 
 - `src/elevate_client_journal.pdx` (issue #6, LANDED): REQ + APR
   journal through the kernel's `uej_append` (UEJ_KIND_ELEVATE = 5).
@@ -125,7 +125,29 @@ See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full breakdown
       journal pair, so every mutating op is both policy-consulted
       AND audit-recorded.
 
-**Error band added at M3-001:**
+- `src/elevate_client_retry.pdx` (issue #7, LANDED): retry-with-
+  backoff wrapper over `elevate_client_request_ex_j`. Retriable
+  set is `{ELVC_ERR_TIMEOUT, ELVC_ERR_SEND_FAIL,
+  ELVC_ERR_LOOKUP_FAIL}` — the three transient broker-side
+  symptoms. Everything else (client-side gates, policy refusals,
+  journal failures) passes through unchanged. Provides:
+    - `elevate_client_retry_set_max_attempts(n)` / `_get_max_attempts()`
+      — bounds [1, 8], default 3.
+    - `elevate_client_retry_backoff_ns_for_attempt(attempt)` —
+      table lookup: 100 ms → 400 ms → 1.6 s → cap at 1.6 s.
+    - `elevate_client_retry_delay(dur_ns)` — bounded busy-poll on
+      `hpet_now_ns` (matches the recv-timeout idiom in
+      `elevate_client_recv_reply`).
+    - `elevate_client_request_ex_r(caps, dur, req_buf, reply_ep_id,
+      reply_buf, timeout_ns) -> ELVC_*/ELVJ_ERR_*/ELVR_ERR_*` —
+      the full-featured entry point: retry × (journal + policy +
+      send + recv). Every attempt writes its own REQ audit record
+      and the eventual success writes its APR record, giving the
+      auditor a complete per-attempt trail.
+
+**Error bands added at M3:**
+- `0xFFFFEA20..0xFFFFEA2F` — `ElevateClientRetry` band
+  (`ELVR_ERR_EXHAUSTED`, `ELVR_ERR_BAD_ARG`).
 - `0xFFFFEA40..0xFFFFEA4F` — `ElevateClientJournal` band
   (`ELVJ_ERR_BAD_ACTOR`, `ELVJ_ERR_REQ_JOURNAL_FAIL`,
   `ELVJ_ERR_APR_JOURNAL_FAIL`).
@@ -161,15 +183,20 @@ See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full breakdown
   `src/kernel/core/ipc/elevate_broker.pdx`) — until it consumes REQ
   frames and produces APR replies, `elevate_client_request_ex*` will
   reliably time out. M4 will exercise the full loop once the broker
-  daemon lands.
+  daemon lands. The retry wrapper at M3-002 turns that timeout into
+  a bounded three-attempt sequence rather than a single 30 s stall.
+- Userspace-visible sleep primitive (R51 scheduler-wait syscall).
+  Once landed, `elevate_client_retry_delay` becomes a thin wrapper
+  and the polling loop retires.
 - `tick_ns` wire in `uej_append` (currently placeholder 0 per
   user_events_journal.pdx L226). Not blocking; audit records still
   carry seq for ordering.
 
 ## Next
 
-M3-002 — retry-with-backoff for transient broker unavailability
-(issue #7). Wraps `elevate_client_request_ex_j` with a bounded
-retry loop for the transient broker-side symptoms
-(`ELVC_ERR_TIMEOUT`, `ELVC_ERR_SEND_FAIL`, `ELVC_ERR_LOOKUP_FAIL`).
-Then M4 — tests + smoke matrix.
+M4 — tests + smoke matrix (auto-approve match/miss, cap-lifetime
+enforcement past deadline, journal record pair landing in
+user_events_journal, retry backoff schedule sample-log). Blocked
+today on the paideia-os elevate broker daemon body (see followups
+above); an M4 harness would need a broker mock or a paideia-os
+change landing the real dispatch first.
