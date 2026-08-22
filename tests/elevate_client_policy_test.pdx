@@ -1,0 +1,376 @@
+// tests/elevate_client_policy_test.pdx -- libpdx-elevate.M4-001 (paideia-os/libpdx-elevate#8)
+//
+// Auto-approve match/miss matrix against the client-side policy table.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Boot witness for src/elevate_client_policy.pdx.  Exercises the four
+// gates that decide whether a REQ can fast-path (idx returned) vs.
+// falls through to human-approve (ELCP_ERR_NO_MATCH):
+//
+//   (a) enabled flag          -- scrubbed row is not a match
+//   (b) target_fp_lo          -- 0 wildcard vs specific-user match
+//   (c) caps subset           -- (req.caps & row.caps) == req.caps
+//   (d) duration cap          -- req.dur <= row.max_dur
+//
+// Plus the four INSTALL-side gates (BAD_CAPS on caps==0 and reserved
+// bits set, BAD_DUR on dur outside [1s, 1h]) and the RATE_LIMIT path
+// on elevate_client_policy_hit once a row's per-hour cap is reached.
+//
+// =============================================================================
+// FINGERPRINT: LIBPDX-ELEVATE M4 POLICY OK
+// =============================================================================
+//
+// One fingerprint for both match and miss branches -- the two share
+// the same table state, the same install path, and the same statistics
+// surface.  A single OK line means every gate refused what it should
+// have refused and admitted what it should have admitted.
+//
+// Same shape as tests/kernel/ipc/elevate_broker_synth.pdx (paideia-os
+// R48b substrate-prep #1627) which was the reference for the stage-
+// tracked witness idiom.  Labels prefixed ecpw_ -- distinct from
+// elvbw_ / eccw_ so the witness's own emitter does not overlap the
+// broker's or the sibling cap witness's when they run in the same
+// boot.
+
+module ElevateClientPolicyTest = structure {
+
+  pub let mut _ecpw_stage : u64 = 0
+
+  pub let ecpw_ok   : [u8; 29] = "LIBPDX-ELEVATE M4 POLICY OK\n\0"
+  pub let ecpw_fail : [u8; 31] = "LIBPDX-ELEVATE M4 POLICY FAIL\n\0"
+
+  pub let elevate_client_policy_witness : () -> u64 !{sysreg, mem} @{boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "libpdx-elevate.M4-001 (#8): boot witness for the auto-approve match/miss matrix. Five callee-save pushes (rbx, r12, r13, r14, r15) -- (8 - 40) mod 16 == 0 so nested calls (policy install/check/hit + klog + stats) see aligned rsp. Stages recorded in _ecpw_stage so the FAIL branch can klog_s1_d1 the exact failing stage via key `line`. All duration constants (60s / 30s / 15s / 120s / 2h) exceed imm32 and are staged in r10 before being copied to the arg reg (rdx) per the paideia-as compliance discipline mirrored from ep_install L275 in src/kernel/core/user/elevate_policy.pdx. Every stage scrubs the policy table on entry and again on both exits so a failure here cannot be mistaken for a fault in whatever runs after. Labels prefixed ecpw_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ------------------------------------------------------------
+        // Stage 1: reset -- count/hits/no_matches all zero.
+        // ------------------------------------------------------------
+        mov rax, 1;
+        lea rcx, [rip + _ecpw_stage];
+        mov [rcx], rax;
+        call elevate_client_policy_reset;
+
+        call elevate_client_policy_count;
+        cmp rax, 0;
+        jne ecpw_fail_stage;
+
+        mov rdi, 1;                      // ELCP_ST_HITS
+        call elevate_client_policy_stat;
+        cmp rax, 0;
+        jne ecpw_fail_stage;
+
+        mov rdi, 3;                      // ELCP_ST_NO_MATCHES
+        call elevate_client_policy_stat;
+        cmp rax, 0;
+        jne ecpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 2: install row 0 -- wildcard target, caps=0x01, 60s max, unlimited rate.
+        // ------------------------------------------------------------
+        mov rax, 2;
+        lea rcx, [rip + _ecpw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;                    // target_fp_lo = 0 (any)
+        mov rsi, 1;                      // caps = 0x01
+        mov r10, 60000000000;            // 60s in ns
+        mov rdx, r10;
+        xor rcx, rcx;                    // rate_per_hour = 0 (unlimited)
+        call elevate_client_policy_install;
+        cmp rax, 0;                      // returned idx=0
+        jne ecpw_fail_stage;
+
+        call elevate_client_policy_count;
+        cmp rax, 1;
+        jne ecpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 3: match row 0 -- wildcard target, exact caps, dur under cap.
+        // ------------------------------------------------------------
+        mov rax, 3;
+        lea rcx, [rip + _ecpw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0x1234;                 // any target -- row 0 is wildcard
+        mov rsi, 1;                      // caps subset of row 0
+        mov r10, 30000000000;            // 30s <= 60s
+        mov rdx, r10;
+        call elevate_client_policy_check;
+        cmp rax, 0;                      // idx 0
+        jne ecpw_fail_stage;
+
+        mov rdi, 1;                      // ELCP_ST_HITS
+        call elevate_client_policy_stat;
+        cmp rax, 1;
+        jne ecpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 4: install row 1 -- specific target 0xABCDEF, caps=0x02, 30s max, rate=5.
+        // ------------------------------------------------------------
+        mov rax, 4;
+        lea rcx, [rip + _ecpw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0xABCDEF;               // specific target
+        mov rsi, 2;                      // caps = 0x02
+        mov r10, 30000000000;            // 30s max
+        mov rdx, r10;
+        mov rcx, 5;                      // rate = 5/hour
+        call elevate_client_policy_install;
+        cmp rax, 1;                      // returned idx=1
+        jne ecpw_fail_stage;
+
+        call elevate_client_policy_count;
+        cmp rax, 2;
+        jne ecpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 5: caps-miss -- request caps=0x02 against row 0 (caps=0x01),
+        // and target-miss against row 1 (target=0x1234 != 0xABCDEF).  Both
+        // rows refuse -> NO_MATCH.
+        // ------------------------------------------------------------
+        mov rax, 5;
+        lea rcx, [rip + _ecpw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0x1234;                 // target
+        mov rsi, 2;                      // caps NOT subset of row 0 (caps=0x01)
+        mov r10, 30000000000;
+        mov rdx, r10;
+        call elevate_client_policy_check;
+        mov r10, 0xFFFFEA12;             // ELCP_ERR_NO_MATCH
+        cmp rax, r10;
+        jne ecpw_fail_stage;
+
+        mov rdi, 3;                      // ELCP_ST_NO_MATCHES
+        call elevate_client_policy_stat;
+        cmp rax, 1;
+        jne ecpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 6: duration-miss -- 120s > row 0 max (60s); caps-miss on row 1.
+        // ------------------------------------------------------------
+        mov rax, 6;
+        lea rcx, [rip + _ecpw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0x1234;                 // target
+        mov rsi, 1;                      // caps subset of row 0
+        mov r10, 120000000000;           // 120s > 60s (row 0)
+        mov rdx, r10;
+        call elevate_client_policy_check;
+        mov r10, 0xFFFFEA12;
+        cmp rax, r10;
+        jne ecpw_fail_stage;
+
+        mov rdi, 3;                      // ELCP_ST_NO_MATCHES
+        call elevate_client_policy_stat;
+        cmp rax, 2;
+        jne ecpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 7: match row 1 -- specific target, caps subset, dur under.
+        // ------------------------------------------------------------
+        mov rax, 7;
+        lea rcx, [rip + _ecpw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0xABCDEF;
+        mov rsi, 2;                      // caps = 0x02
+        mov r10, 15000000000;            // 15s <= 30s
+        mov rdx, r10;
+        call elevate_client_policy_check;
+        cmp rax, 1;                      // idx=1
+        jne ecpw_fail_stage;
+
+        mov rdi, 1;                      // ELCP_ST_HITS should now be 2
+        call elevate_client_policy_stat;
+        cmp rax, 2;
+        jne ecpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 8: target-miss on row 1 -- target 0xFEDCBA != 0xABCDEF.
+        // Row 0 also refuses (caps=0x02 not subset of 0x01).
+        // ------------------------------------------------------------
+        mov rax, 8;
+        lea rcx, [rip + _ecpw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0xFEDCBA;
+        mov rsi, 2;
+        mov r10, 15000000000;
+        mov rdx, r10;
+        call elevate_client_policy_check;
+        mov r10, 0xFFFFEA12;
+        cmp rax, r10;
+        jne ecpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 9: install with caps=0 -> BAD_CAPS refusal, table unchanged.
+        // ------------------------------------------------------------
+        mov rax, 9;
+        lea rcx, [rip + _ecpw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;
+        xor rsi, rsi;                    // caps = 0
+        mov r10, 60000000000;
+        mov rdx, r10;
+        xor rcx, rcx;
+        call elevate_client_policy_install;
+        mov r10, 0xFFFFEA15;             // ELCP_ERR_BAD_CAPS
+        cmp rax, r10;
+        jne ecpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 10: install with caps=0x100 (reserved bit) -> BAD_CAPS.
+        // ELCP_CAP_MASK_VALID = 0xFF, bit 8 is reserved.
+        // ------------------------------------------------------------
+        mov rax, 10;
+        lea rcx, [rip + _ecpw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;
+        mov rsi, 0x100;                  // reserved bit set
+        mov r10, 60000000000;
+        mov rdx, r10;
+        xor rcx, rcx;
+        call elevate_client_policy_install;
+        mov r10, 0xFFFFEA15;             // ELCP_ERR_BAD_CAPS
+        cmp rax, r10;
+        jne ecpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 11: install with dur=0 -> BAD_DUR (below 1s min).
+        // ------------------------------------------------------------
+        mov rax, 11;
+        lea rcx, [rip + _ecpw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;
+        mov rsi, 1;
+        xor rdx, rdx;                    // dur = 0 < 1s
+        xor rcx, rcx;
+        call elevate_client_policy_install;
+        mov r10, 0xFFFFEA14;             // ELCP_ERR_BAD_DUR
+        cmp rax, r10;
+        jne ecpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 12: install with dur=2h -> BAD_DUR (above 1h max).
+        // ------------------------------------------------------------
+        mov rax, 12;
+        lea rcx, [rip + _ecpw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;
+        mov rsi, 1;
+        mov r10, 7200000000000;          // 2h > 1h max
+        mov rdx, r10;
+        xor rcx, rcx;
+        call elevate_client_policy_install;
+        mov r10, 0xFFFFEA14;
+        cmp rax, r10;
+        jne ecpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 13: refused installs did NOT bump count -- still 2 rows.
+        // ------------------------------------------------------------
+        mov rax, 13;
+        lea rcx, [rip + _ecpw_stage];
+        mov [rcx], rax;
+
+        call elevate_client_policy_count;
+        cmp rax, 2;
+        jne ecpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 14: rate-limit exhaustion on row 1 (rate=5).  Five hits
+        // return ELCP_OK; the sixth returns RATE_LIMIT and bumps
+        // ELCP_ST_RATE_DENIES.  r12 holds the loop counter across the
+        // nested calls (callee-save).
+        // ------------------------------------------------------------
+        mov rax, 14;
+        lea rcx, [rip + _ecpw_stage];
+        mov [rcx], rax;
+
+        xor r12, r12;                    // hit counter
+      ecpw_rate_loop:
+        mov rdi, 1;                      // idx=1
+        call elevate_client_policy_hit;
+        cmp rax, 0;                      // ELCP_OK
+        jne ecpw_fail_stage;
+        add r12, 1;
+        cmp r12, 5;
+        jb  ecpw_rate_loop;
+
+        // Sixth hit -- RATE_LIMIT.
+        mov rdi, 1;
+        call elevate_client_policy_hit;
+        mov r10, 0xFFFFEA11;             // ELCP_ERR_RATE_LIMIT
+        cmp rax, r10;
+        jne ecpw_fail_stage;
+
+        mov rdi, 2;                      // ELCP_ST_RATE_DENIES
+        call elevate_client_policy_stat;
+        cmp rax, 1;
+        jne ecpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 15: hit with out-of-range idx=16 -> BAD_ARG (ELCP_MAX_ROWS=16).
+        // ------------------------------------------------------------
+        mov rax, 15;
+        lea rcx, [rip + _ecpw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 16;
+        call elevate_client_policy_hit;
+        mov r10, 0xFFFFEA10;             // ELCP_ERR_BAD_ARG
+        cmp rax, r10;
+        jne ecpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Success.  Log OK, scrub table+stats, return 0.
+        // ------------------------------------------------------------
+        mov rdi, 3;                      // KLOG_LEVEL_INFO (matches broker synth L155)
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecpw_ok];
+        call klog_s1;
+
+        call elevate_client_policy_reset;
+        xor rax, rax;
+        jmp ecpw_out;
+
+      ecpw_fail_stage:
+        // Fail-branch: klog FAIL with `line=<stage>` KV then scrub.
+        lea rax, [rip + _ecpw_stage];
+        mov r8, [rax];                   // value1 -- failing stage id
+        mov rdi, 1;                      // KLOG_LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecpw_fail];
+        lea rcx, [rip + k_line];         // key1 = "line"
+        call klog_s1_d1;
+        call elevate_client_policy_reset;
+        mov rax, 1;
+
+      ecpw_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

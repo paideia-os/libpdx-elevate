@@ -1,7 +1,7 @@
 # libpdx-elevate — status
 
 **Wave:** R49 shared library
-**Current milestone:** M3 (audit + retry integration) — complete
+**Current milestone:** M4 (tests + smoke) — in progress (M4-001 landed)
 
 See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full breakdown.
 
@@ -16,6 +16,7 @@ See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full breakdown
 | M2-003 (#5)     | Cap<KIND_ELEVATE_CHANNEL=0x191> with bounded-lifetime self-invalidation        | LANDED |
 | M3-001 (#6)     | request + response journal via libpdx-audit (extends UEJ_KIND_ELEVATE)         | LANDED |
 | M3-002 (#7)     | retry-with-backoff for transient broker unavailability                         | LANDED |
+| M4-001 (#8)     | auto-approve match/miss matrix against policy table                            | LANDED |
 
 ## M1 — design + skeleton (complete)
 
@@ -192,11 +193,33 @@ See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full breakdown
   user_events_journal.pdx L226). Not blocking; audit records still
   carry seq for ordering.
 
+## M4 — tests + smoke (in progress)
+
+- `tests/elevate_client_policy_test.pdx` (issue #8, LANDED): boot
+  witness `elevate_client_policy_witness` for the client-side
+  auto-approve match/miss matrix.  Fifteen stages, single
+  fingerprint `LIBPDX-ELEVATE M4 POLICY OK`.  Covers:
+    - reset scrubs table + stats
+    - install of a wildcard-target row (row 0) and a specific-
+      target row (row 1) with distinct caps + duration caps
+    - hit paths: wildcard-target match, specific-target match,
+      HITS stat increments in lockstep
+    - miss paths: caps not a subset, dur above row cap, target
+      mismatch; NO_MATCHES stat increments correspondingly
+    - install refusals: caps==0, caps has reserved bits set,
+      dur==0, dur > 1h max; count unaffected
+    - rate-limit exhaustion on row 1 (rate=5): 5 hits ok, 6th
+      returns RATE_LIMIT and bumps RATE_DENIES
+    - out-of-range hit(idx=16) -> BAD_ARG
+  Boot-witness idiom mirrored from
+  `tests/kernel/ipc/elevate_broker_synth.pdx` (paideia-os #1627):
+  stage-tracked, klog OK on success, klog_s1_d1 FAIL carries the
+  failing stage id, table reset on both exits.  Labels `ecpw_`
+  disjoint from every other witness.  Standalone against the
+  client-side table -- no broker daemon dependency.
+
 ## Next
 
-M4 — tests + smoke matrix (auto-approve match/miss, cap-lifetime
-enforcement past deadline, journal record pair landing in
-user_events_journal, retry backoff schedule sample-log). Blocked
-today on the paideia-os elevate broker daemon body (see followups
-above); an M4 harness would need a broker mock or a paideia-os
-change landing the real dispatch first.
+M4-002 (#9) -- cap-lifetime enforcement test (past deadline ->
+kernel revoke fires); one boot witness pair with M4-001.  Then
+M5 -- dual-signed 1.0 release + `.pdxdoc` + mirror push.
