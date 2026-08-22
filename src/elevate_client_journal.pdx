@@ -1,0 +1,490 @@
+// src/elevate_client_journal.pdx -- libpdx-elevate.M3-001 (paideia-os/libpdx-elevate#6)
+//
+// Request + response journal via libpdx-audit (extends UEJ_KIND_ELEVATE).
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The M3 audit-trail integration.  Every ElevateRequest REQ frame is
+// journaled BEFORE it goes on the wire; every APR reply is journaled
+// AFTER it comes back validated.  Two-record shape means an auditor
+// can reconstruct the full policy negotiation from the journal alone,
+// without having to intercept the transport.
+//
+// This lands the "audit trail integration" half of the M3 mandate at
+// design/tooling/r49-r50-plan.md §5.14 M3.  The retry-with-backoff
+// half lives in elevate_client_retry.pdx (M3-002, #7).
+//
+// =============================================================================
+// LIBPDX-AUDIT.M2 DEPENDENCY
+// =============================================================================
+//
+// The design at r49-r50-plan.md §5.14 says "journals via libpdx-audit"
+// -- but libpdx-audit is itself an R49-wave library and its M2 has NOT
+// landed at the time of libpdx-elevate.M3.  So this module wires
+// directly to the kernel's user_events_journal (uej_append) using
+// UEJ_KIND_ELEVATE = 5, which is the same append route libpdx-audit.M2
+// will eventually consume for KIND_ELEVATE events.  The two-hop shape
+// (journal_req + journal_apr) matches libpdx-audit's
+// (audit_begin, audit_record_output, audit_commit) triple minus the
+// commit step -- an elevate has no exit_code the way a tool invocation
+// does, so the commit collapses.
+//
+// When libpdx-audit.M2 lands, replace the direct uej_append calls with
+// the corresponding libpdx-audit entry points; the elevate_client_
+// journal_req / _apr entry points here keep their signatures so the
+// wrapper elevate_client_request_ex_j does not need to change.
+//
+// =============================================================================
+// RECORD LAYOUT (per uej_append)
+// =============================================================================
+//
+// Every elevate audit record uses UEJ_KIND_ELEVATE = 5 and packs the
+// event-specific fields into the three body words:
+//
+//   body0 = ELVJ_EVT_REQ (1) | ELVJ_EVT_APR (2)   -- discriminator
+//   body1 = caps (REQ) | granted_caps (APR)
+//   body2 = duration_ns (REQ) | expire_ns (APR)
+//
+// actor_fp_lo is the caller's low-64 fingerprint (mirrors the
+// process-global _elevate_client_target_fp_lo set via
+// elevate_client_set_target_fp_lo).  subject_fp_lo is 0 for elevate
+// records (user_events_journal.pdx §1 explicitly documents "0 for
+// elevate" so this is the intended convention).
+//
+// =============================================================================
+// PER-OP CONSENT NOTE
+// =============================================================================
+//
+// The r49-r50-plan.md §5.14 M3 line names "each mutating op re-
+// consulted against policy" as an M3 obligation.  The M2 entry point
+// elevate_client_request_ex already runs elevate_client_policy_check
+// on EVERY invocation (see elevate_client_send.pdx L613-L640) -- a
+// caller cannot bypass the consult by holding a stale reference.  The
+// M3 wrapper elevate_client_request_ex_j preserves that per-call
+// discipline AND wraps each attempt with a REQ+APR journal pair, so
+// the audit trail records the full consent sequence for every
+// operation the caller performs.
+//
+// =============================================================================
+// ERROR BAND 0xFFFFEA40..0xFFFFEA4F
+// =============================================================================
+//
+//   0xFFFFEA40  ELVJ_ERR_BAD_ACTOR     -- actor_fp_lo is 0
+//                                          (uej_append refuses 0 actor;
+//                                          gate here so the caller
+//                                          gets a stable client-band
+//                                          error not the kernel band)
+//   0xFFFFEA41  ELVJ_ERR_REQ_JOURNAL_FAIL
+//                                       -- uej_append refused the REQ
+//                                          record; the elevate is
+//                                          aborted (audit-first D3).
+//   0xFFFFEA42  ELVJ_ERR_APR_JOURNAL_FAIL
+//                                       -- uej_append refused the APR
+//                                          record after the elevate
+//                                          succeeded.  The caller now
+//                                          holds a grant that is NOT
+//                                          audit-covered and MUST
+//                                          revoke it (via elevate_
+//                                          client_cap_check_and_revoke)
+//                                          or the audit chain is
+//                                          broken.
+
+module ElevateClientJournal = structure {
+
+  // ---- Wire constants mirrored from user_events_journal.pdx ----
+
+  pub let ELVJ_UEJ_KIND_ELEVATE : u64 = 5
+
+  // ---- Event discriminators (body0 of the audit record) ----
+  //
+  // Chosen to overlap the wire ELV_OP_* codes for REQ (1) and APR (2)
+  // so a reader who has both wire codes and journal discriminators in
+  // hand can join them without a translation table.  EXP (3) does not
+  // journal from the client side; the kernel EXP broadcast handler
+  // journals its own record.
+
+  pub let ELVJ_EVT_REQ : u64 = 1
+  pub let ELVJ_EVT_APR : u64 = 2
+
+  // ---- Result codes / error band 0xFFFFEA40..0xFFFFEA4F ----
+
+  pub let ELVJ_OK                   : u64 = 0
+  pub let ELVJ_ERR_BAD_ACTOR        : u64 = 0xFFFFEA40
+  pub let ELVJ_ERR_REQ_JOURNAL_FAIL : u64 = 0xFFFFEA41
+  pub let ELVJ_ERR_APR_JOURNAL_FAIL : u64 = 0xFFFFEA42
+
+  // Threshold used to discriminate uej_append return (seq | UEJ_ERR_*)
+  // from a valid seq.  UEJ_MAX_RECORDS = 256 per user_events_journal.
+  // pdx §1, so any rax >= 256 is an error.  Kept as a small imm so a
+  // caller-side `cmp rax, 256` fits imm32 without staging.
+  pub let ELVJ_UEJ_SEQ_MAX : u64 = 256
+
+  // ---- Stats ----
+  //
+  //   0 req_writes    successful REQ journal appends
+  //   1 apr_writes    successful APR journal appends
+  //   2 req_fails     uej_append refused a REQ record
+  //   3 apr_fails     uej_append refused an APR record
+  //   4 bad_actor     caller passed actor_fp_lo == 0
+  //   5..7 reserved
+
+  pub let mut _elevate_client_journal_stats : [u64; 8] = uninit @align(64)
+
+  pub let ELVJ_ST_REQ_WRITES : u64 = 0
+  pub let ELVJ_ST_APR_WRITES : u64 = 1
+  pub let ELVJ_ST_REQ_FAILS  : u64 = 2
+  pub let ELVJ_ST_APR_FAILS  : u64 = 3
+  pub let ELVJ_ST_BAD_ACTOR  : u64 = 4
+  pub let ELVJ_ST_MAX        : u64 = 8
+
+  // ==========================================================================
+  // elevate_client_journal_reset() -> ()
+  //
+  // Scrub the stats table.  Boot / teardown only.  Same shape as
+  // elevate_client_stats_reset (elevate_client.pdx).
+  // ==========================================================================
+
+  pub let elevate_client_journal_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M3-001 (#6): clear the 8-slot journal stats table. Boot / teardown discipline; a live counter reset would race any concurrent journal_req / journal_apr call. Leaf; single loop. Labels prefixed elcj_rs_.",
+      block: {
+        lea r10, [rip + _elevate_client_journal_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      elcj_rs_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  elcj_rs_loop;
+        ret
+      }
+    }
+
+  pub let elevate_client_journal_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M3-001 (#6): bounded increment; out-of-range which is a no-op. Same shape as elevate_client_note (elevate_client.pdx L127). Labels prefixed elcj_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae elcj_nt_out;
+        lea r10, [rip + _elevate_client_journal_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      elcj_nt_out:
+        ret
+      }
+    }
+
+  pub let elevate_client_journal_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M3-001 (#6): bounded read; out-of-range which returns 0 (0 is the correct answer for both 'never touched' and 'out of range' -- same convention as elevate_client_stat). Labels prefixed elcj_st_.",
+      block: {
+        cmp rdi, 8;
+        jae elcj_st_zero;
+        lea r10, [rip + _elevate_client_journal_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      elcj_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_journal_req(actor_fp_lo, caps, dur_ns)
+  //   -> seq | ELVJ_ERR_*
+  //
+  // Append a REQ audit record via uej_append.  The kernel primitive
+  // returns the assigned monotonic seq (< 256) on success or a
+  // UEJ_ERR_* code (0xFFFFE5A[B-F]) on refusal.  We normalise any
+  // failure code to ELVJ_ERR_REQ_JOURNAL_FAIL so callers only inspect
+  // the client band -- the specific UEJ_ERR_* is observable via
+  // ELVJ_ST_REQ_FAILS on the stats table.
+  //
+  // Preconditions:
+  //   * actor_fp_lo != 0 (uej_append refuses 0-actor; we gate first
+  //     so the caller sees a distinct ELVJ_ERR_BAD_ACTOR rather than
+  //     an opaque REQ_JOURNAL_FAIL for a caller-side bug).
+  //
+  // Register plan: r12=actor, r13=caps, r14=dur; three callee-save
+  // pushes + one 8-byte alignment pad = 32 bytes; entry rsp%16==8 ->
+  // (8-32) mod 16 == 8 -- but a 3-push has (8-24) mod 16 == 0 so no
+  // pad is needed for 3 pushes.  Wait: uej_append is a 6-arg call
+  // whose args must all be live at the CALL site; keeping actor/caps/
+  // dur in callee-save regs is what lets us pass them without a
+  // second recompute.  3 pushes -> rsp%16 == 0 at CALL, no pad.
+  // ==========================================================================
+
+  pub let elevate_client_journal_req : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (actor_fp_lo: u64) (caps: u64) (dur_ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M3-001 (#6): append a REQ audit record. Three callee-save pushes (r12=actor, r13=caps, r14=dur) = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0 so uej_append CALL sees aligned rsp -- no additional pad required. Gate order matches uej_append's own: actor_fp_lo != 0 first (an audit record with no actor is not verifiable, refuse rather than corrupt the audit trail with an anonymous entry). ELVJ_UEJ_KIND_ELEVATE (5) matches user_events_journal.pdx UEJ_KIND_ELEVATE. body0 = ELVJ_EVT_REQ (1) as the record discriminator; body1 = caps; body2 = dur_ns. Kernel returns seq (< 256) on OK or UEJ_ERR_* (0xFFFFE5A[B-F]) on refusal; we discriminate via `cmp rax, 256` (256 fits imm32, no staging) and collapse any failure to ELVJ_ERR_REQ_JOURNAL_FAIL -- the specific UEJ_ERR_* is observable via ELVJ_ST_REQ_FAILS on the stats table. On success we bump ELVJ_ST_REQ_WRITES via elevate_client_journal_note. Labels prefixed elcj_jr_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                    // actor_fp_lo
+        mov r13, rsi;                    // caps
+        mov r14, rdx;                    // dur_ns
+
+        // Gate: actor_fp_lo != 0.
+        cmp r12, 0;
+        je  elcj_jr_bad_actor;
+
+        // uej_append(kind=5, actor, subject=0, body0=ELVJ_EVT_REQ,
+        //            body1=caps, body2=dur_ns)
+        mov rdi, 5;                      // ELVJ_UEJ_KIND_ELEVATE
+        mov rsi, r12;                    // actor_fp_lo
+        xor rdx, rdx;                    // subject_fp_lo = 0
+        mov rcx, 1;                      // ELVJ_EVT_REQ
+        mov r8,  r13;                    // caps
+        mov r9,  r14;                    // dur_ns
+        call uej_append;
+
+        // rax >= 256 means UEJ_ERR_*; discriminate then normalise.
+        cmp rax, 256;                    // ELVJ_UEJ_SEQ_MAX
+        jae elcj_jr_fail;
+
+        // Success -- bump ELVJ_ST_REQ_WRITES.
+        push rax;                        // stash seq across the note call
+        sub rsp, 8;                      // realign
+        mov rdi, 0;                      // ELVJ_ST_REQ_WRITES
+        call elevate_client_journal_note;
+        add rsp, 8;
+        pop rax;                         // restore seq
+
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcj_jr_fail:
+        mov rdi, 2;                      // ELVJ_ST_REQ_FAILS
+        call elevate_client_journal_note;
+        mov rax, 0xFFFFEA41;             // ELVJ_ERR_REQ_JOURNAL_FAIL
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcj_jr_bad_actor:
+        mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
+        call elevate_client_journal_note;
+        mov rax, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_journal_apr(actor_fp_lo, granted_caps, expire_ns)
+  //   -> seq | ELVJ_ERR_*
+  //
+  // Append an APR audit record.  Same shape as journal_req -- only
+  // the body0 discriminator (ELVJ_EVT_APR = 2) and the body-word
+  // semantics (granted / expire vs requested / duration) differ.
+  //
+  // The caller extracts granted_caps and expire_ns from the reply_buf
+  // returned by elevate_client_request_ex (offsets [+8] and [+16] per
+  // elevate_channel.pdx §1).  This function does not read reply_buf
+  // itself so a caller that already has the two values in registers
+  // does not pay an extra memory hop.
+  //
+  // A failure here after a successful elevate is the audit-trail-
+  // broken case: the grant exists in the kernel table but no audit
+  // record covers it.  The caller MUST then revoke the grant (via
+  // elevate_client_cap_check_and_revoke) or the audit chain is broken.
+  // The higher-level wrapper elevate_client_request_ex_j does exactly
+  // that error surfacing.
+  // ==========================================================================
+
+  pub let elevate_client_journal_apr : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (actor_fp_lo: u64) (granted_caps: u64) (expire_ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M3-001 (#6): append an APR audit record. Shape mirrors elevate_client_journal_req -- see that function's justification for the alignment / gate reasoning. Differences: body0 = ELVJ_EVT_APR (2); body1/body2 are (granted_caps, expire_ns) rather than (caps, dur_ns). Failure normalisation collapses UEJ_ERR_* to ELVJ_ERR_APR_JOURNAL_FAIL and bumps ELVJ_ST_APR_FAILS. Success bumps ELVJ_ST_APR_WRITES. Labels prefixed elcj_ja_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                    // actor_fp_lo
+        mov r13, rsi;                    // granted_caps
+        mov r14, rdx;                    // expire_ns
+
+        cmp r12, 0;
+        je  elcj_ja_bad_actor;
+
+        mov rdi, 5;                      // ELVJ_UEJ_KIND_ELEVATE
+        mov rsi, r12;                    // actor_fp_lo
+        xor rdx, rdx;                    // subject_fp_lo = 0
+        mov rcx, 2;                      // ELVJ_EVT_APR
+        mov r8,  r13;                    // granted_caps
+        mov r9,  r14;                    // expire_ns
+        call uej_append;
+
+        cmp rax, 256;                    // ELVJ_UEJ_SEQ_MAX
+        jae elcj_ja_fail;
+
+        push rax;
+        sub rsp, 8;
+        mov rdi, 1;                      // ELVJ_ST_APR_WRITES
+        call elevate_client_journal_note;
+        add rsp, 8;
+        pop rax;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcj_ja_fail:
+        mov rdi, 3;                      // ELVJ_ST_APR_FAILS
+        call elevate_client_journal_note;
+        mov rax, 0xFFFFEA42;             // ELVJ_ERR_APR_JOURNAL_FAIL
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcj_ja_bad_actor:
+        mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
+        call elevate_client_journal_note;
+        mov rax, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_request_ex_j(caps, dur, req_buf, reply_ep_id,
+  //                             reply_buf, timeout_ns)
+  //   -> ELVC_* | ELVJ_ERR_*
+  //
+  // The M3 audit-wrapped full-flow entry point.  Sequence:
+  //
+  //   (1) Fetch actor_fp_lo from the process-global slot via
+  //       elevate_client_get_target_fp_lo.  Note: a 0 actor means
+  //       "not configured"; journal_req will refuse with BAD_ACTOR
+  //       and the whole flow aborts before the wire hop, which is
+  //       the audit-first D3 discipline (no unattributable elevate).
+  //
+  //   (2) elevate_client_journal_req(actor, caps, dur_ns).
+  //       Failure -> return the ELVJ_ERR_* without ever touching the
+  //       wire.  This is the "audit-first" gate: no audit record ->
+  //       no operation.
+  //
+  //   (3) elevate_client_request_ex(caps, dur, req_buf, reply_ep_id,
+  //                                 reply_buf, timeout_ns).
+  //       Non-zero return -> pass the ELVC_ERR_* back to the caller
+  //       (no APR to journal on failure; the REQ record already
+  //       captures the attempt).
+  //
+  //   (4) On ELVC_OK, extract granted_caps from reply_buf[+8] and
+  //       expire_ns from reply_buf[+16] (per elevate_channel.pdx §1),
+  //       call elevate_client_journal_apr.  If THAT fails, override
+  //       the return with ELVJ_ERR_APR_JOURNAL_FAIL so the caller
+  //       knows to revoke the just-granted cap (audit chain is broken
+  //       otherwise).
+  //
+  // Register plan matches elevate_client_request_ex: six callee-save
+  // pushes + one 8-byte pad = 56 bytes; entry rsp%16==8 -> (8-56) mod
+  // 16 == 0 across every nested call.  We repurpose the pad slot at
+  // [rsp+0] as the stash for actor_fp_lo so we do not need a seventh
+  // callee-save.
+  //
+  //   rbx = caps         (needed by journal_req)
+  //   r12 = dur          (needed by journal_req)
+  //   r13 = req_buf      (passed to elevate_client_request_ex)
+  //   r14 = reply_ep_id  (passed to elevate_client_request_ex)
+  //   r15 = reply_buf    (needed after ex to journal the APR body)
+  //   rbp = timeout_ns   (passed to elevate_client_request_ex)
+  //   [rsp+0] = actor_fp_lo  (stashed after step 1)
+  // ==========================================================================
+
+  pub let elevate_client_request_ex_j : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{boot} =
+    fn (caps: u64) (dur: u64) (req_buf: u64) (reply_ep_id: u64) (reply_buf: u64) (timeout_ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {boot},
+      justification: "libpdx-elevate.M3-001 (#6): audit-wrapped full-flow entry point. Six callee-save pushes (rbx, r12, r13, r14, r15, rbp) + one 8-byte alignment pad = 56 bytes; entry rsp%16==8 -> (8-56) mod 16 == 0 so every nested call (get_target_fp_lo, journal_req, elevate_client_request_ex, journal_apr) sees aligned rsp. The pad slot at [rsp+0] doubles as the stash for actor_fp_lo (avoids a seventh callee-save push). Audit-first D3 discipline: journal_req failure aborts before the wire hop (no operation without an audit record). APR-journal failure after a successful elevate returns ELVJ_ERR_APR_JOURNAL_FAIL so the caller knows to revoke the freshly-granted cap. reply_buf granted_caps at [+8] and expire_ns at [+16] match the ElevateChannel wire spec at src/kernel/core/ipc/elevate_channel.pdx §1. Capability {boot} propagates from the nested elevate_client_request_ex (which pulls it from elevate_client_recv_reply's hpet_now_ns). ELVJ_ERR_* codes exceed imm32 so any equality compare against them stages the constant into r10 first; we only need one such compare here (in the APR-journal failure branch) so it is written inline. Labels prefixed elcj_rx_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;                      // align + stash slot for actor_fp_lo
+
+        mov rbx, rdi;                    // caps
+        mov r12, rsi;                    // dur
+        mov r13, rdx;                    // req_buf
+        mov r14, rcx;                    // reply_ep_id
+        mov r15, r8;                     // reply_buf
+        mov rbp, r9;                     // timeout_ns
+
+        // ---- Step 1: fetch actor_fp_lo from the process-global ----
+        call elevate_client_get_target_fp_lo;
+        mov [rsp + 0], rax;              // stash actor_fp_lo
+
+        // ---- Step 2: journal the REQ (audit-first gate) ----
+        mov rdi, rax;                    // actor_fp_lo
+        mov rsi, rbx;                    // caps
+        mov rdx, r12;                    // dur_ns
+        call elevate_client_journal_req;
+        // rax >= 256 means ELVJ_ERR_* -- pass through.
+        cmp rax, 256;
+        jb  elcj_rx_journaled;
+        // Journal refused -> abort before the wire hop.  rax already
+        // holds the ELVJ_ERR_REQ_JOURNAL_FAIL / ELVJ_ERR_BAD_ACTOR code.
+        jmp elcj_rx_out;
+
+      elcj_rx_journaled:
+        // ---- Step 3: do the elevate ----
+        mov rdi, rbx;                    // caps
+        mov rsi, r12;                    // dur
+        mov rdx, r13;                    // req_buf
+        mov rcx, r14;                    // reply_ep_id
+        mov r8,  r15;                    // reply_buf
+        mov r9,  rbp;                    // timeout_ns
+        call elevate_client_request_ex;
+        cmp rax, 0;
+        jne elcj_rx_out;                 // ELVC_ERR_* -> pass through
+
+        // ---- Step 4: journal the APR (audit chain closer) ----
+        mov rdi, [rsp + 0];              // actor_fp_lo
+        mov rsi, [r15 + 8];              // granted_caps
+        mov rdx, [r15 + 16];             // expire_ns
+        call elevate_client_journal_apr;
+        // Success (rax < 256) collapses to ELVC_OK; failure (rax in
+        // 0xFFFFEA4* band) surfaces as-is so the caller knows the
+        // grant is not audit-covered.
+        cmp rax, 256;
+        jb  elcj_rx_success;
+        // APR-journal failure -- pass the ELVJ_ERR_APR_JOURNAL_FAIL /
+        // ELVJ_ERR_BAD_ACTOR back to the caller.
+        jmp elcj_rx_out;
+
+      elcj_rx_success:
+        xor rax, rax;                    // ELVC_OK
+
+      elcj_rx_out:
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

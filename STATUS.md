@@ -1,7 +1,7 @@
 # libpdx-elevate — status
 
 **Wave:** R49 shared library
-**Current milestone:** M2 (core implementation) — complete
+**Current milestone:** M3 (audit + retry integration) — M3-001 landed, M3-002 in progress
 
 See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full breakdown.
 
@@ -14,6 +14,8 @@ See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full breakdown
 | M2-001 (#3)     | auto-approve path: consult elevate_policy.pdx before human hop                 | LANDED |
 | M2-002 (#4)     | human-approve path with timeout (default 30s, per-request configurable)        | LANDED |
 | M2-003 (#5)     | Cap<KIND_ELEVATE_CHANNEL=0x191> with bounded-lifetime self-invalidation        | LANDED |
+| M3-001 (#6)     | request + response journal via libpdx-audit (extends UEJ_KIND_ELEVATE)         | LANDED |
+| M3-002 (#7)     | retry-with-backoff for transient broker unavailability                         | OPEN   |
 
 ## M1 — design + skeleton (complete)
 
@@ -99,34 +101,75 @@ See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full breakdown
   (`ELCC_ERR_BAD_ROW`, `MINT_FAIL`, `NO_DEADLINE`, `REVOKE_FAIL`,
   `ELCC_STATE_LIVE`, `EXPIRED`, `REVOKED`, `ELCC_NOTE_NO_NARROW`).
 
+## M3 — audit + retry integration (in progress)
+
+- `src/elevate_client_journal.pdx` (issue #6, LANDED): REQ + APR
+  journal through the kernel's `uej_append` (UEJ_KIND_ELEVATE = 5).
+  Two-record shape means an auditor can reconstruct the full policy
+  negotiation from the journal alone. Provides:
+    - `elevate_client_journal_req(actor_fp_lo, caps, dur_ns) -> seq`
+      — body0 = ELVJ_EVT_REQ (1), body1 = caps, body2 = dur_ns.
+    - `elevate_client_journal_apr(actor_fp_lo, granted_caps, expire_ns)
+      -> seq` — body0 = ELVJ_EVT_APR (2), body1 = granted_caps,
+      body2 = expire_ns.
+    - `elevate_client_request_ex_j(...)` — audit-first wrapper over
+      the M2 `elevate_client_request_ex`. Sequence: fetch actor_fp_lo
+      (process-global) → journal REQ → run elevate → journal APR on
+      success. REQ-journal failure aborts before the wire hop (audit-
+      first D3 discipline). APR-journal failure after grant returns
+      `ELVJ_ERR_APR_JOURNAL_FAIL` so the caller knows to revoke the
+      grant (audit chain is broken otherwise).
+    - Per-op consent: `elevate_client_request_ex` already runs
+      `elevate_client_policy_check` on every invocation (M2). The
+      M3 wrapper preserves this per-call discipline and adds the
+      journal pair, so every mutating op is both policy-consulted
+      AND audit-recorded.
+
+**Error band added at M3-001:**
+- `0xFFFFEA40..0xFFFFEA4F` — `ElevateClientJournal` band
+  (`ELVJ_ERR_BAD_ACTOR`, `ELVJ_ERR_REQ_JOURNAL_FAIL`,
+  `ELVJ_ERR_APR_JOURNAL_FAIL`).
+
 ## Cross-repo dependencies
 
 - **paideia-os (at HEAD)** — `KIND_ELEVATE_CHANNEL = 0x191`
   (#1626), broker registration (#1627), wire codec (#1549), policy
-  table (#1550) all present. M2 additionally consumes kernel
-  primitives: `endpoint_write_pending`, `endpoint_take_pending`,
-  `hpet_now_ns`, `elevate_channel_cap_mint_inner`,
-  `elevate_channel_cap_revoke`.
+  table (#1550), user_events_journal (`uej_append`, #1544) all
+  present. M2/M3 consume kernel primitives: `endpoint_write_pending`,
+  `endpoint_take_pending`, `hpet_now_ns`, `svc_lookup`, `uej_append`,
+  `elevate_channel_cap_mint_inner`, `elevate_channel_cap_revoke`.
 - **libpdx-cap.M2** — NOT yet landed. `elevate_client_cap.pdx`
   ships `elevate_client_cap_narrow_stub` as a placeholder; when
   libpdx-cap.M2 lands, replace the stub body with a call to
-  `cap_narrow_rights`. No M2 flow blocks on the stub returning the
-  passthrough value.
+  `cap_narrow_rights`. No M2/M3 flow blocks on the stub returning
+  the passthrough value.
+- **libpdx-audit.M2** — NOT yet landed. M3-001 wires directly to
+  kernel `uej_append` under UEJ_KIND_ELEVATE (5), which is the same
+  route libpdx-audit.M2 will eventually consume. When libpdx-audit
+  lands, `elevate_client_journal_req/_apr` bodies swap to
+  `audit_begin`/`audit_record_output`/`audit_commit` calls; the
+  wrapper `elevate_client_request_ex_j` keeps its signature.
 
-## Followups for paideia-os (not blocking M2)
+## Followups for paideia-os (not blocking M3)
 
 - Kernel-side `elevate_channel_row_set_expire(row_id, expire_ns)` or
   a mint variant accepting `expire_ns` would let the shadow deadline
-  map collapse back into the row's `[+32]` slot. `elevate_client_cap.pdx`
-  API is designed to make that migration transparent to callers.
+  map in `elevate_client_cap.pdx` collapse back into the row's
+  `[+32]` slot. API is designed to make that migration transparent
+  to callers.
 - Broker daemon body (currently `ELVB_DISPATCH_STUB` in
   `src/kernel/core/ipc/elevate_broker.pdx`) — until it consumes REQ
-  frames and produces APR replies, `elevate_client_request_ex` will
-  reliably time out. M4 will exercise the full loop once the
-  broker daemon lands.
+  frames and produces APR replies, `elevate_client_request_ex*` will
+  reliably time out. M4 will exercise the full loop once the broker
+  daemon lands.
+- `tick_ns` wire in `uej_append` (currently placeholder 0 per
+  user_events_journal.pdx L226). Not blocking; audit records still
+  carry seq for ordering.
 
 ## Next
 
-M3 — semantic-pipe / audit integration (extends `UEJ_KIND_ELEVATE`
-via libpdx-audit) + retry-with-backoff for transient broker
-unavailability. Depends on libpdx-audit.M2.
+M3-002 — retry-with-backoff for transient broker unavailability
+(issue #7). Wraps `elevate_client_request_ex_j` with a bounded
+retry loop for the transient broker-side symptoms
+(`ELVC_ERR_TIMEOUT`, `ELVC_ERR_SEND_FAIL`, `ELVC_ERR_LOOKUP_FAIL`).
+Then M4 — tests + smoke matrix.
