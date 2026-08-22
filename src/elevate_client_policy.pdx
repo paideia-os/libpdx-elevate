@@ -1,0 +1,540 @@
+// src/elevate_client_policy.pdx -- libpdx-elevate.M2-001 (paideia-os/libpdx-elevate#3)
+//
+// Client-side auto-approve policy: consult elevate_policy before human hop.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The client-side mirror of the kernel-side ElevatePolicy table at
+// src/kernel/core/user/elevate_policy.pdx (R48.M7-002 #1550).  Same
+// match semantics -- (row.flags ENABLED) AND (row.target == 0 OR ==
+// target) AND (requested caps ⊆ row.caps) AND (dur <= row.max_dur) --
+// but re-implemented locally in the client library so the "fast-path
+// vs human-approve" branch decision does NOT require a syscall round-
+// trip on every request.
+//
+// The client-side table is authoritative for THIS PROCESS's
+// pre-classification only.  The broker's own kernel table remains the
+// source of truth for auto-approval enforcement (it is what actually
+// mints the elevate cap); the client-side check is a CACHED FAST PATH
+// that lets:
+//
+//   * A tool that already knows its request will fast-path (e.g. `pkg
+//     install` under a founder-signed pkg-install rule) request a short
+//     recv timeout (say 500 ms) rather than the default 30-second human
+//     window -- so a broker crash or a race with policy expiry surfaces
+//     as ELVC_ERR_TIMEOUT quickly rather than blocking the interactive
+//     session for 30 seconds.
+//
+//   * A tool that knows its request will NOT fast-path (e.g. `pkg
+//     purge --system`) skip the fast timeout and go straight to the
+//     human timeout, so the founder is not asked to react on a shorter
+//     clock than they expect.
+//
+// The library user seeds this table with the same rules the founder
+// signed into the kernel policy at boot (or a strict subset -- a rule
+// present here but not in the kernel just means the client will try
+// the fast path and the broker will fall back to human, which is
+// safe).  A rule present in the kernel but not here means the client
+// pessimistically assumes human-approve, which is also safe.
+//
+// =============================================================================
+// ROW LAYOUT -- 48 BYTES, SIX U64 WORDS
+// =============================================================================
+//
+//   [+0]   header:   magic(32) | version(16) | flags(16)
+//   [+8]   target_user_fp_lo    (0 = any user)
+//   [+16]  caps_mask            (rule matches when REQ.caps ⊆ this)
+//   [+24]  max_duration_ns      (grant duration capped at this)
+//   [+32]  rate_per_hour(32) | window_hits(32)
+//   [+40]  reserved             (0)
+//
+// magic = 'PDXP' (0x50585044) -- same magic as kernel ElevatePolicy so
+// a boot-time policy loader that reads a shared on-disk file can hand
+// the SAME row bytes to both ep_install and elevate_client_policy_
+// install with just a widened bit-copy for the client's 48-byte shape.
+//
+// =============================================================================
+// ERROR BAND 0xFFFFEA10..0xFFFFEA1F
+// =============================================================================
+//
+// Distinct from elevate_client.pdx's 0xFFFFEA00..0xFFFFEA0F so a caller
+// inspecting a return value can tell "the transport refused" (ELVC_*
+// band) from "the client-side policy refused" (ELCP_* band) at a
+// glance -- symmetric to the kernel's 0xFFFFE5F0..0xFFFFE5FF vs
+// 0xFFFFE5E0..0xFFFFE5EF split.
+//
+//   0xFFFFEA10  ELCP_ERR_BAD_ARG    -- generic gate refusal
+//   0xFFFFEA11  ELCP_ERR_RATE_LIMIT -- row's per-hour cap reached
+//   0xFFFFEA12  ELCP_ERR_NO_MATCH   -- ep_check semantics: no row matched
+//   0xFFFFEA13  ELCP_ERR_ENOSPC     -- table full (16 rows)
+//   0xFFFFEA14  ELCP_ERR_BAD_DUR    -- max_dur outside [1s, 1h]
+//   0xFFFFEA15  ELCP_ERR_BAD_CAPS   -- caps == 0 or reserved bits set
+
+module ElevateClientPolicy = structure {
+
+  // ---- Row + table geometry ----
+
+  pub let ELCP_MAX_ROWS   : u64 = 16
+  pub let ELCP_ROW_BYTES  : u64 = 48
+  pub let ELCP_ROW_WORDS  : u64 = 6
+
+  // 16 * 6 = 96 u64 slots.
+  pub let mut _elevate_client_policy_table : [u64; 96] = uninit @align(64)
+
+  // Eight-word stats table -- same shape as _elevate_client_stats /
+  // _ep_stats / _elevate_broker_stats.  Slots:
+  //   0 count         installed row count
+  //   1 hits          matches this boot
+  //   2 rate_denies   refused for rate limit
+  //   3 no_matches    misses (bumps every ep_check that returns NO_MATCH)
+  //   4..7 reserved
+  pub let mut _elevate_client_policy_stats : [u64; 8] = uninit @align(64)
+
+  pub let ELCP_ST_COUNT       : u64 = 0
+  pub let ELCP_ST_HITS        : u64 = 1
+  pub let ELCP_ST_RATE_DENIES : u64 = 2
+  pub let ELCP_ST_NO_MATCHES  : u64 = 3
+  pub let ELCP_ST_MAX         : u64 = 8
+
+  // ---- Header magic + version + flag ----
+
+  pub let ELCP_MAGIC        : u64 = 0x50585044   // 'PDXP' -- same as kernel
+  pub let ELCP_VERSION      : u64 = 1
+  pub let ELCP_FLAG_ENABLED : u64 = 0x0001
+
+  // ---- Result codes ----
+
+  pub let ELCP_OK              : u64 = 0
+  pub let ELCP_ERR_BAD_ARG     : u64 = 0xFFFFEA10
+  pub let ELCP_ERR_RATE_LIMIT  : u64 = 0xFFFFEA11
+  pub let ELCP_ERR_NO_MATCH    : u64 = 0xFFFFEA12
+  pub let ELCP_ERR_ENOSPC      : u64 = 0xFFFFEA13
+  pub let ELCP_ERR_BAD_DUR     : u64 = 0xFFFFEA14
+  pub let ELCP_ERR_BAD_CAPS    : u64 = 0xFFFFEA15
+
+  // Duration bounds -- mirror of ELV_DUR_MIN_NS / ELV_DUR_MAX_NS in
+  // elevate_request.pdx.  Redeclared here so a policy install can be
+  // gated without a cross-file constant reference.
+
+  pub let ELCP_DUR_MIN_NS : u64 = 1000000000            // 1 sec
+  pub let ELCP_DUR_MAX_NS : u64 = 3600000000000         // 1 hour
+
+  pub let ELCP_CAP_MASK_VALID : u64 = 0x00FF            // bits 0..7 (mirror)
+
+  // ==========================================================================
+  // elevate_client_policy_reset() -> ()
+  //
+  // Scrub table + stats.  Idempotent.  Runtime callers should hold no
+  // pending policy_check when this fires -- a concurrent match against
+  // a scrubbed row is not a corruption (the row is refused for a
+  // missing magic before any body word is read) but IS a lost hit.
+  // ==========================================================================
+
+  pub let elevate_client_policy_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-001 (#3): clear the 96-slot policy table and the 8-slot stats table. Same shape as ep_reset at src/kernel/core/user/elevate_policy.pdx:74 -- boot + teardown discipline. Leaf; two separate loops so the two arrays' lengths do not have to be composed in code. Labels prefixed elcp_rs_.",
+      block: {
+        lea r10, [rip + _elevate_client_policy_table];
+        xor rax, rax;
+        xor rcx, rcx;
+      elcp_rs_table:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        mov r11, 96;
+        cmp rcx, r11;
+        jb  elcp_rs_table;
+
+        lea r10, [rip + _elevate_client_policy_stats];
+        xor rcx, rcx;
+      elcp_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  elcp_rs_stats;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_policy_count() -> u64
+  //
+  // Loaded (enabled+installed) row count.  Leaf.
+  // ==========================================================================
+
+  pub let elevate_client_policy_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-001 (#3): return the count stat slot 0.  Leaf. Labels prefixed elcp_ct_.",
+      block: {
+        lea r10, [rip + _elevate_client_policy_stats];
+        mov rax, [r10 + 0];
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_policy_stat(which) -> u64
+  //
+  // Bounded read from the stats table; out-of-range returns 0.  Same
+  // shape as elevate_client_stat.
+  // ==========================================================================
+
+  pub let elevate_client_policy_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-001 (#3): bounded read; out-of-range which returns 0 (0 is the correct answer for both 'never touched' and 'out of range', see elevate_client_stat in elevate_client.pdx). Labels prefixed elcp_gs_.",
+      block: {
+        cmp rdi, 8;
+        jae elcp_gs_zero;
+        lea r10, [rip + _elevate_client_policy_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      elcp_gs_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_policy_row_va(idx) -> row_va | 0
+  //
+  // Compute the byte address of policy row `idx` within the table.
+  // Returns 0 for out-of-range idx (used by the internal walker; a
+  // caller should never receive 0 from a bounded scan).  Row byte
+  // stride is 48 = 32 + 16, so va = base + (idx << 5) + (idx << 4).
+  // ==========================================================================
+
+  pub let elevate_client_policy_row_va : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-001 (#3): idx -> row VA. Stride 48 = 32 + 16 = (idx<<5) + (idx<<4). Same expansion pattern as ep_row_va at src/kernel/core/user/elevate_policy.pdx:111 (that file uses stride 96 = 64+32). Returns 0 on out-of-range. Labels prefixed elcp_va_.",
+      block: {
+        cmp rdi, 16;
+        jae elcp_va_zero;
+        mov r10, rdi;
+        shl r10, 5;                      // idx * 32
+        mov r11, rdi;
+        shl r11, 4;                      // idx * 16
+        add r10, r11;                    // idx * 48
+        lea rax, [rip + _elevate_client_policy_table];
+        add rax, r10;
+        ret;
+      elcp_va_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_policy_install(target_fp_lo, caps, max_dur, rate_per_hour)
+  //   -> idx | ELCP_ERR_*
+  //
+  // Append a policy row.  Gates:
+  //
+  //   (1) caps != 0 AND (caps & ~ELCP_CAP_MASK_VALID) == 0  -> BAD_CAPS
+  //   (2) max_dur in [ELCP_DUR_MIN_NS, ELCP_DUR_MAX_NS]     -> BAD_DUR
+  //   (3) count < ELCP_MAX_ROWS                             -> ENOSPC
+  //
+  // rate_per_hour is stored as-is; 0 means unlimited (matches
+  // ElevatePolicy's convention).  window_hits starts at 0.  Bumps
+  // count on success.  Labels prefixed elcp_in_.
+  // ==========================================================================
+
+  pub let elevate_client_policy_install : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (target_fp_lo: u64) (caps: u64) (max_dur: u64) (rate_per_hour: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-001 (#3): install a client-side policy row. Mirror of ep_install at src/kernel/core/user/elevate_policy.pdx:144 with the 48-byte layout described in the file header. Six callee-save pushes (rbx, r12, r13, r14, r15, rbp); the function makes NO nested calls (row VA is inlined) so alignment on the nested-call boundary is irrelevant here -- matches the kernel ep_install shape exactly. r12=target, r13=caps, r14=max_dur, r15=rate; rbp=row VA once the ENOSPC gate has passed; rbx=count/idx for the return. Reserved-bit refusal on caps uses `mov r10, 0xFF; and r10, r13; cmp r10, r13` -- same trick as elv_mask_valid / elevate_request_cap_mask_valid. Both duration bounds exceed imm32 and are staged in r10/r11 per the paideia-as compliance discipline. Header magic + version + flags composed in r10 then stored as one qword. Row VA inlined via `(idx<<5) + (idx<<4)` -- matches ep_install L179's `shl r10, 6 + shl r11, 5` idiom for stride 96, adapted here to stride 48. Labels prefixed elcp_in_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+
+        mov r12, rdi;                    // target_fp_lo
+        mov r13, rsi;                    // caps
+        mov r14, rdx;                    // max_dur
+        mov r15, rcx;                    // rate_per_hour
+
+        // (1) Cap-mask gate: non-zero AND no reserved bits.
+        cmp r13, 0;
+        je  elcp_in_bad_caps;
+        mov r10, 0xFF;
+        and r10, r13;
+        cmp r10, r13;
+        jne elcp_in_bad_caps;
+
+        // (2) Duration gate.
+        mov r10, 1000000000;             // ELCP_DUR_MIN_NS
+        cmp r14, r10;
+        jb  elcp_in_bad_dur;
+        mov r11, 3600000000000;          // ELCP_DUR_MAX_NS
+        cmp r14, r11;
+        ja  elcp_in_bad_dur;
+
+        // (3) Table-fullness gate.
+        lea r10, [rip + _elevate_client_policy_stats];
+        mov rbx, [r10 + 0];              // count
+        cmp rbx, 16;
+        jae elcp_in_enospc;
+
+        // Compute row VA inline: (idx<<5) + (idx<<4).
+        mov r10, rbx;
+        shl r10, 5;                      // idx * 32
+        mov r11, rbx;
+        shl r11, 4;                      // idx * 16
+        add r10, r11;                    // idx * 48
+        lea rbp, [rip + _elevate_client_policy_table];
+        add rbp, r10;                    // rbp = row VA
+
+        // Word0: magic(32) | version(16) | flags(16).
+        mov r10, 0x50585044;             // ELCP_MAGIC
+        mov r11, 1;                      // ELCP_VERSION
+        shl r11, 32;
+        or  r10, r11;
+        mov r11, 1;                      // ELCP_FLAG_ENABLED
+        shl r11, 48;
+        or  r10, r11;
+        mov [rbp + 0], r10;
+
+        // Body.
+        mov [rbp + 8],  r12;             // target_fp_lo
+        mov [rbp + 16], r13;             // caps
+        mov [rbp + 24], r14;             // max_dur
+
+        // Word4: rate_per_hour(32) | hits(32)=0.
+        mov r10, r15;
+        and r10, 0xFFFFFFFF;
+        mov [rbp + 32], r10;
+
+        // Word5: reserved.
+        xor r10, r10;
+        mov [rbp + 40], r10;
+
+        // count++.
+        lea r10, [rip + _elevate_client_policy_stats];
+        mov r11, [r10 + 0];
+        add r11, 1;
+        mov [r10 + 0], r11;
+
+        mov rax, rbx;                    // return the assigned idx
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcp_in_bad_caps:
+        mov rax, 0xFFFFEA15;             // ELCP_ERR_BAD_CAPS
+        jmp elcp_in_out;
+      elcp_in_bad_dur:
+        mov rax, 0xFFFFEA14;             // ELCP_ERR_BAD_DUR
+        jmp elcp_in_out;
+      elcp_in_enospc:
+        mov rax, 0xFFFFEA13;             // ELCP_ERR_ENOSPC
+
+      elcp_in_out:
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_policy_check(target_fp_lo, caps, dur) -> idx | ELCP_ERR_*
+  //
+  // Look for the first row that matches (target, caps subset, dur cap
+  // OK).  Row matches iff:
+  //   (a) row.flags has ENABLED
+  //   (b) row.target_fp_lo == 0 OR row.target_fp_lo == target
+  //   (c) (caps & row.caps) == caps    -- requested is subset of granted
+  //   (d) dur <= row.max_dur
+  //
+  // Rows whose magic does not match ELCP_MAGIC are skipped (a scrubbed
+  // or reset row is not a match).  Returns row idx on match; bumps
+  // hits.  Returns ELCP_ERR_NO_MATCH otherwise; bumps no_matches.
+  //
+  // Mirror of ep_check at src/kernel/core/user/elevate_policy.pdx:258.
+  // ==========================================================================
+
+  pub let elevate_client_policy_check : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (target_fp_lo: u64) (caps: u64) (dur: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-001 (#3): scan the 16-row policy table for a match. Mirror of ep_check in src/kernel/core/user/elevate_policy.pdx:258. Five callee-save pushes (rbx, r12, r13, r14, r15) -- (8 - 40) mod 16 = 0, so the function makes NO nested calls (row VA is inlined) and no alignment pad is needed. r12=target, r13=caps, r14=dur; rbx=scan cursor; r15=count. On a hit, bumps ELCP_ST_HITS via a lea+load+add+store (bounded stat write inline). On no-match, bumps ELCP_ST_NO_MATCHES. Row VA inlined per the ep_check L281 pattern (shl r10, 5 + shl r11, 4 for stride 48). Labels prefixed elcp_ck_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                    // target
+        mov r13, rsi;                    // caps
+        mov r14, rdx;                    // dur
+
+        lea r15, [rip + _elevate_client_policy_stats];
+        mov r15, [r15 + 0];              // count
+        xor rbx, rbx;
+
+      elcp_ck_scan:
+        cmp rbx, r15;
+        jae elcp_ck_no_match;
+
+        // Row VA inline: (idx<<5) + (idx<<4) = idx * 48.
+        mov r10, rbx;
+        shl r10, 5;
+        mov r11, rbx;
+        shl r11, 4;
+        add r10, r11;
+        mov rcx, r10;
+        lea r10, [rip + _elevate_client_policy_table];
+        add r10, rcx;                    // r10 = row VA
+
+        // Magic gate.
+        mov rax, [r10 + 0];
+        mov r11, rax;
+        and r11, 0xFFFFFFFF;
+        mov rcx, 0x50585044;
+        cmp r11, rcx;
+        jne elcp_ck_next;
+
+        // Enabled bit.
+        mov r11, rax;
+        shr r11, 48;
+        and r11, 0xFFFF;
+        and r11, 1;
+        cmp r11, 0;
+        je  elcp_ck_next;
+
+        // Target match: row.target == 0 OR == r12.
+        mov r11, [r10 + 8];
+        cmp r11, 0;
+        je  elcp_ck_target_ok;
+        cmp r11, r12;
+        jne elcp_ck_next;
+      elcp_ck_target_ok:
+
+        // Caps subset -- (caps & row.caps) == caps.
+        mov r11, [r10 + 16];
+        mov rax, r13;
+        and rax, r11;
+        cmp rax, r13;
+        jne elcp_ck_next;
+
+        // Duration cap.
+        mov r11, [r10 + 24];
+        cmp r14, r11;
+        ja  elcp_ck_next;
+
+        // Match -- bump ELCP_ST_HITS.
+        lea r10, [rip + _elevate_client_policy_stats];
+        mov r11, [r10 + 8];
+        add r11, 1;
+        mov [r10 + 8], r11;
+
+        mov rax, rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcp_ck_next:
+        add rbx, 1;
+        jmp elcp_ck_scan;
+
+      elcp_ck_no_match:
+        lea r10, [rip + _elevate_client_policy_stats];
+        mov r11, [r10 + 24];             // ELCP_ST_NO_MATCHES at slot 3
+        add r11, 1;
+        mov [r10 + 24], r11;
+
+        mov rax, 0xFFFFEA12;             // ELCP_ERR_NO_MATCH
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_policy_hit(idx) -> ELCP_OK | ELCP_ERR_*
+  //
+  // Bump the window_hits counter of a matched row.  If the counter
+  // would exceed rate_per_hour (row's 32-bit rate cap), refuses
+  // RATE_LIMIT and bumps rate_denies.
+  //
+  // rate_per_hour == 0 means unlimited (no rate gate).  Mirror of
+  // ep_hit_row in src/kernel/core/user/elevate_policy.pdx:361.
+  //
+  // The M2 client MVP treats rate_per_hour as a LIFETIME cap (same
+  // simplification as the kernel); a windowed reset lands with the
+  // kernel-side revision.
+  // ==========================================================================
+
+  pub let elevate_client_policy_hit : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-001 (#3): register a hit on a matched row. Refuses RATE_LIMIT if window_hits would exceed rate_per_hour; refuses BAD_ARG on out-of-range idx. Mirror of ep_hit_row at src/kernel/core/user/elevate_policy.pdx:361 with the 48-byte row shape and low-32/high-32 rate/hits packing. Leaf -- row VA is inlined (same idiom as ep_hit_row L370) so no nested call, no push/pop, no alignment concern. rate_per_hour==0 means unlimited (mirror of ep_hit_row). Labels prefixed elcp_hr_.",
+      block: {
+        cmp rdi, 16;
+        jae elcp_hr_bad_arg;
+
+        // Row VA inline.
+        mov r10, rdi;
+        shl r10, 5;
+        mov r11, rdi;
+        shl r11, 4;
+        add r10, r11;
+        lea rcx, [rip + _elevate_client_policy_table];
+        add rcx, r10;                    // rcx = row VA
+
+        // Word4: rate_per_hour(32) | hits(32).
+        mov rax, [rcx + 32];
+        mov r10, rax;
+        and r10, 0xFFFFFFFF;             // rate_per_hour
+        mov r11, rax;
+        shr r11, 32;                     // hits
+
+        cmp r10, 0;
+        je  elcp_hr_pass;                // unlimited
+        cmp r11, r10;
+        jae elcp_hr_limit;
+
+      elcp_hr_pass:
+        add r11, 1;
+        shl r11, 32;
+        and rax, 0xFFFFFFFF;
+        or  rax, r11;
+        mov [rcx + 32], rax;
+
+        xor rax, rax;                    // ELCP_OK
+        ret;
+
+      elcp_hr_limit:
+        lea r10, [rip + _elevate_client_policy_stats];
+        mov r11, [r10 + 16];             // ELCP_ST_RATE_DENIES at slot 2
+        add r11, 1;
+        mov [r10 + 16], r11;
+        mov rax, 0xFFFFEA11;             // ELCP_ERR_RATE_LIMIT
+        ret;
+
+      elcp_hr_bad_arg:
+        mov rax, 0xFFFFEA10;             // ELCP_ERR_BAD_ARG
+        ret
+      }
+    }
+}
