@@ -1,0 +1,700 @@
+// src/elevate_client_send.pdx -- libpdx-elevate.M2-002 (paideia-os/libpdx-elevate#4)
+//
+// Real ElevateRequest send-and-block-on-reply with configurable timeout.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The M2 successor to the M1 skeleton at elevate_client.pdx.  M1
+// stopped one step short of dispatch (lookup succeeded, no
+// endpoint_write_pending call); M2 lands the real transport half:
+//
+//   1. Assemble the 32-byte REQ payload into caller-provided req_buf
+//      via elevate_request_write_frame (M1).
+//   2. Resolve svc.elevate-broker via elevate_client_lookup_broker
+//      (M1).
+//   3. Pack the 8-byte IPC frame header inline (op=ELV_OP_REQ, ver=1,
+//      reply_endpoint_id=caller's ep, payload_len=32) matching the
+//      layout at src/kernel/core/ipc/frame.pdx §Storage strategy so
+//      the encoded hdr is byte-identical to what frame_encode would
+//      write.  Publish via endpoint_write_pending(broker_ep, hdr,
+//      req_buf, 32).
+//   4. Poll endpoint_take_pending(reply_ep_id, hdr_scratch, reply_buf)
+//      in a bounded loop; compute deadline = hpet_now_ns() + timeout
+//      up-front and refuse ELVC_ERR_TIMEOUT once now >= deadline.
+//   5. Parse the returned 32-byte APR payload: op == ELV_OP_APR,
+//      granted_caps is a subset of the requested mask (elv_check_grant
+//      semantics), expire_ns > 0.  Mismatch -> ELVC_ERR_BAD_REPLY /
+//      ELVC_ERR_GRANT_INVALID.
+//   6. Return ELVC_OK; the caller uses reply_buf's expire_ns as the
+//      cap's bounded-lifetime deadline (see elevate_client_cap.pdx,
+//      M2-003).
+//
+// The M1 entry point elevate_client_request(caps, dur, req_buf,
+// reply_buf) remains unchanged as a source-compatibility surface --
+// its ELVC_STUB return is preserved so a caller not yet upgraded to
+// the M2 API sees the same behaviour.  New callers should use
+// elevate_client_request_ex which accepts (target_fp_lo, reply_ep_id,
+// timeout_ns) explicitly.
+//
+// =============================================================================
+// AUTO-APPROVE FAST PATH
+// =============================================================================
+//
+// Before the send hop, elevate_client_request_ex consults
+// elevate_client_policy_check (M2-001).  A match does NOT skip the
+// broker -- the broker is still the source of truth for enforcement
+// -- but it lets the caller select a SHORT recv timeout (default
+// 500 ms, exposed via elevate_client_fast_timeout_ns) rather than
+// the default HUMAN_TIMEOUT (30 s).  A miss selects HUMAN_TIMEOUT.
+// The two-tier timeout is what lets a founder's shell not block for
+// 30 seconds on a rule-covered `pkg install` when the broker crashes
+// or the policy expires between client cache warmup and the actual
+// request.
+//
+// A caller who wants FULL manual control passes an explicit
+// timeout_ns to elevate_client_request_ex; the fast-path selection
+// only fires when timeout_ns == 0 ("use default").
+//
+// =============================================================================
+// ERROR CODES (extension of elevate_client.pdx band 0xFFFFEA00..0xFFFFEA0F)
+// =============================================================================
+//
+//   0xFFFFEA01  ELVC_ERR_TIMEOUT       -- deadline reached with no reply
+//   0xFFFFEA02  ELVC_ERR_BAD_REPLY     -- reply op != ELV_OP_APR
+//   0xFFFFEA03  ELVC_ERR_GRANT_INVALID -- granted caps not a subset of requested
+//   0xFFFFEA04  ELVC_ERR_BAD_EXPIRE    -- reply expire_ns is 0 or in the past
+//   0xFFFFEA05  ELVC_ERR_BAD_REPLY_EP  -- reply_ep_id out of [1..127]
+//   0xFFFFEA0C  ELVC_ERR_RECV_FAIL     -- endpoint_take_pending refused
+//                                          (kept as M1-reserved alias for parity)
+//   0xFFFFEA0D  ELVC_ERR_SEND_FAIL     -- endpoint_write_pending refused
+//                                          (kept as M1-reserved alias for parity)
+
+module ElevateClientSend = structure {
+
+  // ---- New error codes in the extension slots 0x01..0x05 ----
+
+  pub let ELVC_ERR_TIMEOUT        : u64 = 0xFFFFEA01
+  pub let ELVC_ERR_BAD_REPLY      : u64 = 0xFFFFEA02
+  pub let ELVC_ERR_GRANT_INVALID  : u64 = 0xFFFFEA03
+  pub let ELVC_ERR_BAD_EXPIRE     : u64 = 0xFFFFEA04
+  pub let ELVC_ERR_BAD_REPLY_EP   : u64 = 0xFFFFEA05
+
+  // ---- Default timeouts ----
+  //
+  // HUMAN_TIMEOUT_DEFAULT is a founder-in-the-loop expectation: an
+  // interactive approve should complete within a reasonable window
+  // after the request lands in the approver's inbox.  30 seconds
+  // matches the design at plan.md §5.14 M2.
+  //
+  // FAST_TIMEOUT_DEFAULT is the auto-approve expectation: a matched
+  // policy row means the broker's internal policy-consult should
+  // complete in microseconds; a 500 ms cap catches broker crashes /
+  // stalls without impacting the human-approve path.
+
+  pub let ELVC_HUMAN_TIMEOUT_DEFAULT_NS : u64 = 30000000000   // 30 s
+  pub let ELVC_FAST_TIMEOUT_DEFAULT_NS  : u64 = 500000000     // 500 ms
+
+  // ---- Configurable defaults (per-process globals) ----
+  //
+  // A caller-supplied timeout of 0 to elevate_client_request_ex means
+  // "use the appropriate default for the classification": fast for a
+  // policy hit, human otherwise.  Each is settable so an integration
+  // test can drop the human timeout to a few ms without changing the
+  // call site.
+
+  // Initialized to 0 -- the getters below treat 0 as "not yet
+  // configured" and substitute the constant default from
+  // ELVC_HUMAN_TIMEOUT_DEFAULT_NS / ELVC_FAST_TIMEOUT_DEFAULT_NS.
+  // Large u64 initializers are not observed in paideia-os
+  // (codebase-wide grep for `pub let mut ... : u64 = [0-9]{9,}` at
+  // libpdx-elevate.M2 close returned zero hits), so we stick to the
+  // `= 0` idiom and let the accessor resolve the default.
+  pub let mut _elevate_client_human_timeout_ns : u64 = 0
+  pub let mut _elevate_client_fast_timeout_ns  : u64 = 0
+
+  // Process-global target user fingerprint (low 64 bits of pk_fp).  0
+  // means "any user" for the policy consult; a real fingerprint
+  // scopes policy matches to the current process's identity.  This
+  // is kept as a process-global rather than a per-call argument so
+  // elevate_client_request_ex fits in the 6-register SysV window
+  // (paideia-os does not use 7+ arg functions today; see the
+  // codebase-wide `pub let ... (u64, u64, u64, u64, u64, u64, u64)`
+  // grep at libpdx-elevate.M2 close).
+  pub let mut _elevate_client_target_fp_lo : u64 = 0
+
+  // ---- Wire constants (mirror of ELV_OP_*) ----
+
+  pub let ELVS_OP_REQ : u64 = 0x01
+  pub let ELVS_OP_APR : u64 = 0x02
+
+  // Frame header ver -- matches the R20b.M2-001 convention: ver >= 1
+  // is required for a valid packed hdr (see src/kernel/core/ipc/
+  // frame.pdx "Discriminator" paragraph).
+  pub let ELVS_FRAME_VER : u64 = 1
+
+  // Payload sizes.
+  pub let ELVS_REQ_PAYLOAD_BYTES : u64 = 32       // matches ELEVATE_REQ_FRAME_BYTES
+  pub let ELVS_APR_PAYLOAD_BYTES : u64 = 32       // approver frame is same shape
+
+  // Endpoint id range: 1..127 is a valid reply endpoint per
+  // src/kernel/core/ipc/endpoint_table.pdx (128 slots, 0 = "reply on
+  // source" convention in frame.pdx §Field ... reply_endpoint_id).
+  pub let ELVS_REPLY_EP_MIN : u64 = 1
+  pub let ELVS_REPLY_EP_MAX : u64 = 127
+
+  // Scratch used by the recv path for the packed hdr from
+  // endpoint_take_pending.  8 bytes; single-instance because a REQ
+  // never overlaps with itself on a per-process client.
+  pub let mut _elevate_client_recv_hdr_scratch : [u64; 1] = uninit @align(8)
+
+  // ==========================================================================
+  // elevate_client_set_human_timeout(ns) -> ()
+  //
+  // Change the default human-approve timeout.  A value of 0 restores
+  // ELVC_HUMAN_TIMEOUT_DEFAULT_NS.  Boot / test harness only.
+  // ==========================================================================
+
+  pub let elevate_client_set_human_timeout : (u64) -> () !{mem} @{} =
+    fn (ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-002 (#4): set the process-global human-approve timeout. A value of 0 restores the default -- a test harness that wants to bypass an accidental prior override can just pass 0. Leaf. Large default (30e9) staged in r10 per paideia-as compliance. Labels prefixed elcs_sh_.",
+      block: {
+        cmp rdi, 0;
+        je  elcs_sh_default;
+        lea r10, [rip + _elevate_client_human_timeout_ns];
+        mov [r10 + 0], rdi;
+        ret;
+      elcs_sh_default:
+        mov r10, 30000000000;
+        lea r11, [rip + _elevate_client_human_timeout_ns];
+        mov [r11 + 0], r10;
+        ret
+      }
+    }
+
+  pub let elevate_client_set_fast_timeout : (u64) -> () !{mem} @{} =
+    fn (ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-002 (#4): set the process-global fast-path timeout. Zero restores the 500 ms default. Leaf. 500 ms (500e6) fits imm32; staged directly. Labels prefixed elcs_sf_.",
+      block: {
+        cmp rdi, 0;
+        je  elcs_sf_default;
+        lea r10, [rip + _elevate_client_fast_timeout_ns];
+        mov [r10 + 0], rdi;
+        ret;
+      elcs_sf_default:
+        mov r10, 500000000;
+        lea r11, [rip + _elevate_client_fast_timeout_ns];
+        mov [r11 + 0], r10;
+        ret
+      }
+    }
+
+  pub let elevate_client_get_human_timeout : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-002 (#4): read the process-global human-approve timeout. Substitutes the constant default (30e9 ns, staged in r11 because it exceeds imm32) when the mutable slot is still 0 (not yet configured). Leaf. Labels prefixed elcs_gh_.",
+      block: {
+        lea r10, [rip + _elevate_client_human_timeout_ns];
+        mov rax, [r10 + 0];
+        cmp rax, 0;
+        jne elcs_gh_out;
+        mov r11, 30000000000;
+        mov rax, r11;
+      elcs_gh_out:
+        ret
+      }
+    }
+
+  pub let elevate_client_get_fast_timeout : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-002 (#4): read the process-global fast-path timeout. Substitutes the constant default (500e6 ns) when the mutable slot is still 0 (not yet configured). 500e6 fits imm32 so is loaded directly. Leaf. Labels prefixed elcs_gf_.",
+      block: {
+        lea r10, [rip + _elevate_client_fast_timeout_ns];
+        mov rax, [r10 + 0];
+        cmp rax, 0;
+        jne elcs_gf_out;
+        mov rax, 500000000;
+      elcs_gf_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_set_target_fp_lo(fp) / _get_target_fp_lo() -> u64
+  //
+  // Bind the process-global user fingerprint used by the policy
+  // consult step of elevate_client_request_ex.  A value of 0 means
+  // "any user" (matches every enabled policy row with target == 0);
+  // a real fingerprint scopes matches to that identity.
+  // ==========================================================================
+
+  pub let elevate_client_set_target_fp_lo : (u64) -> () !{mem} @{} =
+    fn (fp: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-002 (#4): set the process-global target user fp_lo. Leaf.",
+      block: {
+        lea r10, [rip + _elevate_client_target_fp_lo];
+        mov [r10 + 0], rdi;
+        ret
+      }
+    }
+
+  pub let elevate_client_get_target_fp_lo : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-002 (#4): read the process-global target user fp_lo. Leaf.",
+      block: {
+        lea r10, [rip + _elevate_client_target_fp_lo];
+        mov rax, [r10 + 0];
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_pack_hdr(reply_ep_id, payload_len) -> u64
+  //
+  // Inline packer for the 8-byte IPC frame header.  Produces the same
+  // u64 that Frame.frame_encode would write to memory:
+  //
+  //   bits  0.. 7   op = ELVS_OP_REQ (1)
+  //   bits  8..15   ver = 1
+  //   bits 16..31   reply_endpoint_id  (0 = reply-on-source)
+  //   bits 32..63   payload_len
+  //
+  // Field-width masking is applied before each shift so an oversize
+  // reply_ep_id can never leak into payload_len's bit range.  Leaf.
+  // ==========================================================================
+
+  pub let elevate_client_pack_hdr : (u64, u64) -> u64 !{} @{} =
+    fn (reply_ep_id: u64) (payload_len: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-elevate.M2-002 (#4): pack the 8-byte IPC frame header as a u64 matching Frame.frame_encode. Field-width masks (0xFF for op/ver, 0xFFFF for reply_ep_id, 0xFFFFFFFF for payload_len) applied BEFORE each shift so an oversize caller value cannot leak into an adjacent field. Composition proceeds high-bits-first so the final `or rax, ELVS_OP_REQ` cleanly sets the low byte. Leaf; no callee-save writes. Labels prefixed elcs_ph_.",
+      block: {
+        // rax = (payload_len & 0xFFFFFFFF) << 32
+        mov rax, rsi;
+        and rax, 0xFFFFFFFF;
+        shl rax, 32;
+
+        // r10 = (reply_ep_id & 0xFFFF) << 16
+        mov r10, rdi;
+        and r10, 0xFFFF;
+        shl r10, 16;
+        or  rax, r10;
+
+        // r10 = (ver & 0xFF) << 8  -- ver == ELVS_FRAME_VER == 1
+        mov r10, 1;
+        shl r10, 8;
+        or  rax, r10;
+
+        // r10 = op & 0xFF  -- op == ELVS_OP_REQ == 1
+        mov r10, 1;
+        or  rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_send_req(broker_ep_id, reply_ep_id, req_buf) -> ELVC_*
+  //
+  // Publish the caller-assembled REQ frame to the broker's endpoint.
+  //
+  // Preconditions:
+  //   * req_buf holds a valid 32-byte REQ payload assembled via
+  //     elevate_request_write_frame.
+  //   * broker_ep_id was resolved via elevate_client_lookup_broker.
+  //   * reply_ep_id is 0 (reply-on-source) or in [1..127].
+  //
+  // Returns ELVC_OK on publish, ELVC_ERR_SEND_FAIL on endpoint_write_
+  // pending refusal (busy, bad id, bad payload len -- collapsed under
+  // one code because the caller cannot meaningfully act on the
+  // distinction; the client stats table separates them via
+  // ELVC_ST_ERRORS increments).
+  // ==========================================================================
+
+  pub let elevate_client_send_req : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (broker_ep_id: u64) (reply_ep_id: u64) (req_buf: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-002 (#4): publish the 32-byte REQ payload on the broker endpoint. Four callee-save pushes (r12=broker_ep, r13=reply_ep, r14=req_buf, r15=packed hdr) + one 8-byte alignment pad = 40 bytes; entry rsp%16==8 -> (8 - 40) mod 16 == 0, so nested calls (elevate_client_pack_hdr, endpoint_write_pending) see aligned rsp before their CALL. broker_ep gate refuses ids >= 128 (endpoint_table has 128 slots per src/kernel/core/ipc/endpoint_table.pdx). endpoint_write_pending returns 0 on OK per its documented PENDING_WRITE_OK code; any non-zero collapses to ELVC_ERR_SEND_FAIL here (the caller cannot meaningfully act on the distinction, and the granular reason is available in the broker's own stats table). Labels prefixed elcs_sr_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;                      // alignment for nested calls
+
+        mov r12, rdi;                    // broker_ep_id
+        mov r13, rsi;                    // reply_ep_id
+        mov r14, rdx;                    // req_buf
+
+        // Bounds: broker_ep_id must fit endpoint table.
+        cmp r12, 128;
+        jae elcs_sr_send_fail;
+
+        // Pack the 8-byte hdr.
+        mov rdi, r13;                    // reply_ep_id
+        mov rsi, 32;                     // payload_len = ELVS_REQ_PAYLOAD_BYTES
+        call elevate_client_pack_hdr;
+        mov r15, rax;                    // r15 = packed hdr
+
+        // endpoint_write_pending(id=r12, hdr=r15, payload_ptr=r14, len=32).
+        mov rdi, r12;
+        mov rsi, r15;
+        mov rdx, r14;
+        mov rcx, 32;
+        call endpoint_write_pending;
+        cmp rax, 0;
+        jne elcs_sr_send_fail;
+
+        xor rax, rax;                    // ELVC_OK
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcs_sr_send_fail:
+        mov rax, 0xFFFFEA0D;             // ELVC_ERR_SEND_FAIL
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_recv_reply(reply_ep_id, reply_buf, timeout_ns) -> ELVC_*
+  //
+  // Bounded poll on the client's reply endpoint for an APR frame.
+  //
+  // Sequence:
+  //   * deadline = hpet_now_ns() + timeout_ns
+  //   * loop:
+  //       rc = endpoint_take_pending(reply_ep_id,
+  //                                  &_elevate_client_recv_hdr_scratch,
+  //                                  reply_buf)
+  //       if rc != 0xFFFFFFFFFFFFFFFF (a message was taken):
+  //           validate hdr.op == ELV_OP_APR and payload contents;
+  //           return ELVC_OK on match, ELVC_ERR_BAD_REPLY otherwise.
+  //       now = hpet_now_ns()
+  //       if now >= deadline: return ELVC_ERR_TIMEOUT
+  //
+  // The tight spin is acceptable at M2 because the R42/R48 substrate
+  // does not yet expose a kernel-level "wait for endpoint fill" gate
+  // to userspace; a `pause` insertion is a follow-up optimisation.
+  //
+  // A hpet_now_ns return of 0 (called before hpet_init) is treated as
+  // "no monotonic clock available" and the poll runs one iteration
+  // then returns TIMEOUT -- prevents an infinite spin in an
+  // early-boot smoke fixture where the broker was never going to
+  // reply anyway.
+  //
+  // Register plan:
+  //   rbx = reply_ep_id
+  //   r12 = reply_buf
+  //   r13 = deadline_ns
+  //   r14 = APR payload op word (loaded from reply_buf after take)
+  //   Five pushes + one alignment pad = 48 bytes across three nested
+  //   calls (hpet_now_ns twice, endpoint_take_pending).
+  // ==========================================================================
+
+  pub let elevate_client_recv_reply : (u64, u64, u64) -> u64 !{mem} @{boot} =
+    fn (reply_ep_id: u64) (reply_buf: u64) (timeout_ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {boot},
+      justification: "libpdx-elevate.M2-002 (#4): bounded polling wait for an APR reply frame. hpet_now_ns carries {boot} because it reads _hpet_ctx (see src/kernel/core/time/hpet.pdx:242); we inherit it upward. Register plan: rbx=reply_ep_id, r12=reply_buf, r13=deadline_ns, r14=work scratch, r15=hdr scratch VA (unused today but reserved for a payload-len probe follow-up). Five callee-save pushes (5*8=40 bytes) -- entry rsp%16==8 -> (8 - 40) mod 16 == 0, so nested calls (hpet_now_ns, endpoint_take_pending) see aligned rsp before their CALL; no additional pad required. Sentinel PENDING_TAKE_EMPTY (0xFFFFFFFFFFFFFFFF) exceeds imm32 so it is staged in r10. The hpet_now_ns==0 gate at the top is a boot-window safety net; the M2 smoke fixtures that run before hpet_init would otherwise spin forever, and returning TIMEOUT is the strictly-conservative answer for 'we cannot tell whether the deadline has passed'. Labels prefixed elcs_rr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // reply_ep_id
+        mov r12, rsi;                    // reply_buf
+
+        // Reply endpoint id gate.
+        cmp rbx, 1;
+        jb  elcs_rr_bad_ep;
+        cmp rbx, 127;
+        ja  elcs_rr_bad_ep;
+
+        // Compute deadline = hpet_now_ns() + timeout_ns.  If hpet is
+        // unarmed (returns 0), we treat "no monotonic clock" as
+        // "cannot bound a wait" and return TIMEOUT after one loop iter.
+        call hpet_now_ns;
+        cmp rax, 0;
+        je  elcs_rr_no_clock;
+        add rax, rdx;                    // rdx still holds timeout_ns
+        mov r13, rax;
+        jmp elcs_rr_loop;
+
+      elcs_rr_no_clock:
+        // deadline == 0 forces the first "now >= deadline" branch to fire.
+        xor r13, r13;
+
+      elcs_rr_loop:
+        // Attempt to consume a pending message.
+        mov rdi, rbx;
+        lea rsi, [rip + _elevate_client_recv_hdr_scratch];
+        mov rdx, r12;
+        call endpoint_take_pending;
+        mov r10, 0xFFFFFFFFFFFFFFFF;     // PENDING_TAKE_EMPTY
+        cmp rax, r10;
+        jne elcs_rr_got_msg;
+
+        // Empty; check timeout.
+        call hpet_now_ns;
+        cmp rax, r13;
+        jae elcs_rr_timeout;
+
+        // Not yet deadline -- respin.
+        jmp elcs_rr_loop;
+
+      elcs_rr_got_msg:
+        // rax = payload_len returned by endpoint_take_pending.  A
+        // valid APR carries 32 bytes; a shorter reply cannot hold a
+        // full op_word + body -> BAD_REPLY.
+        cmp rax, 32;
+        jb  elcs_rr_bad_reply;
+
+        // First 8 bytes of reply_buf are the packed op_word.
+        mov r14, [r12 + 0];
+        // Low byte of op_word must equal ELV_OP_APR (2).
+        mov r10, r14;
+        and r10, 0xFF;
+        cmp r10, 2;
+        jne elcs_rr_bad_reply;
+
+        // expire_ns lives at reply_buf + 16 (body word 1 per elevate_
+        // channel.pdx §1).  Zero is refused (approver must set a real
+        // deadline; a 0-expire APR would let the caller mint a
+        // permanent cap).
+        mov r10, [r12 + 16];
+        cmp r10, 0;
+        je  elcs_rr_bad_expire;
+
+        xor rax, rax;                    // ELVC_OK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcs_rr_bad_reply:
+        mov rax, 0xFFFFEA02;             // ELVC_ERR_BAD_REPLY
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcs_rr_bad_expire:
+        mov rax, 0xFFFFEA04;             // ELVC_ERR_BAD_EXPIRE
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcs_rr_bad_ep:
+        mov rax, 0xFFFFEA05;             // ELVC_ERR_BAD_REPLY_EP
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcs_rr_timeout:
+        mov rax, 0xFFFFEA01;             // ELVC_ERR_TIMEOUT
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_check_grant(reply_buf, requested_caps) -> ELVC_*
+  //
+  // Verify the APR frame's granted_caps is a strict subset of what
+  // the caller asked for.  granted_caps lives at reply_buf + 8 (body
+  // word 0 per elevate_channel.pdx §1); the same mask also appears
+  // packed into bits [23:8] of the op_word at reply_buf + 0.  We
+  // validate the body word (the canonical source per the wire spec
+  // note in elevate_request.pdx WHY REDECLARE) rather than the
+  // op-word slice.
+  //
+  // Returns ELVC_OK on subset, ELVC_ERR_GRANT_INVALID otherwise.
+  // ==========================================================================
+
+  pub let elevate_client_check_grant : (u64, u64) -> u64 !{mem} @{} =
+    fn (reply_buf: u64) (requested_caps: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.M2-002 (#4): (granted & requested) == granted matches elv_check_grant at src/kernel/core/ipc/elevate_channel.pdx:222. Leaf. Labels prefixed elcs_cg_.",
+      block: {
+        mov rax, [rdi + 8];              // granted_caps
+        mov r10, rax;
+        and r10, rsi;
+        cmp r10, rax;
+        jne elcs_cg_bad;
+        xor rax, rax;                    // ELVC_OK
+        ret;
+      elcs_cg_bad:
+        mov rax, 0xFFFFEA03;             // ELVC_ERR_GRANT_INVALID
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_request_ex(caps, dur, req_buf, reply_ep_id,
+  //                           reply_buf, timeout_ns) -> ELVC_*
+  //
+  // The M2 full-flow entry point: policy consult (fast-path
+  // classification), REQ assemble, REQ send, APR recv, grant subset
+  // validation.  Returns ELVC_OK when the APR is validated end-to-
+  // end; the caller then holds the reply_buf + expire_ns needed to
+  // mint the KIND_ELEVATE_CHANNEL cap in elevate_client_cap.pdx
+  // (M2-003).
+  //
+  // timeout_ns semantics:
+  //   * 0  -> use ELVC_FAST_TIMEOUT_DEFAULT_NS on a policy hit,
+  //           ELVC_HUMAN_TIMEOUT_DEFAULT_NS on a miss.
+  //   * >0 -> caller-specified; the policy consult still runs (for
+  //           accounting) but the classification does not affect the
+  //           chosen deadline.
+  //
+  // target_fp_lo comes from the process-global slot
+  // _elevate_client_target_fp_lo (settable via
+  // elevate_client_set_target_fp_lo).  Keeping it out of the arg list
+  // fits this entry point in the 6-register SysV window: paideia-os
+  // does not use 7+ arg functions today (confirmed by a codebase-
+  // wide grep for `(u64, u64, u64, u64, u64, u64, u64)` at
+  // libpdx-elevate.M2 close).
+  //
+  // Register plan:
+  //   rdi=caps, rsi=dur, rdx=req_buf, rcx=reply_ep_id,
+  //   r8=reply_buf, r9=timeout_ns.
+  // Six callee-save pushes + one 8-byte alignment pad = 56 bytes;
+  // entry rsp%16==8 -> (8-56) mod 16 == 0 across every nested call.
+  // ==========================================================================
+
+  pub let elevate_client_request_ex : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{boot} =
+    fn (caps: u64) (dur: u64) (req_buf: u64) (reply_ep_id: u64) (reply_buf: u64) (timeout_ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {boot},
+      justification: "libpdx-elevate.M2-002 (#4): full M2 flow (policy consult, REQ assemble, REQ send, APR recv, grant subset validation). Six callee-save pushes (rbx, r12, r13, r14, r15, rbp) + one 8-byte alignment pad = 56 bytes; entry rsp%16==8 -> (8-56) mod 16 == 0 across every nested call. Register plan: rbx holds broker_ep after lookup (target_fp_lo comes from the process-global; there is no per-call arg to preserve); r12=caps (referenced late by check_grant), r13=req_buf, r14=reply_buf, r15=reply_ep_id, rbp=effective_timeout_ns. `dur` is only needed at write_frame; we park it in the 8-byte pad slot at [rsp + 0] so no extra callee-save is required. Effect band {mem} + capability {boot} propagate from the nested hpet_now_ns / endpoint_write_pending / endpoint_take_pending chain. Labels prefixed elcs_rx_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;                      // align + stash slot for dur at [rsp + 0]
+
+        mov r12, rdi;                    // caps
+        mov [rsp + 0], rsi;              // dur -> stash
+        mov r13, rdx;                    // req_buf
+        mov r15, rcx;                    // reply_ep_id
+        mov r14, r8;                     // reply_buf
+        mov rbp, r9;                     // timeout_ns
+
+        // ---- Step 1: policy consult (accounting + timeout selection) ----
+        lea r10, [rip + _elevate_client_target_fp_lo];
+        mov rdi, [r10 + 0];              // target_fp_lo (process-global)
+        mov rsi, r12;                    // caps
+        mov rdx, [rsp + 0];              // dur (from stash)
+        call elevate_client_policy_check;
+        mov r10, 0xFFFFEA12;             // ELCP_ERR_NO_MATCH
+        cmp rax, r10;
+        je  elcs_rx_policy_miss;
+
+        // Policy HIT.  Bump the rate on the row (rax = idx).
+        mov rdi, rax;
+        call elevate_client_policy_hit;
+        // Non-OK from hit means client-side rate limit; proceed
+        // anyway -- the broker holds authoritative enforcement.
+        cmp rbp, 0;
+        jne elcs_rx_have_timeout;
+        // Use the FAST getter (which resolves the default if the
+        // mutable slot is still 0) rather than a raw mutable read.
+        call elevate_client_get_fast_timeout;
+        mov rbp, rax;
+        jmp elcs_rx_have_timeout;
+
+      elcs_rx_policy_miss:
+        cmp rbp, 0;
+        jne elcs_rx_have_timeout;
+        call elevate_client_get_human_timeout;
+        mov rbp, rax;
+
+      elcs_rx_have_timeout:
+        // ---- Step 2: assemble REQ frame ----
+        mov rdi, r13;                    // req_buf
+        mov rsi, r12;                    // caps
+        mov rdx, [rsp + 0];              // dur (from stash)
+        call elevate_request_write_frame;
+        cmp rax, 0;
+        jne elcs_rx_pack_fail;
+
+        // ---- Step 3: resolve broker endpoint ----
+        call elevate_client_lookup_broker;
+        mov r10, 0xFFFFFFFFFFFFFFFF;     // SVC_LOOKUP_NONE
+        cmp rax, r10;
+        je  elcs_rx_lookup_fail;
+        mov rbx, rax;                    // rbx <- broker_ep_id
+
+        // ---- Step 4: send REQ ----
+        mov rdi, rbx;                    // broker_ep_id
+        mov rsi, r15;                    // reply_ep_id
+        mov rdx, r13;                    // req_buf
+        call elevate_client_send_req;
+        cmp rax, 0;
+        jne elcs_rx_send_fail;
+
+        // ---- Step 5: recv APR with timeout ----
+        mov rdi, r15;                    // reply_ep_id
+        mov rsi, r14;                    // reply_buf
+        mov rdx, rbp;                    // effective timeout
+        call elevate_client_recv_reply;
+        cmp rax, 0;
+        jne elcs_rx_out;                 // TIMEOUT / BAD_REPLY / BAD_EXPIRE pass through
+
+        // ---- Step 6: validate grant subset ----
+        mov rdi, r14;                    // reply_buf
+        mov rsi, r12;                    // requested caps
+        call elevate_client_check_grant;
+
+      elcs_rx_out:
+        add rsp, 8;                      // discard dur/align stash
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcs_rx_pack_fail:
+        mov rax, 0xFFFFEA0E;             // ELVC_ERR_PACK_FAIL
+        jmp elcs_rx_out;
+      elcs_rx_lookup_fail:
+        mov rax, 0xFFFFEA0F;             // ELVC_ERR_LOOKUP_FAIL
+        jmp elcs_rx_out;
+      elcs_rx_send_fail:
+        mov rax, 0xFFFFEA0D;             // ELVC_ERR_SEND_FAIL
+        jmp elcs_rx_out
+      }
+    }
+}
