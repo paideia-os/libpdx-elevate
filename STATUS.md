@@ -1,7 +1,7 @@
 # libpdx-elevate — status
 
 **Wave:** R49 shared library
-**Current milestone:** M4 (tests + smoke) — in progress (M4-001 landed)
+**Current milestone:** M4 (tests + smoke) — complete
 
 See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full breakdown.
 
@@ -17,6 +17,7 @@ See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full breakdown
 | M3-001 (#6)     | request + response journal via libpdx-audit (extends UEJ_KIND_ELEVATE)         | LANDED |
 | M3-002 (#7)     | retry-with-backoff for transient broker unavailability                         | LANDED |
 | M4-001 (#8)     | auto-approve match/miss matrix against policy table                            | LANDED |
+| M4-002 (#9)     | cap-lifetime enforcement test (past deadline -> kernel revoke)                 | LANDED |
 
 ## M1 — design + skeleton (complete)
 
@@ -193,7 +194,7 @@ See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full breakdown
   user_events_journal.pdx L226). Not blocking; audit records still
   carry seq for ordering.
 
-## M4 — tests + smoke (in progress)
+## M4 — tests + smoke (complete)
 
 - `tests/elevate_client_policy_test.pdx` (issue #8, LANDED): boot
   witness `elevate_client_policy_witness` for the client-side
@@ -211,15 +212,53 @@ See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full breakdown
     - rate-limit exhaustion on row 1 (rate=5): 5 hits ok, 6th
       returns RATE_LIMIT and bumps RATE_DENIES
     - out-of-range hit(idx=16) -> BAD_ARG
-  Boot-witness idiom mirrored from
-  `tests/kernel/ipc/elevate_broker_synth.pdx` (paideia-os #1627):
-  stage-tracked, klog OK on success, klog_s1_d1 FAIL carries the
-  failing stage id, table reset on both exits.  Labels `ecpw_`
-  disjoint from every other witness.  Standalone against the
-  client-side table -- no broker daemon dependency.
+- `tests/elevate_client_cap_test.pdx` (issue #9, LANDED): boot
+  witness `elevate_client_cap_witness` for cap-lifetime
+  enforcement.  Twelve stages, fingerprint `LIBPDX-ELEVATE M4 CAP
+  OK`.  Covers:
+    - reset scrubs shadow deadline map + stats
+    - bind_expire / get_expire happy path (60s deadline, non-zero
+      readback)
+    - dur=0 clears; get_expire returns 0 after clear
+    - row_id=17 gates: bind_expire and expired both refuse
+      BAD_ROW
+    - expired discrimination: live (0), no deadline
+      (NO_DEADLINE), bad row (BAD_ROW)
+    - check_and_revoke on live row -> STATE_LIVE + CHECKS_LIVE
+      bumped (no kernel call)
+    - check_and_revoke error passthrough: NO_DEADLINE and BAD_ROW
+      surface unchanged
+    - past-deadline enforcement: slot poked directly with a 1-ns
+      absolute deadline (bypasses bind_expire so the compare is
+      deterministic against hpet_now_ns); expired returns 1;
+      check_and_revoke invokes kernel `elevate_channel_cap_revoke`
+      and reports either STATE_REVOKED (kernel accepted) or
+      ERR_REVOKE_FAIL (kernel BAD_SLOT because no cap was minted
+      here); AUTO_REVOKES + REVOKE_FAILS sum to exactly 1
+
+Both witnesses use the paideia-os boot-witness convention (mirror
+of `tests/kernel/ipc/elevate_broker_synth.pdx` at #1627): stage-
+tracked, klog OK on success, klog_s1_d1 FAIL with the failing
+stage id, and reset on both exits so a failure cannot be mistaken
+for a fault in the next witness in the boot sequence.  Labels
+`ecpw_` and `eccw_` are disjoint from every other witness in the
+tree.  Neither test needs the broker daemon body to be live: both
+target client-side state machines that stand up without a live APR.
+
+**Deferred to when the broker daemon lands (paideia-os followup):**
+- Full REQ -> broker -> policy-consult -> APR -> journal loop
+  witness that a request/response pair actually reaches the
+  user_events_journal.  Today's `elevate_client_request_ex_j` +
+  retry wrapper can be exercised only up to ELVC_ERR_TIMEOUT
+  because the broker stub always returns DISPATCH_STUB.
+- End-to-end mint of a real Cap<KIND_ELEVATE_CHANNEL> and the
+  narrow -> revoke -> re-narrow cycle (blocked on libpdx-cap.M2
+  cap_narrow_rights; today's `elevate_client_cap_narrow_stub`
+  ships as documented placeholder).
 
 ## Next
 
-M4-002 (#9) -- cap-lifetime enforcement test (past deadline ->
-kernel revoke fires); one boot witness pair with M4-001.  Then
-M5 -- dual-signed 1.0 release + `.pdxdoc` + mirror push.
+M5 — 1.0 signed release: dual-signed `.pdxsig`, `.pdxdoc` for the
+public API, mirror push to `pkgs.paideia-os`.  Depends on paideia-as
+crypto (v0.33-crypto-kdf: Argon2id-KDF + ChaCha20-Poly1305 + ML-DSA-65
+verify) reachable through the toolchain.

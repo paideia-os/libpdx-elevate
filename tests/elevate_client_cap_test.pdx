@@ -1,0 +1,325 @@
+// tests/elevate_client_cap_test.pdx -- libpdx-elevate.M4-002 (paideia-os/libpdx-elevate#9)
+//
+// Cap-lifetime enforcement -- past deadline -> kernel revoke fires.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Boot witness for src/elevate_client_cap.pdx.  The M2-003 charter's
+// load-bearing claim is that a Cap<KIND_ELEVATE_CHANNEL> handed back
+// from the elevate broker becomes unusable at its bounded deadline
+// without waiting on a kernel-side EXP broadcast.  The enforcement
+// point is elevate_client_cap_check_and_revoke: it consults
+// elevate_client_cap_expired (client-side shadow-map read of hpet_
+// now_ns vs. the stored deadline) and, on expiry, calls the kernel-
+// side elevate_channel_cap_revoke to actually invalidate the row.
+//
+// This witness exercises the enforcement path end-to-end:
+//
+//   (a) bind_expire records the deadline for a row; get_expire
+//       reads it back.  Boundary cases (dur=0 clears, row>=16
+//       refuses).
+//   (b) expired() returns 0 for a future deadline, 1 for a past
+//       one, NO_DEADLINE for a row with 0 in the shadow slot,
+//       BAD_ROW for out-of-range.
+//   (c) check_and_revoke passes through the error taxonomy for
+//       no_deadline / bad_row; returns STATE_LIVE for a future
+//       deadline (bumps CHECKS_LIVE); and on a past deadline it
+//       INVOKES the kernel revoke and reports either STATE_REVOKED
+//       (kernel accepted the revoke) or ERR_REVOKE_FAIL (kernel
+//       refused -- typically because no cap was minted at that
+//       slot).  Either outcome proves the past-deadline branch
+//       reached the kernel primitive: the client-side enforcement
+//       did NOT let the caller keep using the expired handle.
+//
+// The past-deadline branch uses a direct poke into
+// _elevate_client_cap_expire_map (bypassing bind_expire) with a
+// value of 1 ns.  hpet_now_ns after boot is orders of magnitude
+// larger, so the compare is deterministic without a sleep primitive
+// (whose absence is one of the STATUS.md M3 followups).
+//
+// =============================================================================
+// FINGERPRINT: LIBPDX-ELEVATE M4 CAP OK
+// =============================================================================
+//
+// One fingerprint covers all six enforcement paths -- they share
+// the shadow-map + stats surface, and the OK line means every
+// branch behaved.
+//
+// Same shape as tests/kernel/ipc/elevate_broker_synth.pdx (paideia-os
+// R48b substrate-prep #1627).  Labels prefixed eccw_ so the witness's
+// own emitter does not overlap the broker's elvbw_ or the sibling
+// policy witness's ecpw_ when they run in the same boot.
+
+module ElevateClientCapTest = structure {
+
+  pub let mut _eccw_stage : u64 = 0
+
+  pub let eccw_ok   : [u8; 26] = "LIBPDX-ELEVATE M4 CAP OK\n\0"
+  pub let eccw_fail : [u8; 28] = "LIBPDX-ELEVATE M4 CAP FAIL\n\0"
+
+  pub let elevate_client_cap_witness : () -> u64 !{sysreg, mem} @{cap, boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {cap, boot},
+      justification: "libpdx-elevate.M4-002 (#9): boot witness for cap-lifetime enforcement. Five callee-save pushes (rbx, r12, r13, r14, r15) -- (8 - 40) mod 16 == 0 so nested calls (bind/get/expired/check_and_revoke + klog + stat + kernel revoke) see aligned rsp. capabilities {cap, boot} propagate from elevate_client_cap_check_and_revoke, which needs both. Stage 11 pokes _elevate_client_cap_expire_map[2] directly with a past absolute deadline (1 ns since boot) so the past-deadline branch is deterministic without a sleep primitive; hpet_now_ns after boot is orders of magnitude larger than 1 so the compare cannot race. Stage 12 accepts either STATE_REVOKED (kernel took the revoke) or ERR_REVOKE_FAIL (kernel refused, typically BAD_SLOT because this witness never mints a real cap at slot 2) -- both outcomes prove the past-deadline branch reached elevate_channel_cap_revoke, which is what M4-002 is charged to demonstrate. r12 saves the AUTO_REVOKES stat across the second stat call so the sum check does not need a temp store. Labels prefixed eccw_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ------------------------------------------------------------
+        // Stage 1: reset -- shadow map + stats scrubbed to zero.
+        // ------------------------------------------------------------
+        mov rax, 1;
+        lea rcx, [rip + _eccw_stage];
+        mov [rcx], rax;
+        call elevate_client_cap_reset;
+
+        mov rdi, 0;                      // ELCC_ST_MINTS
+        call elevate_client_cap_stat;
+        cmp rax, 0;
+        jne eccw_fail_stage;
+
+        mov rdi, 1;                      // ELCC_ST_AUTO_REVOKES
+        call elevate_client_cap_stat;
+        cmp rax, 0;
+        jne eccw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 2: bind_expire(row=0, dur=60s) succeeds; get_expire
+        // returns a non-zero deadline (== hpet_now_ns + 60s).
+        // ------------------------------------------------------------
+        mov rax, 2;
+        lea rcx, [rip + _eccw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;                    // row = 0
+        mov r10, 60000000000;            // 60s in ns
+        mov rsi, r10;
+        call elevate_client_cap_bind_expire;
+        cmp rax, 0;                      // ELCC_OK
+        jne eccw_fail_stage;
+
+        xor rdi, rdi;
+        call elevate_client_cap_get_expire;
+        cmp rax, 0;                      // any non-zero (future ns)
+        je  eccw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 3: expired(row=0) is 0 (deadline in future).
+        // ------------------------------------------------------------
+        mov rax, 3;
+        lea rcx, [rip + _eccw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;
+        call elevate_client_cap_expired;
+        cmp rax, 0;                      // live
+        jne eccw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 4: bind_expire(row=1, dur=0) clears -- get_expire == 0.
+        // ------------------------------------------------------------
+        mov rax, 4;
+        lea rcx, [rip + _eccw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 1;
+        xor rsi, rsi;                    // dur = 0 clears
+        call elevate_client_cap_bind_expire;
+        cmp rax, 0;
+        jne eccw_fail_stage;
+
+        mov rdi, 1;
+        call elevate_client_cap_get_expire;
+        cmp rax, 0;
+        jne eccw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 5: expired(row=1) on a cleared row -> NO_DEADLINE.
+        // ------------------------------------------------------------
+        mov rax, 5;
+        lea rcx, [rip + _eccw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 1;
+        call elevate_client_cap_expired;
+        mov r10, 0xFFFFEA32;             // ELCC_ERR_NO_DEADLINE
+        cmp rax, r10;
+        jne eccw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 6: bind_expire(row=17) -> BAD_ROW (ELCC_MAX_ROWS=16).
+        // ------------------------------------------------------------
+        mov rax, 6;
+        lea rcx, [rip + _eccw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 17;
+        mov rsi, 1000000000;             // 1s
+        call elevate_client_cap_bind_expire;
+        mov r10, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
+        cmp rax, r10;
+        jne eccw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 7: expired(row=17) -> BAD_ROW passthrough.
+        // ------------------------------------------------------------
+        mov rax, 7;
+        lea rcx, [rip + _eccw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 17;
+        call elevate_client_cap_expired;
+        mov r10, 0xFFFFEA30;
+        cmp rax, r10;
+        jne eccw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 8: check_and_revoke on live row 0 -> STATE_LIVE.
+        // Bumps ELCC_ST_CHECKS_LIVE.  Does NOT invoke kernel revoke.
+        // ------------------------------------------------------------
+        mov rax, 8;
+        lea rcx, [rip + _eccw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;
+        call elevate_client_cap_check_and_revoke;
+        mov r10, 0xFFFFEA34;             // ELCC_STATE_LIVE
+        cmp rax, r10;
+        jne eccw_fail_stage;
+
+        mov rdi, 2;                      // ELCC_ST_CHECKS_LIVE
+        call elevate_client_cap_stat;
+        cmp rax, 1;
+        jne eccw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 9: check_and_revoke on cleared row 1 -> NO_DEADLINE
+        // passthrough (expired() surfaces the error unchanged).
+        // ------------------------------------------------------------
+        mov rax, 9;
+        lea rcx, [rip + _eccw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 1;
+        call elevate_client_cap_check_and_revoke;
+        mov r10, 0xFFFFEA32;             // ELCC_ERR_NO_DEADLINE passthrough
+        cmp rax, r10;
+        jne eccw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 10: check_and_revoke on out-of-range row 17 -> BAD_ROW
+        // passthrough.
+        // ------------------------------------------------------------
+        mov rax, 10;
+        lea rcx, [rip + _eccw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 17;
+        call elevate_client_cap_check_and_revoke;
+        mov r10, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW passthrough
+        cmp rax, r10;
+        jne eccw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 11: past-deadline set -- poke slot 2 with 1 ns absolute.
+        // Verify expired(row=2) returns 1 (definitively past).
+        //
+        // Bypass bind_expire (which adds hpet_now_ns) so the value in
+        // the map is deterministically less than any live hpet_now_ns
+        // reading.  Slot stride 8 bytes; slot 2 -> offset +16.
+        // ------------------------------------------------------------
+        mov rax, 11;
+        lea rcx, [rip + _eccw_stage];
+        mov [rcx], rax;
+
+        lea r10, [rip + _elevate_client_cap_expire_map];
+        mov r11, 1;                      // past absolute deadline (1 ns since boot)
+        mov [r10 + 16], r11;             // slot 2 * 8 bytes = +16
+
+        mov rdi, 2;
+        call elevate_client_cap_expired;
+        cmp rax, 1;                      // expired
+        jne eccw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 12: check_and_revoke on past-deadline row 2 -- invokes
+        // kernel revoke.  Two acceptable outcomes:
+        //
+        //   STATE_REVOKED   (0xFFFFEA36) kernel took the revoke.
+        //   ERR_REVOKE_FAIL (0xFFFFEA33) kernel refused (BAD_SLOT because
+        //                                 slot 2 has no minted cap in
+        //                                 this witness).
+        //
+        // Either proves the past-deadline branch reached the kernel
+        // primitive (M4-002 charter).  Corresponding stat bumps:
+        //
+        //   STATE_REVOKED   -> AUTO_REVOKES (slot 1) == 1
+        //   ERR_REVOKE_FAIL -> REVOKE_FAILS (slot 4) == 1
+        //
+        // Sum must be exactly 1: enforcement fired once, on this row.
+        // ------------------------------------------------------------
+        mov rax, 12;
+        lea rcx, [rip + _eccw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 2;
+        call elevate_client_cap_check_and_revoke;
+
+        mov r10, 0xFFFFEA36;             // ELCC_STATE_REVOKED
+        cmp rax, r10;
+        je  eccw_stage12_ok;
+        mov r10, 0xFFFFEA33;             // ELCC_ERR_REVOKE_FAIL
+        cmp rax, r10;
+        je  eccw_stage12_ok;
+        jmp eccw_fail_stage;
+
+      eccw_stage12_ok:
+        // AUTO_REVOKES (slot 1) + REVOKE_FAILS (slot 4) == 1.
+        mov rdi, 1;                      // ELCC_ST_AUTO_REVOKES
+        call elevate_client_cap_stat;
+        mov r12, rax;
+        mov rdi, 4;                      // ELCC_ST_REVOKE_FAILS
+        call elevate_client_cap_stat;
+        add rax, r12;
+        cmp rax, 1;
+        jne eccw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Success.  Log OK, scrub map+stats, return 0.
+        // ------------------------------------------------------------
+        mov rdi, 3;                      // KLOG_LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + eccw_ok];
+        call klog_s1;
+
+        call elevate_client_cap_reset;
+        xor rax, rax;
+        jmp eccw_out;
+
+      eccw_fail_stage:
+        // Fail-branch: klog FAIL with `line=<stage>` KV then scrub.
+        lea rax, [rip + _eccw_stage];
+        mov r8, [rax];                   // value1 -- failing stage id
+        mov rdi, 1;                      // KLOG_LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + eccw_fail];
+        lea rcx, [rip + k_line];         // key1 = "line"
+        call klog_s1_d1;
+        call elevate_client_cap_reset;
+        mov rax, 1;
+
+      eccw_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
