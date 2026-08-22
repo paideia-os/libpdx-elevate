@@ -1,0 +1,75 @@
+# libpdx-elevate — capability manifest (D4 per design/tooling/plan.md §6)
+#
+# Version:      1.0.0
+# Kind:         shared library (paideia-as .pdx sources; no bin/, no lib/*.so)
+# Consumer:     any tool that requests a cap from svc.elevate-broker via the
+#               client-side helper set in src/elevate_client*.pdx.
+#
+# libpdx-elevate is a library, not a tool: it holds no caps itself.  What it
+# declares here is the *floor* set of caps the *consuming process* must hold
+# for each entry point below to succeed.  pkg (§5.1), the R50 coreutils,
+# and every future tool that needs a per-op elevate hop link this manifest
+# into their own caps.decl via a `+use libpdx-elevate` line at exec time.
+#
+# The kernel's cap-check runs against the consuming process's cap set — this
+# file is documentary: it tells `pkg install libpdx-elevate` what to prompt
+# the caller to grant, and it tells `paideia-as release --sign` what to hash
+# into manifest.pdxsig.  It does NOT relax any check the kernel enforces.
+
++entry elevate_client_lookup_broker
+  KIND_IPC_ENDPOINT(read, "svc.elevate-broker")
+  # svc_lookup returns the broker endpoint id after checking the name-service
+  # cap.  No mint required — the endpoint is already registered.
+
++entry elevate_client_send_req
+  KIND_IPC_ENDPOINT(write, broker_ep_id)
+  KIND_IPC_ENDPOINT(mint,  reply)
+  # broker_ep_id comes from lookup_broker; reply is minted by the caller for
+  # the APR return channel.  The mint right is per-invocation and narrowed
+  # to a single-frame endpoint.
+
++entry elevate_client_recv_reply
+  KIND_IPC_ENDPOINT(read, reply_ep_id)
+  # reply_ep_id must be the caller's own reply endpoint.  No cross-process
+  # read is possible: endpoint_take_pending checks holder identity.
+
++entry elevate_client_journal_req
++entry elevate_client_journal_apr
+  KIND_IPC_ENDPOINT(write, uej)
+  # uej_append (UEJ_KIND_ELEVATE=5) fans out to /system/audit/user-events/.
+  # M3-001 wires directly to the kernel primitive; when libpdx-audit.M2
+  # lands the caller may substitute a libpdx-audit cap for this line.
+
++entry elevate_client_cap_mint
++entry elevate_client_cap_check_and_revoke
+  KIND_ELEVATE_CHANNEL(mint,   row_id)   # M2-003
+  KIND_ELEVATE_CHANNEL(revoke, row_id)   # cap-lifetime enforcement
+  # 0x191, derived over KIND_IPC_ENDPOINT (base 5).  Rights narrowed to the
+  # specific row_id the caller obtained from the broker's APR reply.
+
++entry elevate_client_request_ex
++entry elevate_client_request_ex_j
++entry elevate_client_request_ex_r
+  # Full-flow entry points: they compose the individual entries above.  The
+  # caller must hold the *union* of the caps listed above for every entry
+  # the composed path reaches.  The retry variant (_r) may loop the
+  # send/recv/journal triple up to elevate_client_retry_get_max_attempts()
+  # times per invocation; the cap set does not grow with retries.
+
+# Notes for downstream tools:
+#
+# 1. libpdx-elevate itself never holds KIND_SUPERVISOR.  Every cap it names
+#    above is either narrowed to a specific object (broker_ep_id, reply,
+#    row_id) or opaquely brokered through svc.* lookup.  This preserves the
+#    audit chain: the elevate broker owns the policy table and the sign-off
+#    trail, the caller owns the request and the returned cap.
+#
+# 2. No cap declared here is minted with lifetime > the request's requested
+#    duration.  Cap<KIND_ELEVATE_CHANNEL>'s bounded-lifetime self-
+#    invalidation (M2-003, tests/elevate_client_cap_test.pdx) means a
+#    caller cannot silently retain a granted elevate past its deadline.
+#
+# 3. When libpdx-cap.M2 lands and elevate_client_cap_narrow_stub is
+#    replaced with a real cap_narrow_rights call, one new line will be
+#    added here:  KIND_ELEVATE_CHANNEL(narrow, row_id).  Bumped in the
+#    v1.1.0 manifest, not here.

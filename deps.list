@@ -1,0 +1,54 @@
+# libpdx-elevate — shared-library dependencies (per design/tooling/plan.md §7)
+#
+# Format:  <libname>  <version-constraint>  <status>  <notes>
+#
+# `status` is one of:
+#   LANDED      — the dependency has shipped its own v1.0 signed release
+#   PENDING     — the dep exists as source but hasn't closed M5 yet;
+#                 libpdx-elevate wires to the kernel primitive the dep will
+#                 eventually front, and the swap is source-compatible.
+#   KERNEL      — not a shared library; kernel primitive consumed directly.
+#
+# A PENDING entry is a documented forward reference, not a build blocker:
+# every function that would go through the pending lib is present today with
+# a direct kernel-primitive call marked as the swap site in the source.
+
+libpdx-cap        >=0.2.0   PENDING   elevate_client_cap_narrow_stub swap
+                                     (elevate_client_cap.pdx :90) —
+                                     replaces the stub body with
+                                     cap_narrow_rights when libpdx-cap.M2
+                                     lands.  Return shape unchanged; only
+                                     the ELCC_NOTE_NO_NARROW status code
+                                     retires.
+
+libpdx-audit      >=0.3.0   PENDING   elevate_client_journal_req/_apr
+                                     bodies swap from raw uej_append(5, ...)
+                                     to audit_begin / audit_record_output /
+                                     audit_commit when libpdx-audit.M2
+                                     ships.  Signatures unchanged;
+                                     UEJ_KIND_ELEVATE = 5 stays the wire
+                                     ordinal in both paths.
+
+# Kernel primitives consumed directly (KERNEL — not shared libraries):
+#
+#   endpoint_write_pending             — R20b IPC (M2-002 send)
+#   endpoint_take_pending              — R20b IPC (M2-002 recv)
+#   svc_lookup                         — R20b name service (M1-002 binding)
+#   hpet_now_ns                        — HPET clock (M2-002 bounded recv,
+#                                        M2-003 shadow deadline map,
+#                                        M3-002 retry backoff)
+#   uej_append                         — R48.M7 user-events journal
+#                                        (M3-001, UEJ_KIND_ELEVATE = 5)
+#   elevate_channel_cap_mint_inner     — R48.M7 kernel mint helper
+#                                        (M2-003)
+#   elevate_channel_cap_revoke         — R48.M7 kernel revoke
+#                                        (M2-003 auto-revoke path)
+#
+# Kernel dependency is fixed at paideia-os HEAD with:
+#   - #1626 (KIND_ELEVATE_CHANNEL = 0x191)
+#   - #1627 (broker registration + policy table wiring)
+#   - #1549 (wire codec)
+#   - #1550 (policy table)
+#   - #1544 (user_events_journal / uej_append)
+#
+# All five have LANDED per paideia-os HEAD 2026-08-21+.

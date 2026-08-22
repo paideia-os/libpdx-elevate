@@ -1,0 +1,101 @@
+# manifest.pdxsig — libpdx-elevate v1.0.0
+#
+# Dual-signed release manifest per D4 (design/tooling/plan.md §6).  Two
+# ML-DSA-65 signatures cover the manifest body: (a) the author key of the
+# repository owner, and (b) the Paideia root key that re-signs at the
+# `pkgs.paideia-os` mirror gate.
+#
+# This text form is the canonical source of truth for the manifest body.
+# `paideia-as release --sign`, once v0.33-crypto-kdf is reachable through
+# the toolchain, canonicalises this file (strip comments, sort keys,
+# LF-only, no trailing whitespace) into the byte string that both
+# signatures cover, then rewrites the two SIG-BYTES blocks below with the
+# 3309-byte ML-DSA-65 outputs.  Until then the SIG-BYTES blocks carry the
+# stub marker below; the manifest body itself is stable and any tool
+# that resigns against v0.33-crypto will produce a message digest
+# identical to the one recorded here.
+
+[manifest]
+schema-version        = 1
+tool-name             = libpdx-elevate
+tool-kind             = shared-library
+version               = 1.0.0
+released              = 2026-08-22
+source-repo           = https://github.com/paideia-os/libpdx-elevate
+source-commit         = 796fe888cd384dfefc3d088652c1b02d3538f186
+source-tree-hash-sha256 = 1e53491dd382d66e9817b2956074a5150ffd52b5f066b750efbcc9253add6e6b
+license               = MIT
+
+[artifacts]
+# Enumerated .pdx sources, hashed individually.  A future paideia-as
+# build step producing an elaborated binary (bin/libpdx-elevate.pdxlib)
+# would append a `binary-hash-sha256` line here; the source hashes
+# stay authoritative for the source-audit path.
+src/elevate_client.pdx           = sha256:d7ba5fae8090d9422dbf7233b71fd6ba7267e618e58b47107c2f3a6a5a57cf29
+src/elevate_client_cap.pdx       = sha256:dcf8ce33db195f083b2b193aef81279eaf539770c59148aa8021d644acdd93b5
+src/elevate_client_journal.pdx   = sha256:3cf3bfa33dc8be9ac130278edc3ba9d1ead5e85ac102a839caec7f73a8ecce19
+src/elevate_client_policy.pdx    = sha256:399db1eb2a422b3f4bc234ad6f8f88eb884f25bb5ce99121798eda5355d3a487
+src/elevate_client_retry.pdx     = sha256:e65923907c9c15459fff49bbf20aa37d9aaafefa49de5dc7be5be7a57f1c272e
+src/elevate_client_send.pdx      = sha256:4dbd04458f653ff88dcb23b0dd2cd4c54de85d4ca01fb99336c8c52c859299ef
+src/elevate_request.pdx          = sha256:2b315119c9dce6b66a8d52ff64b5a0fb012332727b394972aad65f74a2c743a3
+tests/elevate_client_cap_test.pdx    = sha256:0997a61c39763466e459946be8a0ef89ee0f8d783df3e31eae96935847f2b1a2
+tests/elevate_client_policy_test.pdx = sha256:9754c2ad013ec29edc3d33e005a328b99c79c2fa5b07e298c0e27b33aaccec4d
+
+[cap-manifest]
+# Hash over caps.decl.  The raw-file hash below is authoritative for
+# v1.0.0 — the file has LF-only line endings and no trailing
+# whitespace, so the canonical form (per canonicalise-manifest.sh,
+# landing in paideia-as v0.33) equals the raw file byte-for-byte.
+# A canonicalisation-form field is kept below for the release-sign
+# tool to verify at push time.
+caps.decl.file       = caps.decl
+caps.decl.sha256     = sha256:41164da73a61c4235ce03bf0d31e9362c3370c12262bc17deeff5cbad387bf0c
+caps.decl.canonical  = sha256:41164da73a61c4235ce03bf0d31e9362c3370c12262bc17deeff5cbad387bf0c
+
+[deps]
+deps.list.file       = deps.list
+deps.list.sha256     = sha256:e2e80822028f1f6845618d14bcb1fda3b18384cdc9b2b07f461efe450ca357d6
+deps.list.canonical  = sha256:e2e80822028f1f6845618d14bcb1fda3b18384cdc9b2b07f461efe450ca357d6
+
+[changelog]
+CHANGELOG.md.sha256  = sha256:117a449bd246be93c8e95891abc4cfb066b83e3cfe12f7514b4928a2b423410d
+
+[docs]
+doc/libpdx-elevate.pdxdoc.sha256 = sha256:86c09beaa0a1856a3f80dd66e9e6f0f03648c9b64463cd53f3493bd528e02eda
+
+[kernel-substrate]
+# The paideia-os kernel primitives libpdx-elevate v1.0 links against.
+# Substrate change bumps require re-signing (major or minor per SemVer);
+# see CHANGELOG.md §"Known deferred paths" for the swap sites.
+paideia-os-issue-1626   = KIND_ELEVATE_CHANNEL = 0x191
+paideia-os-issue-1627   = svc.elevate-broker registration + policy wiring
+paideia-os-issue-1549   = elevate wire codec (elv_pack_req)
+paideia-os-issue-1550   = elevate policy table (ep_check, ep_hit_row)
+paideia-os-issue-1544   = user_events_journal (uej_append, UEJ_KIND_ELEVATE=5)
+paideia-as-toolchain    = >=v0.33-crypto-kdf (for release --sign)
+
+[signature.author]
+key-fingerprint       = <author_pk-fingerprint-pending-v0.33-crypto>
+key-owner             = paideia-os (santiago; snunezcr@gmail.com)
+algorithm             = ML-DSA-65
+signed-at             = <populated-at-release-sign-time>
+sig-bytes             = <MLDSA65-SIG:STUB-PENDING-V0.33-CRYPTO-KDF>
+# The stub marker above is a fixed 42-byte ASCII sentinel that
+# `paideia-as release --sign` scans for and replaces in place with the
+# 3309-byte ML-DSA-65 signature (base64-encoded, 4412 chars) once the
+# crypto tag is reachable.  The manifest body preceding this section is
+# hash-stable, so signing produces a bit-identical output on any
+# machine holding the author key.
+
+[signature.paideia-root]
+key-fingerprint       = <paideia_root_pk-fingerprint-per-R32>
+key-owner             = pkgs.paideia-os re-sign gate
+algorithm             = ML-DSA-65
+signed-at             = <populated-at-mirror-push-time>
+sig-bytes             = <MLDSA65-SIG:STUB-PENDING-V0.33-CRYPTO-KDF>
+# Applied by the Paideia signing bot at the pkgs.paideia-os/main/
+# staging gate (design/tooling/plan.md §8, release-flow step 4):
+# the bot verifies the author sig, computes its own signature over the
+# identical canonical body, and rewrites this second SIG-BYTES field.
+# Both must verify for `pkg install libpdx-elevate` to accept the
+# manifest (§6.2 trust model — dual signature).

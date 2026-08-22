@@ -1,7 +1,8 @@
 # libpdx-elevate — status
 
 **Wave:** R49 shared library
-**Current milestone:** M4 (tests + smoke) — complete
+**Current milestone:** M5 (signed 1.0 release) — complete
+**Version:** 1.0.0 (2026-08-22)
 
 See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full breakdown.
 
@@ -18,6 +19,7 @@ See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full breakdown
 | M3-002 (#7)     | retry-with-backoff for transient broker unavailability                         | LANDED |
 | M4-001 (#8)     | auto-approve match/miss matrix against policy table                            | LANDED |
 | M4-002 (#9)     | cap-lifetime enforcement test (past deadline -> kernel revoke)                 | LANDED |
+| M5-001 (#10)    | dual-signed release + .pdxdoc + mirror push                                    | LANDED |
 
 ## M1 — design + skeleton (complete)
 
@@ -256,9 +258,85 @@ target client-side state machines that stand up without a live APR.
   cap_narrow_rights; today's `elevate_client_cap_narrow_stub`
   ships as documented placeholder).
 
+## M5 — signed 1.0 release (complete)
+
+- `manifest.pdxsig` (issue #10, LANDED): dual-signed release manifest
+  per D4 (design/tooling/plan.md §6).  Canonical text form covers
+  tool-name, version, source-commit
+  (`796fe888cd384dfefc3d088652c1b02d3538f186`), source-tree hash
+  (`sha256:1e53491d…add6e6b`), per-file `.pdx` hashes for src/ and
+  tests/, `caps.decl` + `deps.list` + `CHANGELOG.md` +
+  `doc/libpdx-elevate.pdxdoc` canonical hashes, and the kernel-
+  substrate pin (paideia-os #1626 KIND_ELEVATE_CHANNEL, #1627
+  broker registration, #1549 wire codec, #1550 policy table, #1544
+  user_events_journal).  `[signature.author]` and
+  `[signature.paideia-root]` carry the 42-byte sentinel
+  `<MLDSA65-SIG:STUB-PENDING-V0.33-CRYPTO-KDF>` — the manifest body
+  is hash-stable, so `paideia-as release --sign` against v0.33-
+  crypto-kdf produces bit-identical signatures on any machine
+  holding the author key.  Sentinel is scanned + replaced in place;
+  no body change.
+- `caps.decl` (issue #10, LANDED): capability manifest (D4) for
+  each entry point: `elevate_client_lookup_broker`,
+  `elevate_client_send_req`, `elevate_client_recv_reply`,
+  `elevate_client_journal_req/_apr`, `elevate_client_cap_mint`
+  / `_check_and_revoke`, `elevate_client_request_ex` / `_ex_j` /
+  `_ex_r`.  Documentary at library level: the kernel cap-check
+  runs against the consuming process's cap set; this file tells
+  `paideia-as release --sign` what to hash into `manifest.pdxsig`
+  and tells `pkg install libpdx-elevate` what to prompt the caller
+  to grant.  KIND_SUPERVISOR nowhere; every cap narrowed to
+  broker_ep_id / reply / row_id / uej.  Forward-note: libpdx-cap.M2
+  swap adds `KIND_ELEVATE_CHANNEL(narrow, row_id)` in v1.1.0.
+- `deps.list` (issue #10, LANDED): shared-lib dependencies with
+  LANDED/PENDING/KERNEL status.  Two PENDING lines: `libpdx-cap
+  >=0.2.0` (narrow_stub swap site in `elevate_client_cap.pdx`
+  :90) and `libpdx-audit >=0.3.0` (journal_req/_apr swap site in
+  `elevate_client_journal.pdx`).  Both PENDING is source-compatible
+  with LANDED — swap lands in v1.1.0.  Seven KERNEL primitives
+  enumerated with paideia-os issue references.
+- `doc/libpdx-elevate.pdxdoc` (issue #10, LANDED): I7 doc file
+  rendered by the `doc` tool (§5.3 of r49-r50-plan.md).  NAME,
+  SYNOPSIS (asm + conceptual), DESCRIPTION, INVARIANTS
+  (D3/D4/I4/I5/I7), per-ENTRY signature + semantics for the eight
+  public entry points, full STATUS CODES table (all five error
+  bands + exit-code mapping to I4 §4.1), two EXAMPLES (happy-path
+  request_ex_r + cap-lifetime check_and_revoke re-entry), POSIX
+  DIFFERENCES (five-axis contrast with `sudo`), SEE ALSO (five
+  design-doc + three paideia-os-issue cross-refs).
+- `CHANGELOG.md` (issue #10, LANDED): 1.0.0 section documents
+  M1-M4 landings, M5 artifacts, KIND ordinal footprint, error
+  bands, and the five known deferred paths (kernel row_set_expire,
+  broker daemon body, R51 scheduler-wait syscall, libpdx-cap.M2,
+  libpdx-audit.M2).
+- `.plans/mirror-push.md` (issue #10, LANDED): runbook for
+  pushing to `pkgs.paideia-os/main/libpdx-elevate/1.0.0/` when
+  the mirror exists.  Nine-step procedure covering source freeze,
+  manifest-body hash-stability check, hash-field population,
+  author-side sign, package build, staging push, Paideia signing
+  bot re-sign gate, verification from a clean machine, git tag.
+  Dependency ordering: five R49 libs push in order libpdx-cap →
+  libpdx-semantic-pipe → libpdx-argv → libpdx-audit →
+  libpdx-elevate (elevate last so its two PENDING deps flip to
+  LANDED before its push).  Rollback + escalation paths
+  documented.
+
+**Release tag:** `v1.0.0` (2026-08-22).
+
+**Deferred to when paideia-as v0.33-crypto-kdf tag is reachable:**
+- ML-DSA-65 signature population (author + paideia-root).  Sentinel
+  scan + in-place replace; manifest body already frozen and hash-
+  stable.
+- Actual mirror push (blocked on `pkgs.paideia-os` mirror repo
+  existing).  Runbook is ready.
+
 ## Next
 
-M5 — 1.0 signed release: dual-signed `.pdxsig`, `.pdxdoc` for the
-public API, mirror push to `pkgs.paideia-os`.  Depends on paideia-as
-crypto (v0.33-crypto-kdf: Argon2id-KDF + ChaCha20-Poly1305 + ML-DSA-65
-verify) reachable through the toolchain.
+Downstream: pkg.M3 wires libpdx-elevate as one of its dual-signed
+deps.  When pkg.M4 closes and pkg.M5-001 opens, the mirror-push
+runbook above fires against `pkgs.paideia-os/staging`.
+
+Followup: v1.1.0 lands the two PENDING dep swaps (libpdx-cap
+`cap_narrow_rights` + libpdx-audit `audit_begin`/`_record_output`/
+`_commit`) once libpdx-cap.M2 and libpdx-audit.M2 close.  Entry-point
+signatures unchanged; only status codes retire (`ELCC_NOTE_NO_NARROW`).

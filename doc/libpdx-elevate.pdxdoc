@@ -1,0 +1,243 @@
+.pdxdoc  libpdx-elevate  1.0.0
+.audience  tool-author, security-auditor, kernel-integrator
+.format-version  1
+.rendered-by  doc (§5.3 of design/tooling/r49-r50-plan.md)
+
+.section  NAME
+
+libpdx-elevate — client-side elevate-protocol helper for per-op
+capability requests on PaideiaOS.
+
+.section  SYNOPSIS
+
+  ;; assembly-level (from src/*.pdx)
+  call  elevate_client_lookup_broker
+  call  elevate_client_request_ex_r   ;; full-featured: retry + audit + policy
+  call  elevate_client_cap_check_and_revoke
+
+  ;; conceptual (tool-side)
+  hold  Cap<KIND_IPC_ENDPOINT(read,  "svc.elevate-broker")>
+  hold  Cap<KIND_IPC_ENDPOINT(write, broker_ep)>
+  hold  Cap<KIND_IPC_ENDPOINT(mint,  reply)>
+  request  caps=<mask>, dur=<ns>, target_fp_lo=<user>
+  receive  Cap<KIND_ELEVATE_CHANNEL(0x191, expire_ns)>
+
+.section  DESCRIPTION
+
+libpdx-elevate wraps the R48.M7 kernel elevate protocol
+(`src/kernel/core/ipc/elevate_channel.pdx`) with the client-side state
+machine tools need to request a bounded-lifetime capability from
+`svc.elevate-broker`.  It is a shared library — no binary, no daemon.
+Consumers are `pkg` (§5.1, elevate for `/pkgs` write), the R50
+coreutils (`cp` and `mv` for cross-subtree destinations), and every
+future tool that needs to escalate a single operation without becoming
+setuid or claiming persistent supervisor authority.
+
+The library does not replace `sudo`.  There is no `sudo` in PaideiaOS
+(see .see-also §5 of design/user/model.md).  What replaces it is the
+per-op elevate protocol: for one operation, at one moment, with one
+duration budget and one cap-mask scope, the caller asks the founder (or
+the auto-approve policy table) for a `Cap<KIND_ELEVATE_CHANNEL>`.  The
+cap dies at its expire_ns.  No lingering root shell exists to hijack;
+no persistent group membership grants standing authority; every request
+is journaled to `/system/audit/user-events/`.
+
+.section  INVARIANTS  I4  I5  I7  D3  D4
+
+Every entry point in libpdx-elevate enforces the following:
+
+  D3 (audit-first)
+    Every mutating flow (request_ex_j, request_ex_r) writes its REQ
+    audit record before it reaches the broker.  A REQ-journal failure
+    aborts the operation with ELVJ_ERR_REQ_JOURNAL_FAIL — no wire hop
+    occurs.  Successful APR writes its APR audit record before the
+    cap is returned to the caller.
+
+  D4 (dual-signed manifest)
+    libpdx-elevate ships with manifest.pdxsig carrying author +
+    Paideia-root ML-DSA-65 signatures.  `pkg install libpdx-elevate`
+    verifies both before the .pdx sources are placed under /pkgs/.
+
+  I4 (never silent failure)
+    Every entry point returns a nonzero status code on the failure
+    path (see .section STATUS CODES).  No path silently returns
+    success on partial completion.
+
+  I5 (destructive ops undoable)
+    Not applicable at library level — libpdx-elevate holds no state
+    on the caller's behalf.  The Cap<KIND_ELEVATE_CHANNEL> lifetime
+    bound (M2-003) is the equivalent invariant: the cap self-
+    invalidates at expire_ns and calls to it thereafter fail with
+    ELCC_STATE_REVOKED.  A caller cannot "forget" to release it.
+
+  I7 (help + tutorial + example-gallery)
+    This .pdxdoc file is the doc(1) back-end.  Callers hit --help
+    against a consuming tool (e.g. `pkg --help`), which references
+    this doc via .see-also.  --tutorial and --examples for
+    libpdx-elevate specifically will land with the doc tool itself
+    (§5.3, doc.M2); today the .examples section below stands in.
+
+.section  ENTRY  elevate_client_lookup_broker
+
+.signature  fn elevate_client_lookup_broker() -> ep_id | ELVC_ERR_LOOKUP_FAIL
+
+Resolves the canonical name `svc.elevate-broker` to a
+KIND_IPC_ENDPOINT handle via `svc_lookup`.  No side effects; safe to
+call at any point in the caller's lifecycle.  The returned handle is
+suitable as the `broker_ep_id` argument to `elevate_client_send_req`.
+
+.section  ENTRY  elevate_client_set_human_timeout / _set_fast_timeout
+
+.signature  fn elevate_client_set_human_timeout(ns: u64)
+.signature  fn elevate_client_set_fast_timeout(ns: u64)
+
+Set the recv-timeout budget for the human-approve and auto-approve
+paths respectively.  Defaults are 30 s and 500 ms.  Callers that
+raise the human budget above 30 s should also raise their own
+user-visible progress indication — the founder may take that long to
+respond, and the terminal will otherwise appear stuck.
+
+.section  ENTRY  elevate_client_request_ex
+
+.signature  fn elevate_client_request_ex(caps: u64, dur: u64, req_buf: *u8,
+.signature                               reply_ep_id: u32, reply_buf: *u8,
+.signature                               timeout_ns: u64) -> ELVC_*
+
+The full M2 flow.  Sequence: policy consult (fast/human classification)
+→ REQ assemble via `elevate_request_write_frame` → REQ send via
+`elevate_client_send_req` → APR recv via `elevate_client_recv_reply` →
+grant subset check via `elevate_client_check_grant`.
+`timeout_ns == 0` picks the human or fast default based on the policy
+classification.  `target_fp_lo` comes from the process-global set via
+`elevate_client_set_target_fp_lo`.  Caller must supply a
+64-byte-aligned `req_buf` and `reply_buf`.
+
+.section  ENTRY  elevate_client_request_ex_j
+
+.signature  fn elevate_client_request_ex_j(caps: u64, dur: u64, ...)
+.signature                                 -> ELVC_*/ELVJ_ERR_*
+
+M3-001 audit-first wrapper.  Journals REQ before wire hop; aborts on
+REQ-journal failure; journals APR on success; returns
+ELVJ_ERR_APR_JOURNAL_FAIL if the APR-journal write fails after grant
+(caller should revoke immediately in that case — the audit chain is
+broken otherwise).
+
+.section  ENTRY  elevate_client_request_ex_r
+
+.signature  fn elevate_client_request_ex_r(caps: u64, dur: u64, ...)
+.signature                                 -> ELVC_*/ELVJ_ERR_*/ELVR_ERR_*
+
+M3-002 retry wrapper over _ex_j.  Retriable set is
+{ELVC_ERR_TIMEOUT, ELVC_ERR_SEND_FAIL, ELVC_ERR_LOOKUP_FAIL}.  Bounds
+[1, 8] attempts (default 3).  Backoff 100 ms → 400 ms → 1.6 s
+(capped).  Every attempt writes its own REQ audit record; the eventual
+success writes its APR record; the auditor sees a per-attempt trail.
+Non-retriable failures pass through unchanged on the first attempt.
+
+.section  ENTRY  elevate_client_cap_mint / _bind_expire / _check_and_revoke
+
+.signature  fn elevate_client_cap_mint(...) -> Cap<KIND_ELEVATE_CHANNEL>
+.signature  fn elevate_client_cap_bind_expire(row_id: u32, dur_ns: u64)
+.signature  fn elevate_client_cap_expired(row_id: u32) -> u32
+.signature  fn elevate_client_cap_check_and_revoke(row_id: u32) -> ELCC_*
+
+M2-003 cap-lifetime wrapper.  Kernel default `expire_ns == 0` is
+compensated by a client-side shadow deadline map (16 slots, one per
+possible row_id).  `check_and_revoke` invokes kernel
+`elevate_channel_cap_revoke` when past deadline; the call is
+idempotent (`REVOKE_ALREADY` collapses to `STATE_REVOKED`).
+
+Callers should invoke `check_and_revoke` at every re-entry to a
+guarded region; the M4 witness `elevate_client_cap_witness`
+demonstrates the pattern (12 stages, fingerprint
+`LIBPDX-ELEVATE M4 CAP OK`).
+
+.section  STATUS  CODES
+
+Codes are grouped by band; the numeric value is a u32 return code.
+Every entry point returns 0 on success.
+
+  0xFFFFEA01  ELVC_ERR_TIMEOUT           recv-timeout expired (retriable)
+  0xFFFFEA02  ELVC_ERR_BAD_REPLY         reply frame malformed (non-retriable)
+  0xFFFFEA03  ELVC_ERR_GRANT_INVALID     granted caps not subset of requested
+  0xFFFFEA04  ELVC_ERR_BAD_EXPIRE        expire_ns == 0 in APR
+  0xFFFFEA05  ELVC_ERR_BAD_REPLY_EP      caller-supplied reply_ep_id invalid
+  0xFFFFEA10..1F  ELCP_ERR_*             policy table (BAD_ARG, RATE_LIMIT,
+                                         NO_MATCH, ENOSPC, BAD_DUR, BAD_CAPS)
+  0xFFFFEA20  ELVR_ERR_EXHAUSTED         retry attempts exhausted
+  0xFFFFEA21  ELVR_ERR_BAD_ARG           retry config out of bounds
+  0xFFFFEA30..3F  ELCC_*                 cap-lifetime (BAD_ROW, MINT_FAIL,
+                                         NO_DEADLINE, REVOKE_FAIL, STATE_LIVE,
+                                         EXPIRED, REVOKED, NOTE_NO_NARROW)
+  0xFFFFEA40  ELVJ_ERR_BAD_ACTOR         no target_fp_lo set (process-global)
+  0xFFFFEA41  ELVJ_ERR_REQ_JOURNAL_FAIL  audit REQ write failed; abort
+  0xFFFFEA42  ELVJ_ERR_APR_JOURNAL_FAIL  audit APR write failed; revoke grant
+
+Consumers map these to the shared exit codes (design/tooling/plan.md
+§4.1 I4 table): every ELVC_/ELCP_/ELCC_ failure is exit 4
+(capability denied); ELVR_ERR_EXHAUSTED is exit 3 (system error);
+ELVJ_ERR_* is exit 4 (capability + audit denied).
+
+.section  EXAMPLES
+
+  ;; #1 — happy-path per-op elevate, auto-approve
+  ;;
+  ;; A tool wants to write /pkgs for a package install.  target_fp_lo
+  ;; is the founder's user fingerprint.  Caller pre-mints a reply
+  ;; endpoint and a request buffer.
+  ;;
+  ;;   caps       = 0x0000000000000002  ;; KIND_PDXFS_FILE(write, /pkgs)
+  ;;   dur        = 60_000_000_000       ;; 60 s
+  ;;   timeout_ns = 0                    ;; use policy default
+  ;;
+  ;;   elevate_client_set_target_fp_lo   founder_fp_lo
+  ;;   elevate_client_request_ex_r       caps, dur, req_buf, reply_ep,
+  ;;                                     reply_buf, timeout_ns
+  ;;   ;; on success rax=0, reply_buf holds APR frame
+
+  ;; #2 — cap-lifetime enforcement at re-entry
+  ;;
+  ;;   loop:
+  ;;     elevate_client_cap_check_and_revoke   row_id
+  ;;     cmp     rax, ELCC_STATE_LIVE
+  ;;     jne     .cap_expired_or_bad
+  ;;     ;; ...perform guarded work using the cap...
+  ;;     jmp     loop
+  ;;   .cap_expired_or_bad:
+  ;;     ;; cap dead — either re-request or bail
+
+.section  POSIX  DIFFERENCES
+
+The Unix analog is `sudo`.  libpdx-elevate is different on five
+observable axes:
+
+  1. sudo grants a shell.  libpdx-elevate grants a cap for one op.
+  2. sudo persists for a tty timeout (default 5 min).  libpdx-elevate
+     caps carry an explicit expire_ns; the kernel invalidates at
+     deadline; no session-time inheritance.
+  3. sudo authenticates once and remembers.  libpdx-elevate consults
+     the policy table for auto-approve, or blocks on the founder for
+     human approve, per invocation.  There is no "sudo timestamp".
+  4. sudo works via setuid + /etc/sudoers.  libpdx-elevate mints a
+     kernel-checked `Cap<KIND_ELEVATE_CHANNEL>` — the kernel enforces
+     the scope; no in-kernel superuser exists to bypass.  See §3.3
+     of design/user/model.md ("Founder is not magic").
+  5. sudo logs to /var/log/auth.log optionally.  libpdx-elevate
+     journals every REQ and every APR to
+     /system/audit/user-events/ before the wire hop (D3 audit-first).
+
+.section  SEE  ALSO
+
+  design/user/model.md §5      elevation model (no setuid, no sudo)
+  design/tooling/plan.md §4.2  invariants I4, I5, I7
+  design/tooling/plan.md §6    D4 dual-signed packages
+  design/tooling/r49-r50-plan.md §5.14   libpdx-elevate milestones
+  paideia-os issue #1626       KIND_ELEVATE_CHANNEL = 0x191
+  paideia-os issue #1627       svc.elevate-broker registration
+  paideia-os issue #1544       user_events_journal / uej_append
+
+.section  AUTHORS
+
+paideia-os — santiago (snunezcr@gmail.com) and contributors.
+MIT license — see LICENSE at repo root.
