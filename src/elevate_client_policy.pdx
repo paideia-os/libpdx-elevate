@@ -403,7 +403,7 @@ module ElevateClientPolicy = structure {
         // Magic gate.
         mov rax, [r10 + 0];
         mov r11, rax;
-        and r11, 0xFFFFFFFF;
+        mov r11d, r11d;
         mov rcx, 0x50585044;
         cmp r11, rcx;
         jne elcp_ck_next;
