@@ -16,38 +16,76 @@
 //   * elevate_client_lookup_broker() -- wraps svc_lookup with the
 //     canonical (name_ptr, name_len) pair.  Returns the u16 endpoint_id
 //     (zero-extended to u64) on hit or SVC_LOOKUP_NONE on miss.
-//   * elevate_client_request(caps, dur, req_buf, reply_buf) -- the
-//     M1 block-on-reply SKELETON: assemble the REQ frame into req_buf
-//     (via elevate_request_write_frame), resolve the broker via
-//     elevate_client_lookup_broker, and return ELVC_STUB.  The actual
-//     endpoint_invoke + block-on-recv arrive at M2 alongside the
-//     policy-consult (auto-approve) and human-approve paths.
+//   * elevate_client_request_norealize(caps, dur, req_buf, reply_buf) --
+//     the M1 block-on-reply SKELETON, RENAMED at libpdx-elevate.ENH-005
+//     (#12) from `elevate_client_request`: assemble the REQ frame into
+//     req_buf (via elevate_request_write_frame), resolve the broker
+//     via elevate_client_lookup_broker, and return
+//     ELVC_NOT_DISPATCHED.  It never sends, never receives, never
+//     validates a grant -- see WHY THE RENAME below.  The actual
+//     endpoint_invoke + block-on-recv live at
+//     elevate_client_request_ex (elevate_client_send.pdx, M2) and the
+//     grant-handle composition elevate_client_acquire
+//     (elevate_client_acquire.pdx, ENH-001).
 //   * _elevate_client_stats -- eight-word counter table so the client's
 //     own health is observable independently of the broker's stats.
 //     Same shape as ElevateBroker._elevate_broker_stats.
 //
 // =============================================================================
-// WHY "STUB" IS THE HAPPY PATH AT M1
+// WHY THE RENAME (ENH-005, #12) -- retiring "ELVC_STUB means proceed"
 // =============================================================================
 //
-// The paideia-os broker itself only lands the SEAM at R48b substrate-
-// prep (#1627): elevate_broker_dispatch is a stub that recognises the
-// three wire ops (REQ / APR / EXP) and returns ELVB_DISPATCH_STUB
-// (0xFFFFEBFB) for every one of them, without a daemon body to consume
-// them.  A client that "sends a REQ and blocks on reply" against that
-// broker cannot receive a real APR -- there is no policy consult and
-// no approver hop yet.  Rather than fake an APR at M1, this skeleton
-// stops one step short: everything up to and INCLUDING the endpoint
-// resolution happens, and the return is ELVC_STUB.  At M2 the same
-// entry point is extended to actually invoke the endpoint (once the
-// broker's daemon body exists) and the return codes shift to
-// ELVC_OK / ELVC_ERR_TIMEOUT / ELVC_ERR_DENIED.
+// The post-1.0.0 enhancement audit (.plans/enhancement-plan.md §2) found
+// that `elevate_client_request` -- the name every real caller reached
+// for, because it was the only entry point that fit in four arguments
+// and needed no reply endpoint -- NEVER dispatches.  Two consumers
+// called the identical function and reached OPPOSITE security
+// dispositions from its return value: one treated the STUB sentinel as
+// "proceed" (fail-open), the other treated it as "refuse" (fail-
+// closed).  That is a library-side API defect: a sentinel that lives in
+// the error/status band but reads, in this library's OWN README
+// example, as a second spelling of "proceed" is a coin-flip for every
+// future consumer.
+//
+// The fix has two parts, both landed here:
+//
+//   (1) RENAME.  `elevate_client_request` no longer exists under that
+//       name.  Any caller still linking against it fails at BUILD time
+//       -- a compile error, not a silent security bug -- and is forced
+//       to make an explicit choice: either it truly cannot dispatch
+//       (rare; the new name says so) and should call
+//       elevate_client_request_norealize with the SAME semantics as
+//       before, or -- the overwhelmingly likely case for any caller
+//       gating a mutating operation -- it wants a flow that actually
+//       reaches the broker, and should migrate to
+//       elevate_client_request_ex (M2, real dispatch) or
+//       elevate_client_acquire (ENH-001, dispatch + a grant HANDLE the
+//       caller must thread into the privileged op).  This is the one
+//       source-breaking change in the v1.1.0 surface; `rm` and `pkg`
+//       track their own migration under their own issues.
+//   (2) CONSTANT RENAME.  ELVC_STUB is renamed to
+//       ELVC_NOT_DISPATCHED (same numeric value, 0xFFFFEA00, so no
+//       stats/wire encoding shifts).  "STUB" described the
+//       implementation stage (M1); "NOT_DISPATCHED" describes the
+//       SECURITY FACT a caller must act on -- this function did not
+//       reach the broker, so nothing was authorized.  A name that
+//       states the security fact is harder to misread as "proceed"
+//       than one that states an implementation milestone.
+//
+// elevate_client_request_norealize is NOT deprecated for removal: a
+// caller that genuinely only wants "assemble + resolve, no wire hop"
+// (a dry-run / capability-probe use case) still has a name for that --
+// it just can no longer be mistaken for the name real callers reach
+// for by default, because that name (elevate_client_request) is gone.
 //
 // =============================================================================
 // ERROR BAND 0xFFFFEA00..0xFFFFEA0F
 // =============================================================================
 //
-//   0xFFFFEA00  ELVC_STUB            -- M1 happy path (validated + resolved)
+//   0xFFFFEA00  ELVC_NOT_DISPATCHED  -- elevate_client_request_norealize's
+//                                        ONLY return (validated + resolved,
+//                                        never sent).  NEVER a proceed
+//                                        signal; see WHY THE RENAME above.
 //   0xFFFFEA0B  ELVC_ERR_BAD_BUF     -- req_buf or reply_buf is 0
 //   0xFFFFEA0C  ELVC_ERR_RECV_FAIL   -- M2+: block-on-reply gave up
 //   0xFFFFEA0D  ELVC_ERR_SEND_FAIL   -- M2+: endpoint_invoke refused
@@ -57,7 +95,10 @@
 // The band sits above the 0xFFFFE5E* wire-error band (ELV_ERR_*) so a
 // caller can inspect a single return value and tell "the request could
 // not be built" (ELV_ERR_*) from "the request could not be delivered"
-// (ELVC_ERR_*) without knowing the internal call graph.
+// (ELVC_ERR_*) without knowing the internal call graph.  Only ELVC_OK
+// (0, defined below) means an operation was actually authorized end to
+// end; every other value in this file -- including
+// ELVC_NOT_DISPATCHED -- is a refuse/no-op signal.
 
 module ElevateClient = structure {
 
@@ -73,7 +114,7 @@ module ElevateClient = structure {
   // ---- Result codes ----
 
   pub let ELVC_OK                : u64 = 0
-  pub let ELVC_STUB              : u64 = 0xFFFFEA00
+  pub let ELVC_NOT_DISPATCHED    : u64 = 0xFFFFEA00
   pub let ELVC_ERR_BAD_BUF       : u64 = 0xFFFFEA0B
   pub let ELVC_ERR_RECV_FAIL     : u64 = 0xFFFFEA0C
   pub let ELVC_ERR_SEND_FAIL     : u64 = 0xFFFFEA0D
@@ -211,9 +252,15 @@ module ElevateClient = structure {
     }
 
   // ==========================================================================
-  // elevate_client_request(caps, dur, req_buf, reply_buf) -> ELVC_*
+  // elevate_client_request_norealize(caps, dur, req_buf, reply_buf) -> ELVC_*
   //
-  // The M1 skeleton for the send-and-block-on-reply flow.  Sequence:
+  // RENAMED at libpdx-elevate.ENH-005 (#12) from `elevate_client_request`
+  // -- see WHY THE RENAME in the file header.  Behavior is BYTE-FOR-BYTE
+  // unchanged from the M1 skeleton; only the name (and the STUB
+  // constant's name) changed, so the security fact is legible from the
+  // call site: this function never realizes (dispatches) the request.
+  //
+  // Sequence:
   //
   //   (1) Gate req_buf != 0 AND reply_buf != 0 -> ELVC_ERR_BAD_BUF.
   //   (2) elevate_request_write_frame(req_buf, caps, dur) -- assemble
@@ -224,28 +271,30 @@ module ElevateClient = structure {
   //       the client return band flat).
   //   (3) elevate_client_lookup_broker() -- resolve svc.elevate-broker
   //       to an endpoint id.  Miss -> ELVC_ERR_LOOKUP_FAIL.
-  //   (4) M1 stop: return ELVC_STUB.  At M2 this is where
-  //       endpoint_invoke(broker_ep, req_buf) + block-on-recv(reply_buf)
-  //       land, and the return band shifts to
-  //       ELVC_OK / ELVC_ERR_SEND_FAIL / ELVC_ERR_RECV_FAIL.
+  //   (4) Stop: return ELVC_NOT_DISPATCHED.  This function NEVER sends,
+  //       NEVER receives, NEVER validates a grant -- do not gate a
+  //       privileged operation on its return.  Use
+  //       elevate_client_request_ex (elevate_client_send.pdx) or
+  //       elevate_client_acquire (elevate_client_acquire.pdx) for a
+  //       flow that actually reaches the broker.
   //
-  // reply_buf is validated non-null at M1 (see (1)) but not touched
-  // beyond that, so a caller migrating from M1 to M2 does not need to
-  // change their call site to pass an additional buffer.
+  // reply_buf is validated non-null (see (1)) but not touched beyond
+  // that, so a caller migrating to a real-dispatch entry point does not
+  // need to change their call site to pass an additional buffer.
   //
   // Register plan:
   //   r12 = caps         (saved across nested calls)
   //   r13 = dur
   //   r14 = req_buf
-  //   r15 = reply_buf    (M1: gate-only; M2: recv-into)
+  //   r15 = reply_buf    (gate-only; never dereferenced)
   // Four callee-save pushes = 32 bytes; keeps rsp%16 stable across
   // three nested calls (write_frame, lookup_broker, client_note).
   // ==========================================================================
 
-  pub let elevate_client_request : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+  pub let elevate_client_request_norealize : (u64, u64, u64, u64) -> u64 !{mem} @{} =
     fn (caps: u64) (dur: u64) (req_buf: u64) (reply_buf: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M1-002 (#2): the client-side skeleton for the send-then-block flow. Four callee-save pushes (r12=caps, r13=dur, r14=req_buf, r15=reply_buf) preserve the args across three nested calls (elevate_request_write_frame, elevate_client_lookup_broker, elevate_client_note) so the argument sources are unambiguous at every fork. Each error path bumps ELVC_ST_ERRORS before returning so the client's own stats table records the failure without needing the caller to touch the journal. The reply_buf gate at M1 refuses a 0 pointer up-front so a caller migrating to M2's block-on-recv cannot accidentally write to address 0; M1 does not touch reply_buf beyond the gate. SVC_LOOKUP_NONE (0xFFFFFFFFFFFFFFFF) is staged in r10 for the miss compare. Labels prefixed elc_rq_.",
+      justification: "libpdx-elevate.ENH-005 (#12): renamed from elevate_client_request (M1-002, #2) -- see the file header WHY THE RENAME note. Behavior unchanged: four callee-save pushes (r12=caps, r13=dur, r14=req_buf, r15=reply_buf) preserve the args across three nested calls (elevate_request_write_frame, elevate_client_lookup_broker, elevate_client_note) so the argument sources are unambiguous at every fork. Each error path bumps ELVC_ST_ERRORS before returning so the client's own stats table records the failure without needing the caller to touch the journal. The reply_buf gate refuses a 0 pointer up-front; this function does not touch reply_buf beyond the gate and NEVER dispatches -- ELVC_NOT_DISPATCHED is its only non-error return and must never be read as authorization. SVC_LOOKUP_NONE (0xFFFFFFFFFFFFFFFF) is staged in r10 for the miss compare. Labels prefixed elc_rq_.",
       block: {
         push r12;
         push r13;
@@ -280,10 +329,10 @@ module ElevateClient = structure {
         cmp rax, r10;
         je  elc_rq_lookup_fail;
 
-        // (4) M1 stop -- endpoint resolved; real dispatch is M2.
+        // (4) Stop -- endpoint resolved; NEVER dispatched.
         mov rdi, 4;                      // ELVC_ST_STUBS
         call elevate_client_note;
-        mov rax, 0xFFFFEA00;             // ELVC_STUB
+        mov rax, 0xFFFFEA00;             // ELVC_NOT_DISPATCHED
         pop r15;
         pop r14;
         pop r13;

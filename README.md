@@ -57,7 +57,7 @@ Broker name binding, client stats, and the M1 send-and-block skeleton.
 | `elevate_client_note(which) -> () !{mem} @{}` | Bounded increment of counter slot `which`; out-of-range is a no-op. |
 | `elevate_client_stat(which) -> u64 !{mem} @{}` | Bounded read of counter slot `which`; out-of-range returns `0`. |
 | `elevate_client_lookup_broker() -> u64 !{mem} @{}` | Resolve `"svc.elevate-broker"` via `svc_lookup`; returns the endpoint id or `SVC_LOOKUP_NONE`. |
-| `elevate_client_request(caps, dur, req_buf, reply_buf) -> u64 !{mem} @{}` | M1 skeleton: gate buffers, assemble REQ, resolve broker, stop before dispatch and return `ELVC_STUB`. Kept as a source-compatibility surface. |
+| `elevate_client_request_norealize(caps, dur, req_buf, reply_buf) -> u64 !{mem} @{}` | **Never dispatches.** Gate buffers, assemble REQ, resolve broker, stop and return `ELVC_NOT_DISPATCHED`. Renamed at ENH-005 (#12) from `elevate_client_request` — that name is gone; do not gate a privileged operation on this return. Use `elevate_client_request_ex` or `elevate_client_acquire` instead. |
 
 ### `src/elevate_client_policy.pdx` — module `ElevateClientPolicy`
 

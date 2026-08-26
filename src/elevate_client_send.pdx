@@ -31,12 +31,13 @@
 //      cap's bounded-lifetime deadline (see elevate_client_cap.pdx,
 //      M2-003).
 //
-// The M1 entry point elevate_client_request(caps, dur, req_buf,
-// reply_buf) remains unchanged as a source-compatibility surface --
-// its ELVC_STUB return is preserved so a caller not yet upgraded to
-// the M2 API sees the same behaviour.  New callers should use
-// elevate_client_request_ex which accepts (target_fp_lo, reply_ep_id,
-// timeout_ns) explicitly.
+// The M1 entry point, RENAMED at ENH-005 (#12) from
+// `elevate_client_request` to `elevate_client_request_norealize`,
+// keeps its never-dispatches behavior unchanged (it still returns
+// ELVC_NOT_DISPATCHED, née ELVC_STUB) -- see elevate_client.pdx's WHY
+// THE RENAME note.  New callers should use elevate_client_request_ex
+// (real dispatch) or elevate_client_acquire (dispatch + grant handle,
+// ENH-001, elevate_client_acquire.pdx).
 //
 // =============================================================================
 // AUTO-APPROVE FAST PATH

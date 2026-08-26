@@ -1,10 +1,30 @@
 # libpdx-elevate — status
 
 **Wave:** R49 shared library
-**Current milestone:** M5 (signed 1.0 release) — complete
-**Version:** 1.0.0 (2026-08-22)
+**Current milestone:** M5 (signed 1.0 release) — complete; M6
+(enhancement wave, v1.1.0) in progress
+**Version:** 1.0.0 (2026-08-22), v1.1.0 hardening underway
 
-See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full breakdown.
+See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full
+M1–M5 breakdown, and `.plans/enhancement-plan.md` for the M6
+(post-1.0.0) rationale.
+
+## M6 — enhancement wave (in progress)
+
+Filed 2026-08-25 from the org-wide 14-repo enhancement audit
+(`.plans/enhancement-plan.md`).  The audit's finding: the 1.0.0
+client half is complete but *advisory* — nothing forced a consumer to
+present a grant before performing the privileged operation it gated,
+and the one entry point every real consumer called
+(`elevate_client_request`) never dispatched, so its return value was
+a coin-flip between "proceed" and "refuse" depending on which
+consumer read it. M6 adds a credential-shaped surface alongside the
+existing status-shaped one.
+
+- **ENH-005 (#12, LANDED):** `elevate_client_request` renamed to
+  `elevate_client_request_norealize`; `ELVC_STUB` renamed to
+  `ELVC_NOT_DISPATCHED` (same value). Source-breaking by design — see
+  `elevate_client.pdx` WHY THE RENAME.
 
 ## Milestone rollup
 

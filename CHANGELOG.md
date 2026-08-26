@@ -8,6 +8,25 @@ covers.
 
 ---
 
+## Unreleased — v1.1.0 in progress — hardening the elevate gate
+
+Post-1.0.0 enhancement wave (`.plans/enhancement-plan.md`).  The
+1.0.0 client half was complete but advisory-only: nothing forced a
+consumer to present a grant before performing the privileged
+operation it gated.  v1.1.0 adds a credential-shaped surface
+alongside the status-shaped one.
+
+- **ENH-005 (#12)** — `elevate_client_request` **renamed** to
+  `elevate_client_request_norealize` (`elevate_client.pdx`); the old
+  name no longer exists (source-breaking, intentional — see the
+  file's WHY THE RENAME note).  `ELVC_STUB` renamed to
+  `ELVC_NOT_DISPATCHED` (same value, `0xFFFFEA00`).  This retires the
+  fail-open/fail-closed coin-flip documented in the enhancement plan
+  §2: two real consumers (`rm`, `pkg`) called the same M1 skeleton and
+  reached opposite dispositions from its return value.
+
+---
+
 ## 1.0.0 — 2026-08-22 — R49 shared library, first signed release
 
 First 1.0 release.  Establishes the client-side elevate protocol helper
