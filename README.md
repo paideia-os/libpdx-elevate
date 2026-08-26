@@ -105,6 +105,19 @@ missing argument, not a skipped statement.
 | --- | --- |
 | `elevate_client_acquire(caps, dur, req_buf, reply_ep_id, reply_buf, mint_ctx_buf) -> u64 !{mem} @{boot, cap}` | Full `request_ex_r` flow, then mint + shadow-bind (expire + granted caps). Returns `row_id` (`< 16`) on success; every failure passes through the ORIGINAL band from whichever layer refused, or `ELCA_ERR_BAD_BUF` if `mint_ctx_buf == 0`. `mint_ctx_buf` is a 40-byte, 5-word caller buffer: `parent_ep_slot`, `request_id`, `requester_pid`, `target_cap_kind`, `target_cap_rights` (see the file header for the exact layout). |
 
+### `src/elevate_client_require.pdx` — module `ElevateClientRequire`
+
+Per-op re-assert against an `elevate_client_acquire` handle — ENH-002
+(#13). No broker hop: a bounded local freshness check plus a
+caps-subset check against the shadow grant map. A recursive walk over
+N objects calls this once per item; the cost is a clock read.
+
+| Signature | Purpose |
+| --- | --- |
+| `elevate_client_require_reset() -> () !{mem} @{}` | Scrub the 8-slot require stats. Boot/teardown only. |
+| `elevate_client_require_note(which) -> () !{mem} @{}` / `elevate_client_require_stat(which) -> u64 !{mem} @{}` | Bounded stats increment / read; out of range is a no-op resp. `0`. |
+| `elevate_client_require(row_id, needed_caps) -> u64 !{mem} @{cap, boot}` | Freshness (`elevate_client_cap_check_and_revoke`) then `(needed & granted) == needed` against the shadow grant map. `ELCA_ERR_EXPIRED` / `ELCA_ERR_CAPS_INSUFFICIENT` on refusal; `ELCC_ERR_BAD_ROW` / `_NO_DEADLINE` / `_NO_GRANT` pass through as caller-usage errors. |
+
 ### `src/elevate_client_cap.pdx` — module `ElevateClientCap`
 
 `Cap<KIND_ELEVATE_CHANNEL>` mint plus client-side bounded-lifetime

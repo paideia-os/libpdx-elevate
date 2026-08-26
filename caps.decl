@@ -56,6 +56,12 @@
   # send/recv/journal triple up to elevate_client_retry_get_max_attempts()
   # times per invocation; the cap set does not grow with retries.
 
++entry elevate_client_require
+  KIND_ELEVATE_CHANNEL(revoke, row_id)
+  # ENH-002 (#13): per-op re-assert. Only cap this entry can exercise is the
+  # kernel revoke elevate_client_cap_check_and_revoke fires on an expired
+  # row -- no broker hop, no mint, no IPC endpoint use.
+
 +entry elevate_client_acquire
   KIND_IPC_ENDPOINT(read, "svc.elevate-broker")
   KIND_IPC_ENDPOINT(mint,  reply)

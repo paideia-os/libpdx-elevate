@@ -1,0 +1,239 @@
+// tests/elevate_client_require_test.pdx -- libpdx-elevate.ENH-002 (paideia-os/libpdx-elevate#13)
+//
+// Per-op re-assert -- freshness + caps-subset, no broker hop.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Boot witness for src/elevate_client_require.pdx. The load-bearing
+// claim: a caller holding a row_id handle from elevate_client_acquire
+// cannot use it for an op whose caps exceed what was granted, and
+// cannot use it past its deadline, without a broker round-trip on
+// every check.
+//
+// Setup bypasses elevate_client_acquire (no live broker in a boot
+// witness) and instead drives the shadow maps directly via
+// elevate_client_cap_bind_expire / elevate_client_cap_bind_grant --
+// exactly the two calls elevate_client_acquire itself makes after a
+// successful mint, so the witness exercises the SAME state
+// elevate_client_require reads in production, just populated by hand.
+//
+// Stages:
+//   (a) row 0: live deadline, granted = 0x03. require(needed=0x01)
+//       -> ELCA_OK (subset). require(needed=0x05) -> ELCA_ERR_
+//       CAPS_INSUFFICIENT (0x05 is NOT a subset of 0x03).
+//   (b) row 1: live deadline, grant never bound (bind_grant skipped)
+//       -> require -> ELCC_ERR_NO_GRANT passthrough.
+//   (c) row 2: no deadline ever bound -> require -> ELCC_ERR_NO_
+//       DEADLINE passthrough (matches check_and_revoke's own
+//       passthrough for this case).
+//   (d) row 17 (out of range) -> require -> ELCC_ERR_BAD_ROW
+//       passthrough.
+//   (e) row 3: past-deadline (poked directly, same technique as
+//       elevate_client_cap_test.pdx's stage 11/12) + grant bound ->
+//       require -> either ELCA_ERR_EXPIRED (kernel accepted the
+//       revoke) or ELCC_ERR_REVOKE_FAIL (kernel refused -- no real
+//       cap minted at this slot in the witness). Both prove the
+//       expired branch reached elevate_client_cap_check_and_revoke.
+//
+// =============================================================================
+// FINGERPRINT: LIBPDX-ELEVATE ENH-002 REQUIRE OK
+// =============================================================================
+//
+// Labels prefixed ecqw_ -- disjoint from eccw_ (cap witness), ecpw_
+// (policy witness), and the elcq_ prefix elevate_client_require.pdx's
+// OWN functions use internally.
+
+module ElevateClientRequireTest = structure {
+
+  pub let mut _ecqw_stage : u64 = 0
+
+  pub let ecqw_ok   : [u8; 35] = "LIBPDX-ELEVATE ENH-002 REQUIRE OK\n\0"
+  pub let ecqw_fail : [u8; 37] = "LIBPDX-ELEVATE ENH-002 REQUIRE FAIL\n\0"
+
+  pub let elevate_client_require_witness : () -> u64 !{sysreg, mem} @{cap, boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {cap, boot},
+      justification: "libpdx-elevate.ENH-002 (#13): boot witness for the per-op re-assert. Every stage reloads its rdi/rsi arguments as fresh immediates and records the stage id to memory (_ecqw_stage) rather than a register, so no value needs to survive across a CALL and no callee-save push is required for data -- only alignment. A bare `sub rsp, 24` reserves the same byte count the two-push-plus-pad idiom elsewhere in this library uses (24 bytes); entry rsp%16==8 -> (8-24) mod 16 == 0, so every nested call in this witness sees aligned rsp. capabilities {cap, boot} propagate from elevate_client_require / elevate_client_cap_check_and_revoke. Stage (e) pokes _elevate_client_cap_expire_map[3] directly with a past absolute deadline (1 ns since boot), same technique as elevate_client_cap_test.pdx stage 11, so the expired branch is deterministic without a sleep primitive; that stage accepts either ELCA_ERR_EXPIRED or ELCC_ERR_REVOKE_FAIL for the same reason elevate_client_cap_test.pdx's stage 12 does -- this witness never mints a real kernel cap at any slot. Labels prefixed ecqw_.",
+      block: {
+        sub rsp, 24;                     // alignment only -- no live data spans a CALL
+
+        // ------------------------------------------------------------
+        // Stage 1: reset both the cap shadow state and require stats.
+        // ------------------------------------------------------------
+        mov rax, 1;
+        lea rcx, [rip + _ecqw_stage];
+        mov [rcx], rax;
+        call elevate_client_cap_reset;
+        call elevate_client_require_reset;
+
+        mov rdi, 0;                      // ELCA_ST_CHECKS
+        call elevate_client_require_stat;
+        cmp rax, 0;
+        jne ecqw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 2: row 0 -- live deadline (60s), granted = 0x03.
+        // require(needed=0x01) -> ELCA_OK.
+        // ------------------------------------------------------------
+        mov rax, 2;
+        lea rcx, [rip + _ecqw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;                    // row = 0
+        mov rsi, 60000000000;            // 60s
+        call elevate_client_cap_bind_expire;
+        cmp rax, 0;
+        jne ecqw_fail_stage;
+
+        xor rdi, rdi;                    // row = 0
+        mov rsi, 0x03;                   // granted_caps
+        call elevate_client_cap_bind_grant;
+        cmp rax, 0;
+        jne ecqw_fail_stage;
+
+        xor rdi, rdi;                    // row = 0
+        mov rsi, 0x01;                   // needed = subset of 0x03
+        call elevate_client_require;
+        cmp rax, 0;                      // ELCA_OK
+        jne ecqw_fail_stage;
+
+        mov rdi, 1;                      // ELCA_ST_LIVE_OK
+        call elevate_client_require_stat;
+        cmp rax, 1;
+        jne ecqw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 3: same row 0, needed=0x05 -- NOT a subset of 0x03 ->
+        // ELCA_ERR_CAPS_INSUFFICIENT.
+        // ------------------------------------------------------------
+        mov rax, 3;
+        lea rcx, [rip + _ecqw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;                    // row = 0
+        mov rsi, 0x05;
+        call elevate_client_require;
+        mov r10, 0xFFFFEA61;             // ELCA_ERR_CAPS_INSUFFICIENT
+        cmp rax, r10;
+        jne ecqw_fail_stage;
+
+        mov rdi, 3;                      // ELCA_ST_INSUFFICIENT
+        call elevate_client_require_stat;
+        cmp rax, 1;
+        jne ecqw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 4: row 1 -- live deadline, grant never bound ->
+        // ELCC_ERR_NO_GRANT passthrough.
+        // ------------------------------------------------------------
+        mov rax, 4;
+        lea rcx, [rip + _ecqw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 1;                      // row = 1
+        mov rsi, 60000000000;
+        call elevate_client_cap_bind_expire;
+        cmp rax, 0;
+        jne ecqw_fail_stage;
+
+        mov rdi, 1;                      // row = 1
+        mov rsi, 0x01;
+        call elevate_client_require;
+        mov r10, 0xFFFFEA38;             // ELCC_ERR_NO_GRANT
+        cmp rax, r10;
+        jne ecqw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 5: row 2 -- no deadline ever bound ->
+        // ELCC_ERR_NO_DEADLINE passthrough.
+        // ------------------------------------------------------------
+        mov rax, 5;
+        lea rcx, [rip + _ecqw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 2;                      // row = 2
+        mov rsi, 0x01;
+        call elevate_client_require;
+        mov r10, 0xFFFFEA32;             // ELCC_ERR_NO_DEADLINE
+        cmp rax, r10;
+        jne ecqw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 6: row 17 (out of range) -> ELCC_ERR_BAD_ROW
+        // passthrough.
+        // ------------------------------------------------------------
+        mov rax, 6;
+        lea rcx, [rip + _ecqw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 17;
+        mov rsi, 0x01;
+        call elevate_client_require;
+        mov r10, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
+        cmp rax, r10;
+        jne ecqw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 7: row 3 -- past-deadline (direct poke) + grant bound.
+        // require -> ELCA_ERR_EXPIRED or ELCC_ERR_REVOKE_FAIL.
+        // ------------------------------------------------------------
+        mov rax, 7;
+        lea rcx, [rip + _ecqw_stage];
+        mov [rcx], rax;
+
+        lea r10, [rip + _elevate_client_cap_expire_map];
+        mov r11, 1;                      // past absolute deadline (1 ns)
+        mov [r10 + 24], r11;             // slot 3 * 8 bytes = +24
+
+        mov rdi, 3;                      // row = 3
+        mov rsi, 0x01;
+        call elevate_client_cap_bind_grant;
+        cmp rax, 0;
+        jne ecqw_fail_stage;
+
+        mov rdi, 3;                      // row = 3
+        mov rsi, 0x01;
+        call elevate_client_require;
+
+        mov r10, 0xFFFFEA60;             // ELCA_ERR_EXPIRED
+        cmp rax, r10;
+        je  ecqw_stage7_ok;
+        mov r10, 0xFFFFEA33;             // ELCC_ERR_REVOKE_FAIL
+        cmp rax, r10;
+        je  ecqw_stage7_ok;
+        jmp ecqw_fail_stage;
+
+      ecqw_stage7_ok:
+        // ------------------------------------------------------------
+        // Success. Log OK, scrub state, return 0.
+        // ------------------------------------------------------------
+        mov rdi, 3;                      // KLOG_LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecqw_ok];
+        call klog_s1;
+
+        call elevate_client_cap_reset;
+        call elevate_client_require_reset;
+        xor rax, rax;
+        jmp ecqw_out;
+
+      ecqw_fail_stage:
+        lea rax, [rip + _ecqw_stage];
+        mov r8, [rax];                   // value1 -- failing stage id
+        mov rdi, 1;                      // KLOG_LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecqw_fail];
+        lea rcx, [rip + k_line];         // key1 = "line"
+        call klog_s1_d1;
+        call elevate_client_cap_reset;
+        call elevate_client_require_reset;
+        mov rax, 1;
+
+      ecqw_out:
+        add rsp, 24;
+        ret
+      }
+    }
+}

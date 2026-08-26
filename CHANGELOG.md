@@ -33,6 +33,13 @@ alongside the status-shaped one.
   / `_get_grant` (shadow the APR's `granted_caps` per row, band
   `ELCC_ERR_NO_GRANT = 0xFFFFEA38`). New error band
   `0xFFFFEA50..0xFFFFEA5F` (`ELCA_*`).
+- **ENH-002 (#13)** — `elevate_client_require` (new
+  `elevate_client_require.pdx`): per-op re-assert against a handle
+  from `elevate_client_acquire`, no broker hop. Checks freshness
+  (`elevate_client_cap_check_and_revoke`) then `(needed & granted) ==
+  needed` against the shadow grant map. New error band
+  `0xFFFFEA60..0xFFFFEA6F` (`ELCA_ERR_EXPIRED`,
+  `ELCA_ERR_CAPS_INSUFFICIENT`).
 
 ---
 

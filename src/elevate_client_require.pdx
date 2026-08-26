@@ -1,0 +1,249 @@
+// src/elevate_client_require.pdx -- libpdx-elevate.ENH-002 (paideia-os/libpdx-elevate#13)
+//
+// elevate_client_require -- per-op re-assert against a handle, no broker hop.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The other half of ENH-001's structural fix. elevate_client_acquire
+// (elevate_client_acquire.pdx) hands back a row_id HANDLE; this file
+// is what a caller re-checks BEFORE each individual mutating step of
+// a multi-step operation (a recursive delete's per-file pass, a
+// package install's per-file write) so a handle obtained once cannot
+// be silently reused past its deadline or beyond what it was actually
+// granted.
+//
+// The re-assert is DELIBERATELY cheap: no broker round-trip, no IPC.
+// It is exactly two local checks:
+//
+//   (a) not expired      -- via elevate_client_cap_check_and_revoke,
+//                            which also fires the kernel-side revoke
+//                            the instant the deadline is found to have
+//                            passed (self-invalidation, M2-003).
+//   (b) caps still cover  -- (needed_caps & granted_caps) == needed_caps,
+//       this op            reading the shadow grant map ENH-001 bound
+//                          at acquire time (elevate_client_cap_
+//                          bind_grant).
+//
+// "A recursive walk calls it once per item; the cost is a clock read"
+// (enhancement-plan.md §3) -- check_and_revoke's own cost is exactly
+// one hpet_now_ns() sample on the live-row path; the caps check below
+// it is a bitwise AND against an already-resident cache line.
+//
+// A row never bound via elevate_client_acquire (i.e. minted directly
+// via elevate_client_cap_mint, bypassing bind_grant) has granted_caps
+// == 0 in the shadow map; elevate_client_require refuses such a row
+// with ELCA_ERR_NO_GRANT rather than treating an empty mask as "covers
+// nothing requested" (which would vacuously pass a needed_caps == 0
+// call) or "covers everything" (which would be the actual security
+// bug this file exists to prevent). Row 0 in the shadow map genuinely
+// meaning "never bound" is exactly the ELCC_ERR_NO_GRANT convention
+// elevate_client_cap_bind_grant / _get_grant already establish.
+//
+// =============================================================================
+// ERROR BAND 0xFFFFEA60..0xFFFFEA6F
+// =============================================================================
+//
+//   0xFFFFEA60  ELCA_ERR_EXPIRED             -- handle's deadline has
+//                                                passed (the kernel
+//                                                revoke has already
+//                                                fired or just did)
+//   0xFFFFEA61  ELCA_ERR_CAPS_INSUFFICIENT   -- needed_caps is not a
+//                                                subset of what this
+//                                                handle was granted
+//
+// ELCC_ERR_BAD_ROW / ELCC_ERR_NO_DEADLINE / ELCC_ERR_NO_GRANT
+// (elevate_client_cap.pdx, 0xFFFFEA30 band) pass through unchanged
+// when the underlying shadow-map lookups refuse for those reasons --
+// they are caller-side usage errors (bad row_id, or a row that was
+// never bound through the acquire path), not per-op refusals, so they
+// keep their own band rather than being re-wrapped here.
+
+module ElevateClientRequire = structure {
+
+  pub let ELCA_OK                    : u64 = 0
+  pub let ELCA_ERR_EXPIRED           : u64 = 0xFFFFEA60
+  pub let ELCA_ERR_CAPS_INSUFFICIENT : u64 = 0xFFFFEA61
+
+  // ---- Stats ----
+  //
+  //   0 checks       every elevate_client_require call
+  //   1 live_ok      passed both the freshness and caps checks
+  //   2 expired      refused: check_and_revoke reported the row gone
+  //   3 insufficient refused: needed_caps not covered by the grant
+  //   4..7 reserved
+
+  pub let mut _elevate_client_require_stats : [u64; 8] = uninit @align(64)
+
+  pub let ELCA_ST_CHECKS       : u64 = 0
+  pub let ELCA_ST_LIVE_OK      : u64 = 1
+  pub let ELCA_ST_EXPIRED      : u64 = 2
+  pub let ELCA_ST_INSUFFICIENT : u64 = 3
+  pub let ELCA_ST_MAX          : u64 = 8
+
+  // ==========================================================================
+  // elevate_client_require_reset() -> ()
+  //
+  // Scrub the stats table. Boot / teardown only. Same shape as every
+  // other *_reset in this library.
+  // ==========================================================================
+
+  pub let elevate_client_require_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.ENH-002 (#13): clear the 8-slot require stats table. Boot / teardown discipline; a live counter reset would race a concurrent elevate_client_require call. Leaf. Labels prefixed elcq_rs_.",
+      block: {
+        lea r10, [rip + _elevate_client_require_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      elcq_rs_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  elcq_rs_loop;
+        ret
+      }
+    }
+
+  pub let elevate_client_require_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.ENH-002 (#13): bounded increment; out-of-range which is a no-op. Same shape as elevate_client_note. Labels prefixed elcq_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae elcq_nt_out;
+        lea r10, [rip + _elevate_client_require_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      elcq_nt_out:
+        ret
+      }
+    }
+
+  pub let elevate_client_require_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.ENH-002 (#13): bounded read; out-of-range returns 0. Same convention as elevate_client_stat. Labels prefixed elcq_st_.",
+      block: {
+        cmp rdi, 8;
+        jae elcq_st_zero;
+        lea r10, [rip + _elevate_client_require_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      elcq_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_require(row_id, needed_caps)
+  //   -> ELCA_OK | ELCA_ERR_EXPIRED | ELCA_ERR_CAPS_INSUFFICIENT
+  //      | ELCC_ERR_BAD_ROW | ELCC_ERR_NO_DEADLINE | ELCC_ERR_NO_GRANT
+  //
+  // The per-op re-assert. No broker hop -- see the file header.
+  //
+  // Sequence:
+  //   (1) elevate_client_cap_check_and_revoke(row_id):
+  //         ELCC_STATE_LIVE    -> continue to the caps check
+  //         ELCC_STATE_REVOKED -> ELCA_ERR_EXPIRED (deadline passed;
+  //                               kernel revoke fired just now or
+  //                               earlier -- either way the handle is
+  //                               gone)
+  //         ELCC_ERR_BAD_ROW / ELCC_ERR_NO_DEADLINE -> passthrough
+  //           (caller-side usage error: bad row_id, or a row that was
+  //           never bound via elevate_client_cap_bind_expire /
+  //           elevate_client_acquire)
+  //   (2) elevate_client_cap_get_grant(row_id) -> granted_caps.
+  //       granted_caps == 0 -> ELCC_ERR_NO_GRANT (never bound via
+  //       elevate_client_acquire / elevate_client_cap_bind_grant).
+  //   (3) (needed_caps & granted_caps) == needed_caps -> ELCA_OK,
+  //       else ELCA_ERR_CAPS_INSUFFICIENT.
+  //
+  // Register plan: r12=row_id, r13=needed_caps. Two callee-save
+  // pushes + one 8-byte alignment pad = 24 bytes; entry rsp%16==8 ->
+  // (8-24) mod 16 == 0 so the nested calls (check_and_revoke,
+  // get_grant, note) see aligned rsp.
+  // ==========================================================================
+
+  pub let elevate_client_require : (u64, u64) -> u64 !{mem} @{cap, boot} =
+    fn (row_id: u64) (needed_caps: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap, boot},
+      justification: "libpdx-elevate.ENH-002 (#13): the per-op re-assert -- freshness (via elevate_client_cap_check_and_revoke, which itself needs {cap, boot} for the kernel revoke + hpet_now_ns chain) then caps-subset against the shadow grant map (elevate_client_cap_get_grant). Two callee-save pushes (r12=row_id, r13=needed_caps) + one 8-byte alignment pad = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0 so every nested call sees aligned rsp. Every call bumps ELCA_ST_CHECKS up front so a caller's stats read reflects attempted checks even on an early passthrough refusal. ELCC_ERR_BAD_ROW / ELCC_ERR_NO_DEADLINE / ELCC_ERR_NO_GRANT are NOT re-wrapped -- they identify a caller-side usage error (bad row_id, or a row never bound through the acquire path) distinct from a per-op refusal, so they keep their own 0xFFFFEA3* band. Labels prefixed elcq_rq_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 8;                      // alignment
+
+        mov r12, rdi;                    // row_id
+        mov r13, rsi;                    // needed_caps
+
+        mov rdi, 0;                      // ELCA_ST_CHECKS
+        call elevate_client_require_note;
+
+        // (1) Freshness.
+        mov rdi, r12;
+        call elevate_client_cap_check_and_revoke;
+        mov r10, 0xFFFFEA34;             // ELCC_STATE_LIVE
+        cmp rax, r10;
+        je  elcq_rq_fresh;
+        mov r10, 0xFFFFEA36;             // ELCC_STATE_REVOKED
+        cmp rax, r10;
+        je  elcq_rq_expired;
+        // ELCC_ERR_BAD_ROW / ELCC_ERR_NO_DEADLINE -- passthrough as-is.
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcq_rq_fresh:
+        // (2) Read the shadow grant.
+        mov rdi, r12;
+        call elevate_client_cap_get_grant;
+        cmp rax, 0;
+        je  elcq_rq_no_grant;
+
+        // (3) Subset check: (needed & granted) == needed.
+        mov r10, rax;                    // granted_caps
+        mov rax, r13;                    // needed_caps
+        and rax, r10;
+        cmp rax, r13;
+        jne elcq_rq_insufficient;
+
+        mov rdi, 1;                      // ELCA_ST_LIVE_OK
+        call elevate_client_require_note;
+        xor rax, rax;                    // ELCA_OK
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcq_rq_expired:
+        mov rdi, 2;                      // ELCA_ST_EXPIRED
+        call elevate_client_require_note;
+        mov rax, 0xFFFFEA60;             // ELCA_ERR_EXPIRED
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcq_rq_insufficient:
+        mov rdi, 3;                      // ELCA_ST_INSUFFICIENT
+        call elevate_client_require_note;
+        mov rax, 0xFFFFEA61;             // ELCA_ERR_CAPS_INSUFFICIENT
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcq_rq_no_grant:
+        mov rax, 0xFFFFEA38;             // ELCC_ERR_NO_GRANT (passthrough band)
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}

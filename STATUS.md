@@ -32,6 +32,10 @@ existing status-shaped one.
   shadow, no `hpet_now_ns` re-add), `elevate_client_cap_bind_grant` /
   `_get_grant` (granted-caps shadow map, `ELCC_ERR_NO_GRANT` on a
   never-bound row).
+- **ENH-002 (#13, LANDED):** `elevate_client_require`
+  (`elevate_client_require.pdx`) — cheap per-op re-assert against an
+  acquired handle: freshness via `elevate_client_cap_check_and_revoke`
+  + caps-subset against the shadow grant map, no broker hop.
 
 ## Milestone rollup
 
