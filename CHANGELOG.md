@@ -24,6 +24,15 @@ alongside the status-shaped one.
   fail-open/fail-closed coin-flip documented in the enhancement plan
   §2: two real consumers (`rm`, `pkg`) called the same M1 skeleton and
   reached opposite dispositions from its return value.
+- **ENH-001 (#11)** — `elevate_client_acquire` (new
+  `elevate_client_acquire.pdx`): composes `elevate_client_request_ex_r`
+  with a mint + shadow-bind into one call returning a `row_id` HANDLE.
+  New `elevate_client_cap.pdx` primitives:
+  `elevate_client_cap_bind_expire_abs` (shadow an absolute deadline
+  without re-adding `hpet_now_ns`) and `elevate_client_cap_bind_grant`
+  / `_get_grant` (shadow the APR's `granted_caps` per row, band
+  `ELCC_ERR_NO_GRANT = 0xFFFFEA38`). New error band
+  `0xFFFFEA50..0xFFFFEA5F` (`ELCA_*`).
 
 ---
 

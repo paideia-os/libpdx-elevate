@@ -25,6 +25,13 @@ existing status-shaped one.
   `elevate_client_request_norealize`; `ELVC_STUB` renamed to
   `ELVC_NOT_DISPATCHED` (same value). Source-breaking by design — see
   `elevate_client.pdx` WHY THE RENAME.
+- **ENH-001 (#11, LANDED):** `elevate_client_acquire`
+  (`elevate_client_acquire.pdx`) — composed `request_ex_r` + mint +
+  shadow-bind returning a `row_id` handle. New `elevate_client_cap.pdx`
+  primitives: `elevate_client_cap_bind_expire_abs` (absolute-deadline
+  shadow, no `hpet_now_ns` re-add), `elevate_client_cap_bind_grant` /
+  `_get_grant` (granted-caps shadow map, `ELCC_ERR_NO_GRANT` on a
+  never-bound row).
 
 ## Milestone rollup
 

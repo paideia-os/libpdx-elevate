@@ -92,6 +92,19 @@ validation, and the M2 full-flow entry point.
 | `elevate_client_check_grant(reply_buf, requested_caps) -> u64 !{mem} @{}` | `(granted & requested) == granted`; mirror of kernel `elv_check_grant`. |
 | `elevate_client_request_ex(caps, dur, req_buf, reply_ep_id, reply_buf, timeout_ns) -> u64 !{mem} @{boot}` | Full M2 flow: policy consult → REQ assemble → broker lookup → send → recv → grant-subset check. `timeout_ns == 0` selects fast/human by policy classification. |
 
+### `src/elevate_client_acquire.pdx` — module `ElevateClientAcquire`
+
+Composed flow returning a grant **handle** (`row_id`) instead of a bare
+status — ENH-001 (#11), the structural answer to "the elevate gate is
+advisory, not a credential." Callers thread the returned `row_id` into
+the privileged operation and re-assert it per-op via
+`elevate_client_require` (below); omitting the gate now becomes a
+missing argument, not a skipped statement.
+
+| Signature | Purpose |
+| --- | --- |
+| `elevate_client_acquire(caps, dur, req_buf, reply_ep_id, reply_buf, mint_ctx_buf) -> u64 !{mem} @{boot, cap}` | Full `request_ex_r` flow, then mint + shadow-bind (expire + granted caps). Returns `row_id` (`< 16`) on success; every failure passes through the ORIGINAL band from whichever layer refused, or `ELCA_ERR_BAD_BUF` if `mint_ctx_buf == 0`. `mint_ctx_buf` is a 40-byte, 5-word caller buffer: `parent_ep_slot`, `request_id`, `requester_pid`, `target_cap_kind`, `target_cap_rights` (see the file header for the exact layout). |
+
 ### `src/elevate_client_cap.pdx` — module `ElevateClientCap`
 
 `Cap<KIND_ELEVATE_CHANNEL>` mint plus client-side bounded-lifetime
@@ -103,6 +116,8 @@ self-invalidation.
 | `elevate_client_cap_note(which) -> () !{mem} @{}` / `elevate_client_cap_stat(which) -> u64 !{mem} @{}` | Bounded stats increment / read; out of range is a no-op resp. `0`. |
 | `elevate_client_cap_bind_expire(row_id, dur_ns) -> u64 !{mem} @{boot}` | Record `hpet_now_ns() + dur_ns` as the row's shadow deadline; `dur_ns == 0` clears it. |
 | `elevate_client_cap_get_expire(row_id) -> u64 !{mem} @{}` | Read the shadow deadline; `0` means unbound or out of range. |
+| `elevate_client_cap_bind_expire_abs(row_id, deadline_ns) -> u64 !{mem} @{}` | ENH-001: store an ABSOLUTE deadline (no `hpet_now_ns` addition) — the counterpart `elevate_client_acquire` uses to shadow a broker-supplied `expire_ns` without re-deriving it against a later clock read. |
+| `elevate_client_cap_bind_grant(row_id, granted_caps) -> u64 !{mem} @{}` / `elevate_client_cap_get_grant(row_id) -> u64 !{mem} @{}` | ENH-001: shadow / read the APR's `granted_caps` for `row_id`, so `elevate_client_require` can re-check caps coverage with no broker hop. `0` means never bound (`ELCC_ERR_NO_GRANT`). |
 | `elevate_client_cap_narrow_stub(rights_in) -> u64 !{} @{}` | **Stub** awaiting libpdx-cap.M2 `cap_narrow_rights`; returns rights unchanged. |
 | `elevate_client_cap_mint(parent_ep_slot, rights, request_id, requester_pid, target_cap_kind, target_cap_rights) -> u64 !{mem} @{cap}` | Wrapper over the kernel `elevate_channel_cap_mint_inner`; returns `row_id` (< 16) or `ELCC_ERR_MINT_FAIL`. |
 | `elevate_client_cap_expired(row_id) -> u64 !{mem} @{boot}` | `1` expired / `0` live, or `ELCC_ERR_BAD_ROW` / `ELCC_ERR_NO_DEADLINE`. |

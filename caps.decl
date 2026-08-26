@@ -56,6 +56,23 @@
   # send/recv/journal triple up to elevate_client_retry_get_max_attempts()
   # times per invocation; the cap set does not grow with retries.
 
++entry elevate_client_acquire
+  KIND_IPC_ENDPOINT(read, "svc.elevate-broker")
+  KIND_IPC_ENDPOINT(mint,  reply)
+  KIND_IPC_ENDPOINT(write, broker_ep_id)
+  KIND_IPC_ENDPOINT(read,  reply_ep_id)
+  KIND_IPC_ENDPOINT(write, uej)
+  KIND_ELEVATE_CHANNEL(mint, row_id)
+  # ENH-001 (#11): composed request_ex_r + mint + shadow-bind returning a
+  # row_id handle.  Union of every entry it reaches, PLUS the caller's own
+  # pre-existing KIND_IPC_ENDPOINT cap over the broker at the cap-table slot
+  # named `parent_ep_slot` in the caller's mint_ctx_buf -- that cap is NOT
+  # minted by this entry point (it must already be held; see kind_elevate_
+  # channel.pdx's parent-gate note in paideia-os). target_cap_kind /
+  # target_cap_rights in mint_ctx_buf are opaque to this manifest -- they
+  # name a DOWNSTREAM capability this elevate channel governs, declared by
+  # whatever the caller links this library into, not by libpdx-elevate.
+
 # Notes for downstream tools:
 #
 # 1. libpdx-elevate itself never holds KIND_SUPERVISOR.  Every cap it names

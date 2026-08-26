@@ -73,6 +73,14 @@
 //   0xFFFFEA37  ELCC_NOTE_NO_NARROW   -- narrowing stub reached (libpdx-cap.M2
 //                                        not yet available); rights returned
 //                                        unchanged, caller should treat as advisory.
+//   0xFFFFEA38  ELCC_ERR_NO_GRANT     -- ENH-001 (#11): get_grant / a
+//                                        require-style caps check found
+//                                        no recorded granted_caps for
+//                                        this row_id (0 in the shadow
+//                                        map -- either never bound via
+//                                        elevate_client_cap_bind_grant,
+//                                        or the row was minted directly
+//                                        and bypassed elevate_client_acquire).
 
 module ElevateClientCap = structure {
 
@@ -81,6 +89,16 @@ module ElevateClientCap = structure {
   pub let ELCC_KIND_ELEVATE_CHANNEL : u64 = 0x191
   pub let ELCC_MAX_ROWS             : u64 = 16
   pub let ELCC_STATE_REQUESTED      : u64 = 1
+
+  // Mirror of kernel R_ELVC_ALL (src/kernel/core/cap/kind_elevate_
+  // channel.pdx:86) -- the full elevate-channel rights mask.  Used by
+  // elevate_client_acquire (ENH-001, elevate_client_acquire.pdx) as the
+  // `rights` argument to elevate_client_cap_mint: since elevate_
+  // client_cap_narrow_stub is a passthrough until libpdx-cap.M2 lands
+  // (see file header), every mint through the composed acquire flow
+  // requests the full mask today; narrowing arrives as a v1.1.0+
+  // follow-up without changing this constant's meaning.
+  pub let ELCC_RIGHTS_ALL           : u64 = 0x418
 
   // ---- Result codes / status band 0xFFFFEA30..0xFFFFEA3F ----
 
@@ -93,6 +111,7 @@ module ElevateClientCap = structure {
   pub let ELCC_STATE_EXPIRED     : u64 = 0xFFFFEA35
   pub let ELCC_STATE_REVOKED     : u64 = 0xFFFFEA36
   pub let ELCC_NOTE_NO_NARROW    : u64 = 0xFFFFEA37
+  pub let ELCC_ERR_NO_GRANT      : u64 = 0xFFFFEA38
 
   // ---- Client-side shadow deadline map ----
   //
@@ -101,6 +120,21 @@ module ElevateClientCap = structure {
   // capture it in one line for a memcmp-vs-expected check.
 
   pub let mut _elevate_client_cap_expire_map : [u64; 16] = uninit @align(64)
+
+  // ---- Client-side shadow granted-caps map (ENH-001, #11) ----
+  //
+  // Slot i holds the granted_caps bitmask the broker's APR carried for
+  // the request that produced row i (0 means "not recorded" -- a row
+  // minted directly via elevate_client_cap_mint, bypassing
+  // elevate_client_acquire, never populates this map, and
+  // elevate_client_require (elevate_client_require.pdx, ENH-002)
+  // treats a 0 entry as ELCC_ERR_NO_GRANT rather than silently passing
+  // every caps check).  Populated by elevate_client_cap_bind_grant,
+  // which elevate_client_acquire calls immediately after a successful
+  // mint.  Same 16-slot shape as the deadline map -- one slot per
+  // kernel row_id.
+
+  pub let mut _elevate_client_cap_grant_map : [u64; 16] = uninit @align(64)
 
   // ---- Client-side counters ----
   //
@@ -131,7 +165,7 @@ module ElevateClientCap = structure {
   pub let elevate_client_cap_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M2-003 (#5): scrub the deadline map + the stats. Boot / teardown only. Two independent loops so the two arrays' lengths do not have to be composed in code. Leaf. Labels prefixed elcc_rs_.",
+      justification: "libpdx-elevate.M2-003 (#5), extended at ENH-001 (#11): scrub the deadline map, the grant map, and the stats. Boot / teardown only. Three independent loops so the arrays' lengths do not have to be composed in code. Leaf. Labels prefixed elcc_rs_.",
       block: {
         lea r10, [rip + _elevate_client_cap_expire_map];
         xor rax, rax;
@@ -141,6 +175,14 @@ module ElevateClientCap = structure {
         add rcx, 1;
         cmp rcx, 16;
         jb  elcc_rs_map;
+
+        lea r10, [rip + _elevate_client_cap_grant_map];
+        xor rcx, rcx;
+      elcc_rs_grant:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  elcc_rs_grant;
 
         lea r10, [rip + _elevate_client_cap_stats];
         xor rcx, rcx;
@@ -270,6 +312,140 @@ module ElevateClientCap = structure {
         mov rax, [r10 + rdi * 8];
         ret;
       elcc_ge_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_cap_bind_expire_abs(row_id, deadline_ns) -> ELCC_OK | ELCC_ERR_BAD_ROW
+  //
+  // ENH-001 (#11).  Store an ABSOLUTE deadline directly, with no
+  // hpet_now_ns() addition -- the counterpart to
+  // elevate_client_cap_bind_expire (which stores hpet_now_ns() +
+  // dur_ns, a RELATIVE duration from the caller).  This exists because
+  // the broker's own APR reply already carries an absolute expire_ns
+  // (validated non-zero by elevate_client_recv_reply) computed against
+  // the broker's clock, not the caller's -- re-deriving it as "now +
+  // dur" on the client side would use the WRONG clock read (a second,
+  // later hpet_now_ns() sample) and silently shift the deadline later
+  // than what was actually granted.  elevate_client_acquire
+  // (elevate_client_acquire.pdx) calls this, not bind_expire, when it
+  // shadows the APR's expire_ns after a successful mint.
+  //
+  // deadline_ns == 0 is accepted and clears the slot (same convention
+  // as bind_expire's dur_ns == 0), but a caller reaching this path
+  // through elevate_client_acquire never passes 0 here: the recv path
+  // already refused a 0 expire_ns as ELVC_ERR_BAD_EXPIRE before the
+  // mint ever ran.
+  //
+  // Register plan: r12=row_id, r13=deadline_ns.  No nested calls -- a
+  // bare store -- so no alignment pad is needed regardless of push
+  // count.
+  // ==========================================================================
+
+  pub let elevate_client_cap_bind_expire_abs : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (deadline_ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.ENH-001 (#11): store an absolute deadline (no hpet_now_ns addition) -- the counterpart to elevate_client_cap_bind_expire for a caller who already holds an absolute ns value from the broker's own APR reply, where re-adding a fresh hpet_now_ns() sample would silently shift the deadline later than what was actually granted. Two callee-save pushes (r12=row_id, r13=deadline_ns); function makes no nested call, so no alignment pad is required. Labels prefixed elcc_ba_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rdi;                    // row_id
+        mov r13, rsi;                    // deadline_ns
+
+        cmp r12, 16;
+        jae elcc_ba_bad_row;
+
+        lea r10, [rip + _elevate_client_cap_expire_map];
+        mov [r10 + r12 * 8], r13;
+
+        xor rax, rax;                    // ELCC_OK
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_ba_bad_row:
+        mov rax, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_cap_bind_grant(row_id, granted_caps) -> ELCC_OK | ELCC_ERR_BAD_ROW
+  //
+  // ENH-001 (#11).  Record the granted_caps bitmask the broker's APR
+  // carried for row_id, in the shadow grant map.  elevate_client_
+  // acquire calls this once, immediately after a successful mint,
+  // using the SAME granted_caps it already validated as a subset of
+  // the request via elevate_client_check_grant.  elevate_client_
+  // require (elevate_client_require.pdx, ENH-002) reads this map back
+  // to answer "does the handle still cover this op's caps?" without a
+  // broker round-trip.
+  //
+  // granted_caps == 0 is rejected: a broker never grants an empty
+  // mask (elv_check_grant / elevate_client_check_grant both operate on
+  // a non-zero requested mask, and ELV_CAP_MASK_VALID excludes 0), so
+  // a caller passing 0 here is a programming error, not a legitimate
+  // "no caps" grant -- refusing it keeps a 0 slot meaning exactly one
+  // thing: "never bound" (see ELCC_ERR_NO_GRANT in the file header).
+  // ==========================================================================
+
+  pub let elevate_client_cap_bind_grant : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (granted_caps: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.ENH-001 (#11): shadow the APR's granted_caps for row_id. Two callee-save pushes (r12=row_id, r13=granted_caps); no nested call, no alignment pad needed. granted_caps==0 is refused (BAD_ROW's error code is reused for this gate too -- see ELCC_ERR_BAD_CAPS discussion in the function doc; a distinct code is not warranted because this is a caller-side program-defect gate, not a runtime condition a caller branches on) so a 0 slot in the map keeps exactly one meaning: 'never bound'. Labels prefixed elcc_bg_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rdi;                    // row_id
+        mov r13, rsi;                    // granted_caps
+
+        cmp r12, 16;
+        jae elcc_bg_bad_row;
+        cmp r13, 0;
+        je  elcc_bg_bad_row;
+
+        lea r10, [rip + _elevate_client_cap_grant_map];
+        mov [r10 + r12 * 8], r13;
+
+        xor rax, rax;                    // ELCC_OK
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_bg_bad_row:
+        mov rax, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_cap_get_grant(row_id) -> granted_caps | 0
+  //
+  // ENH-001 (#11).  Read the shadow granted_caps for row_id.  0 means
+  // "never bound" (out of range OR a row minted without going through
+  // elevate_client_acquire / elevate_client_cap_bind_grant) -- same
+  // convention as elevate_client_cap_get_expire.  Leaf.
+  // ==========================================================================
+
+  pub let elevate_client_cap_get_grant : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.ENH-001 (#11): bounded read of the shadow grant map; out-of-range returns 0 (same convention as elevate_client_cap_get_expire). Leaf. Labels prefixed elcc_gg_.",
+      block: {
+        cmp rdi, 16;
+        jae elcc_gg_zero;
+        lea r10, [rip + _elevate_client_cap_grant_map];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      elcc_gg_zero:
         xor rax, rax;
         ret
       }

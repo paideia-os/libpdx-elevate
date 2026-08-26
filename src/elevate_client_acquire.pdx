@@ -1,0 +1,243 @@
+// src/elevate_client_acquire.pdx -- libpdx-elevate.ENH-001 (paideia-os/libpdx-elevate#11)
+//
+// elevate_client_acquire -- composed flow returning a grant HANDLE.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The post-1.0.0 enhancement audit (.plans/enhancement-plan.md §3)
+// found the elevate gate to be "an advisory boolean, not a
+// credential": elevate_client_request_ex (M2) returns a STATUS code
+// and leaves the APR in the caller's reply_buf, but minting the actual
+// Cap<KIND_ELEVATE_CHANNEL> is a separate, optional call
+// (elevate_client_cap_mint) a consumer may simply never make. Nothing
+// the privileged operation subsequently performs consumes anything the
+// elevate hop produced -- so "did I ask?" is a fact recorded nowhere
+// the destructive code path is forced to look, and skipping the
+// question on one branch (the `rm -r` regression that motivated this
+// audit) is invisible at every level.
+//
+// elevate_client_acquire closes that gap structurally: it composes the
+// full retry+journal+dispatch flow (elevate_client_request_ex_r, M3)
+// with the mint (elevate_client_cap_mint, M2-003) and the two shadow
+// bindings the mint needs (elevate_client_cap_bind_expire_abs,
+// elevate_client_cap_bind_grant -- both new at this issue, in
+// elevate_client_cap.pdx) into ONE call that returns a row_id --  a
+// HANDLE -- on success. A caller now threads that row_id into the
+// privileged operation and re-asserts it per-op via
+// elevate_client_require (elevate_client_require.pdx, ENH-002).
+// Omitting the gate becomes a MISSING ARGUMENT to the privileged
+// helper, not a skipped statement invisible in a diff.
+//
+// This does NOT replace elevate_client_request_ex or
+// elevate_client_request_ex_r -- a caller that only wants the status-
+// shaped answer (no cap, no handle) keeps using those. It also does
+// NOT attempt to know anything about what the caller is protecting
+// (no path, no argv, no filesystem vocabulary) -- see the enhancement
+// plan's "recommendation against" a --recursive-aware helper. The
+// mint's target_cap_kind / target_cap_rights are opaque caller inputs,
+// exactly as elevate_client_cap_mint already requires them to be.
+//
+// =============================================================================
+// mint_ctx_buf LAYOUT -- 40 BYTES, FIVE u64 WORDS
+// =============================================================================
+//
+// elevate_client_cap_mint already takes six SysV arguments; composing
+// it with the six-argument elevate_client_request_ex_r would need 11
+// distinct live values (target_cap_rights is orthogonal to caps/dur/
+// req_buf/reply_ep_id/reply_buf), which does not fit paideia-os's
+// established 6-register SysV window (confirmed by the same codebase-
+// wide grep noted in elevate_client_send.pdx). Rather than invent a
+// 7+-argument call, this follows the SAME idiom req_buf/reply_buf
+// already establish: a caller-owned scratch buffer carrying the
+// values elevate_client_cap_mint would otherwise take positionally.
+//
+//   [+0]   parent_ep_slot     -- cap-table slot of the caller's
+//                                 KIND_IPC_ENDPOINT cap over the
+//                                 broker (NOT the bare endpoint_id
+//                                 elevate_client_lookup_broker
+//                                 returns -- see kind_elevate_channel.
+//                                 pdx's parent-gate note in paideia-os)
+//   [+8]   request_id         -- caller-chosen identifier stored in
+//                                 the minted row (elevate_channel_
+//                                 row_req)
+//   [+16]  requester_pid      -- caller's own pid (elevate_channel_
+//                                 row_pid); this library has no
+//                                 process-context primitive of its
+//                                 own, so the caller supplies it,
+//                                 exactly as a direct
+//                                 elevate_client_cap_mint call already
+//                                 requires
+//   [+24]  target_cap_kind    -- kind of the DOWNSTREAM capability
+//                                 this elevate channel governs
+//                                 (opaque to this library)
+//   [+32]  target_cap_rights  -- rights of that downstream capability
+//                                 (opaque to this library)
+//
+// The mint's own `rights` argument (the elevate channel's OWN rights,
+// distinct from target_cap_rights) is NOT read from this buffer: it is
+// fixed at ELCC_RIGHTS_ALL (elevate_client_cap.pdx) because narrowing
+// is stubbed until libpdx-cap.M2 lands (elevate_client_cap_narrow_stub
+// is a passthrough today) -- there is no partial-rights value this
+// composed flow could meaningfully request yet.
+//
+// =============================================================================
+// SEQUENCE
+// =============================================================================
+//
+//   (1) Gate mint_ctx_buf != 0                   -> ELCA_ERR_BAD_BUF.
+//   (2) elevate_client_request_ex_r(caps, dur, req_buf, reply_ep_id,
+//       reply_buf, timeout_ns=0) -- the full M3 flow: policy-classified
+//       timeout, REQ+APR audit journaling, retry-with-backoff on
+//       transient broker unavailability.  timeout_ns is always 0
+//       (auto-select fast/human by policy classification) -- a caller
+//       wanting manual timeout control keeps using
+//       elevate_client_request_ex_r directly and composes the mint
+//       itself.  Non-zero return (ELVC_ERR_* / ELVJ_ERR_* /
+//       ELVR_ERR_*) passes straight through: no mint is attempted
+//       without a validated grant.
+//   (3) elevate_client_cap_mint(parent_ep_slot, ELCC_RIGHTS_ALL,
+//       request_id, requester_pid, target_cap_kind, target_cap_rights)
+//       -- args (1),(3),(4),(5) read from mint_ctx_buf.  Mint failure
+//       (ELCC_ERR_MINT_FAIL) passes through.
+//   (4) elevate_client_cap_bind_expire_abs(row_id, reply_buf[+16]) --
+//       shadow the broker's OWN absolute expire_ns (not a client-side
+//       re-derivation; see that function's doc for why bind_expire's
+//       relative form would be wrong here).
+//   (5) elevate_client_cap_bind_grant(row_id, reply_buf[+8]) -- shadow
+//       the granted_caps so elevate_client_require can answer "does
+//       this handle still cover X" without a broker hop.
+//   (6) Return row_id.
+//
+// =============================================================================
+// RETURN DISCRIMINATION
+// =============================================================================
+//
+// row_id is always < 16 (ELCC_MAX_ROWS). Every error this function or
+// anything it calls can produce is >= 0xFFFFEA00. A caller therefore
+// discriminates with one bounded compare -- `cmp rax, 16; jae refuse`
+// -- with no adjacent band to confuse it with a valid handle. This is
+// the same "typed enum, not 0-vs-nonzero" discipline ENH-005 (#12)
+// applied to the transport layer, carried through to the handle layer.
+//
+// =============================================================================
+// ERROR BAND 0xFFFFEA50..0xFFFFEA5F
+// =============================================================================
+//
+//   0xFFFFEA50  ELCA_ERR_BAD_BUF  -- mint_ctx_buf is 0
+//
+// Every other non-success return is a passthrough from a composed
+// call (ELVC_*, ELVJ_ERR_*, ELVR_ERR_*, ELCC_ERR_*) -- this function
+// does not re-wrap them, so the ORIGINAL band identifies which layer
+// refused.
+
+module ElevateClientAcquire = structure {
+
+  pub let ELCA_OK          : u64 = 0
+  pub let ELCA_ERR_BAD_BUF : u64 = 0xFFFFEA50
+
+  // ==========================================================================
+  // elevate_client_acquire(caps, dur, req_buf, reply_ep_id, reply_buf,
+  //                        mint_ctx_buf) -> row_id | ELVC_*/ELVJ_ERR_*/
+  //                                          ELVR_ERR_*/ELCC_ERR_*/ELCA_ERR_*
+  //
+  // See the file header for the full sequence and the mint_ctx_buf
+  // layout. Register plan:
+  //
+  //   rbx = caps          (passed to request_ex_r)
+  //   r12 = dur, then reused post-mint as row_id (dur is dead after
+  //         the request_ex_r call; reusing the slot avoids a seventh
+  //         callee-save push)
+  //   r13 = req_buf       (passed to request_ex_r)
+  //   r14 = reply_ep_id   (passed to request_ex_r)
+  //   r15 = reply_buf     (read at [+8]/[+16] after a successful APR)
+  //   rbp = mint_ctx_buf  (read at [+0..+32] before the mint call)
+  //
+  // Six callee-save pushes + one 8-byte alignment pad = 56 bytes;
+  // entry rsp%16==8 -> (8-56) mod 16 == 0 across every nested call
+  // (elevate_client_request_ex_r, elevate_client_cap_mint,
+  // elevate_client_cap_bind_expire_abs, elevate_client_cap_bind_grant)
+  // -- same shape as elevate_client_request_ex_j / _ex_r.
+  // ==========================================================================
+
+  pub let elevate_client_acquire : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{boot, cap} =
+    fn (caps: u64) (dur: u64) (req_buf: u64) (reply_ep_id: u64) (reply_buf: u64) (mint_ctx_buf: u64) -> unsafe {
+      effects: {mem}, capabilities: {boot, cap},
+      justification: "libpdx-elevate.ENH-001 (#11): composed acquire -- request_ex_r (retry+journal+dispatch) then mint + shadow-bind, returning a row_id HANDLE instead of a bare status. Six callee-save pushes (rbx=caps, r12=dur/row_id, r13=req_buf, r14=reply_ep_id, r15=reply_buf, rbp=mint_ctx_buf) + one 8-byte alignment pad = 56 bytes; entry rsp%16==8 -> (8-56) mod 16 == 0 across every nested call, matching elevate_client_request_ex_j / _ex_r. r12 is reused as the row_id stash post-mint because `dur` is dead once request_ex_r has run -- this avoids a seventh callee-save. mint_ctx_buf fields are read directly into the SysV arg registers immediately before the elevate_client_cap_mint CALL (rbp itself is never overwritten, so the buffer stays valid for the whole function). The elevate channel's OWN rights are fixed at ELCC_RIGHTS_ALL (0x418, fits imm32, loaded directly) rather than read from the ctx buffer -- narrowing is stubbed until libpdx-cap.M2 (see elevate_client_cap_narrow_stub). capabilities {boot, cap} are the exact union of the two capability-bearing callees (elevate_client_request_ex_r needs {boot} via its own hpet_now_ns chain; elevate_client_cap_mint needs {cap}); the two shadow-bind calls need neither. Every failure path passes the callee's OWN return code straight through (no re-wrap), so the original error band identifies which layer refused -- only the mint_ctx_buf==0 gate produces a code owned by this file (ELCA_ERR_BAD_BUF). Labels prefixed elca_aq_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;                      // alignment (see justification)
+
+        mov rbx, rdi;                    // caps
+        mov r12, rsi;                    // dur
+        mov r13, rdx;                    // req_buf
+        mov r14, rcx;                    // reply_ep_id
+        mov r15, r8;                     // reply_buf
+        mov rbp, r9;                     // mint_ctx_buf
+
+        cmp rbp, 0;
+        je  elca_aq_bad_buf;
+
+        // ---- Step 2: full retry+journal+dispatch flow ----
+        mov rdi, rbx;                    // caps
+        mov rsi, r12;                    // dur
+        mov rdx, r13;                    // req_buf
+        mov rcx, r14;                    // reply_ep_id
+        mov r8,  r15;                    // reply_buf
+        xor r9,  r9;                     // timeout_ns = 0 (auto-select)
+        call elevate_client_request_ex_r;
+        cmp rax, 0;
+        jne elca_aq_out;                 // ELVC_*/ELVJ_ERR_*/ELVR_ERR_* passthrough
+
+        // ---- Step 3: mint the elevate channel cap ----
+        mov rdi, [rbp + 0];              // parent_ep_slot
+        mov rsi, 0x418;                  // ELCC_RIGHTS_ALL
+        mov rdx, [rbp + 8];              // request_id
+        mov rcx, [rbp + 16];             // requester_pid
+        mov r8,  [rbp + 24];             // target_cap_kind
+        mov r9,  [rbp + 32];             // target_cap_rights
+        call elevate_client_cap_mint;
+        cmp rax, 16;
+        jae elca_aq_out;                 // ELCC_ERR_MINT_FAIL passthrough
+
+        mov r12, rax;                    // row_id (dur no longer live)
+
+        // ---- Step 4: shadow the broker's absolute expire_ns ----
+        mov rdi, r12;
+        mov rsi, [r15 + 16];             // expire_ns, validated non-zero by recv
+        call elevate_client_cap_bind_expire_abs;
+        cmp rax, 0;
+        jne elca_aq_out;                 // defensive passthrough (row_id already < 16)
+
+        // ---- Step 5: shadow the granted_caps ----
+        mov rdi, r12;
+        mov rsi, [r15 + 8];              // granted_caps, validated subset by recv
+        call elevate_client_cap_bind_grant;
+        cmp rax, 0;
+        jne elca_aq_out;                 // defensive passthrough
+
+        // ---- Step 6: the handle IS the row_id ----
+        mov rax, r12;
+        jmp elca_aq_out;
+
+      elca_aq_bad_buf:
+        mov rax, 0xFFFFEA50;             // ELCA_ERR_BAD_BUF
+
+      elca_aq_out:
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
