@@ -117,6 +117,7 @@ N objects calls this once per item; the cost is a clock read.
 | `elevate_client_require_reset() -> () !{mem} @{}` | Scrub the 8-slot require stats. Boot/teardown only. |
 | `elevate_client_require_note(which) -> () !{mem} @{}` / `elevate_client_require_stat(which) -> u64 !{mem} @{}` | Bounded stats increment / read; out of range is a no-op resp. `0`. |
 | `elevate_client_require(row_id, needed_caps) -> u64 !{mem} @{cap, boot}` | Freshness (`elevate_client_cap_check_and_revoke`) then `(needed & granted) == needed` against the shadow grant map. `ELCA_ERR_EXPIRED` / `ELCA_ERR_CAPS_INSUFFICIENT` on refusal; `ELCC_ERR_BAD_ROW` / `_NO_DEADLINE` / `_NO_GRANT` pass through as caller-usage errors. |
+| `elevate_client_require_j(actor_fp_lo, row_id, needed_caps) -> u64 !{mem} @{cap, boot}` | ENH-004: audit-wrapped `elevate_client_require` — journals one per-op record (`elevate_client_journal_op`) on every AUTHORIZED use, none on a refusal. The per-op record count against one REQ/APR pair is the grant-amplification signal. |
 
 ### `src/elevate_client_cap.pdx` — module `ElevateClientCap`
 
@@ -147,6 +148,7 @@ Audit-first REQ/APR journaling through the kernel user-events journal.
 | `elevate_client_journal_req(actor_fp_lo, caps, dur_ns) -> u64 !{mem} @{}` | Append a REQ record via `uej_append`; returns the seq (< 256) or `ELVJ_ERR_BAD_ACTOR` / `_REQ_JOURNAL_FAIL`. |
 | `elevate_client_journal_apr(actor_fp_lo, granted_caps, expire_ns) -> u64 !{mem} @{}` | Append an APR record; returns the seq or `ELVJ_ERR_BAD_ACTOR` / `_APR_JOURNAL_FAIL`. |
 | `elevate_client_request_ex_j(caps, dur, req_buf, reply_ep_id, reply_buf, timeout_ns) -> u64 !{mem} @{boot}` | Audit-wrapped flow: journal REQ (failure aborts *before* the wire hop) → `request_ex` → journal APR. An APR-journal failure after a grant surfaces so the caller can revoke. |
+| `elevate_client_journal_op(actor_fp_lo, row_id, needed_caps) -> u64 !{mem} @{}` | ENH-004 (#16): append a per-op record (`ELVJ_EVT_OP = 3`) for one authorized use of an acquired handle; returns the seq or `ELVJ_ERR_BAD_ACTOR` / `_OP_JOURNAL_FAIL`. This is the grant-amplification signal: N of these against one REQ/APR pair. |
 
 ### `src/elevate_client_retry.pdx` — module `ElevateClientRetry`
 

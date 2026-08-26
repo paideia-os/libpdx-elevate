@@ -40,6 +40,12 @@ alongside the status-shaped one.
   needed` against the shadow grant map. New error band
   `0xFFFFEA60..0xFFFFEA6F` (`ELCA_ERR_EXPIRED`,
   `ELCA_ERR_CAPS_INSUFFICIENT`).
+- **ENH-004 (#16)** — `elevate_client_journal_op`
+  (`elevate_client_journal.pdx`, `ELVJ_EVT_OP = 3`,
+  `ELVJ_ERR_OP_JOURNAL_FAIL = 0xFFFFEA43`) and `elevate_client_require_j`
+  (`elevate_client_require.pdx`): one audit record per authorized
+  per-op use of an acquired handle, making grant amplification (1
+  REQ/APR pair, N mutating uses) legible to an auditor.
 
 ---
 

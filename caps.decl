@@ -62,6 +62,14 @@
   # kernel revoke elevate_client_cap_check_and_revoke fires on an expired
   # row -- no broker hop, no mint, no IPC endpoint use.
 
++entry elevate_client_journal_op
++entry elevate_client_require_j
+  KIND_ELEVATE_CHANNEL(revoke, row_id)
+  KIND_IPC_ENDPOINT(write, uej)
+  # ENH-004 (#16): audit-wrapped per-op re-assert. Union of elevate_client_
+  # require's cap (above) and uej_append's write-to-audit-fanout cap
+  # (same line elevate_client_journal_req/_apr already declare).
+
 +entry elevate_client_acquire
   KIND_IPC_ENDPOINT(read, "svc.elevate-broker")
   KIND_IPC_ENDPOINT(mint,  reply)

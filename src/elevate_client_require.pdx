@@ -41,6 +41,13 @@
 // meaning "never bound" is exactly the ELCC_ERR_NO_GRANT convention
 // elevate_client_cap_bind_grant / _get_grant already establish.
 //
+// ENH-004 (#16) adds elevate_client_require_j, an audit-wrapped
+// variant that journals ONE per-op record (via elevate_client_
+// journal_op, elevate_client_journal.pdx) for every AUTHORIZED use --
+// see that function's doc below for why a refusal is not journaled.
+// The count of those records against one REQ/APR pair is the grant-
+// amplification signal the enhancement plan calls for.
+//
 // =============================================================================
 // ERROR BAND 0xFFFFEA60..0xFFFFEA6F
 // =============================================================================
@@ -241,6 +248,71 @@ module ElevateClientRequire = structure {
       elcq_rq_no_grant:
         mov rax, 0xFFFFEA38;             // ELCC_ERR_NO_GRANT (passthrough band)
         add rsp, 8;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_require_j(actor_fp_lo, row_id, needed_caps)
+  //   -> ELCA_OK | ELCA_ERR_* | ELCC_ERR_* | ELVJ_ERR_*
+  //
+  // ENH-004 (#16).  Audit-wrapped per-op re-assert: elevate_client_
+  // require, then -- ONLY on ELCA_OK -- elevate_client_journal_op
+  // (elevate_client_journal.pdx). A refused check is NOT journaled
+  // here (see elevate_client_journal_op's doc for why); a caller
+  // wanting an audit trail of attempted-but-refused ops reads
+  // elevate_client_require_stat directly.
+  //
+  // ELVJ_ERR_OP_JOURNAL_FAIL on the journal step means the SAME thing
+  // ELVJ_ERR_APR_JOURNAL_FAIL means at the acquire layer: the
+  // operation was authorized (the caller's needed_caps really were
+  // covered by a live handle) but the audit record recording that
+  // fact did not land. Unlike a broken APR journal, there is no cap to
+  // revoke here -- the handle itself is unaffected -- but the caller
+  // should treat the returned non-zero code as "do not treat this op
+  // as audit-covered" and escalate accordingly (e.g. retry the journal
+  // write out of band, or abort the operation if audit coverage is a
+  // hard requirement for this caller).
+  //
+  // Register plan: r12=row_id, r13=needed_caps, r14=actor_fp_lo. Three
+  // callee-save pushes = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 ==
+  // 0, no pad needed (same shape as elevate_client_journal_req).
+  // ==========================================================================
+
+  pub let elevate_client_require_j : (u64, u64, u64) -> u64 !{mem} @{cap, boot} =
+    fn (actor_fp_lo: u64) (row_id: u64) (needed_caps: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap, boot},
+      justification: "libpdx-elevate.ENH-004 (#16): audit-wrapped per-op re-assert -- elevate_client_require then, only on success, elevate_client_journal_op. Three callee-save pushes (r12=row_id, r13=needed_caps, r14=actor_fp_lo) = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0, no pad needed, matching elevate_client_journal_req's shape. A refusal from elevate_client_require passes through unchanged with no journal attempt (see elevate_client_journal_op's doc for the rationale: journaling refusals would make the per-op write count meaningless as an amplification signal). capabilities {cap, boot} are the exact union of elevate_client_require's own {cap, boot} and elevate_client_journal_op's {} (mem only). Labels prefixed elcq_rj_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r14, rdi;                    // actor_fp_lo
+        mov r12, rsi;                    // row_id
+        mov r13, rdx;                    // needed_caps
+
+        mov rdi, r12;                    // row_id
+        mov rsi, r13;                    // needed_caps
+        call elevate_client_require;
+        cmp rax, 0;
+        jne elcq_rj_out;                 // refusal passthrough -- not journaled
+
+        mov rdi, r14;                    // actor_fp_lo
+        mov rsi, r12;                    // row_id
+        mov rdx, r13;                    // needed_caps
+        call elevate_client_journal_op;
+        cmp rax, 256;                    // ELVJ_UEJ_SEQ_MAX
+        jb  elcq_rj_success;
+        jmp elcq_rj_out;                 // ELVJ_ERR_* passthrough
+
+      elcq_rj_success:
+        xor rax, rax;                    // ELCA_OK
+
+      elcq_rj_out:
+        pop r14;
         pop r13;
         pop r12;
         ret

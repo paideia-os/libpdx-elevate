@@ -108,12 +108,22 @@ module ElevateClientJournal = structure {
   pub let ELVJ_EVT_REQ : u64 = 1
   pub let ELVJ_EVT_APR : u64 = 2
 
+  // ENH-004 (#16): per-op discriminator. Does NOT overlap a wire
+  // ELV_OP_* code (the wire protocol has no "per-op use" frame -- this
+  // event exists purely client-side, recording that
+  // elevate_client_require authorized one use of an already-granted
+  // handle). Chosen as 3 anyway, immediately after APR, so the three
+  // discriminators read as a chronological sequence: REQ, APR, then
+  // zero or more OP records per handle.
+  pub let ELVJ_EVT_OP : u64 = 3
+
   // ---- Result codes / error band 0xFFFFEA40..0xFFFFEA4F ----
 
   pub let ELVJ_OK                   : u64 = 0
   pub let ELVJ_ERR_BAD_ACTOR        : u64 = 0xFFFFEA40
   pub let ELVJ_ERR_REQ_JOURNAL_FAIL : u64 = 0xFFFFEA41
   pub let ELVJ_ERR_APR_JOURNAL_FAIL : u64 = 0xFFFFEA42
+  pub let ELVJ_ERR_OP_JOURNAL_FAIL  : u64 = 0xFFFFEA43
 
   // Threshold used to discriminate uej_append return (seq | UEJ_ERR_*)
   // from a valid seq.  UEJ_MAX_RECORDS = 256 per user_events_journal.
@@ -128,7 +138,14 @@ module ElevateClientJournal = structure {
   //   2 req_fails     uej_append refused a REQ record
   //   3 apr_fails     uej_append refused an APR record
   //   4 bad_actor     caller passed actor_fp_lo == 0
-  //   5..7 reserved
+  //   5 op_writes     successful per-op (ELVJ_EVT_OP) journal appends
+  //                   (ENH-004, #16) -- this count, compared against
+  //                   1 for the corresponding REQ/APR pair, IS the
+  //                   grant-amplification signal: N op_writes under
+  //                   one acquired handle means N mutating uses of a
+  //                   single broker grant.
+  //   6 op_fails      uej_append refused an OP record
+  //   7 reserved
 
   pub let mut _elevate_client_journal_stats : [u64; 8] = uninit @align(64)
 
@@ -137,6 +154,8 @@ module ElevateClientJournal = structure {
   pub let ELVJ_ST_REQ_FAILS  : u64 = 2
   pub let ELVJ_ST_APR_FAILS  : u64 = 3
   pub let ELVJ_ST_BAD_ACTOR  : u64 = 4
+  pub let ELVJ_ST_OP_WRITES  : u64 = 5
+  pub let ELVJ_ST_OP_FAILS   : u64 = 6
   pub let ELVJ_ST_MAX        : u64 = 8
 
   // ==========================================================================
@@ -355,6 +374,92 @@ module ElevateClientJournal = structure {
         ret;
 
       elcj_ja_bad_actor:
+        mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
+        call elevate_client_journal_note;
+        mov rax, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_journal_op(actor_fp_lo, row_id, needed_caps)
+  //   -> seq | ELVJ_ERR_*
+  //
+  // ENH-004 (#16).  Append a per-op audit record: one call per
+  // AUTHORIZED use of an already-acquired handle (elevate_client_
+  // require.pdx's elevate_client_require_j calls this on ELCA_OK
+  // only -- a refused op is not journaled here because it is already
+  // reflected in elevate_client_require's own stats table, and
+  // journaling every ATTEMPT would make the OP count meaningless as an
+  // amplification signal). Shape mirrors journal_req/journal_apr; body0
+  // = ELVJ_EVT_OP (3), body1 = row_id, body2 = needed_caps.
+  //
+  // This is the record an auditor reads to detect grant amplification:
+  // one REQ + one APR record establishes that ONE elevate was
+  // authorized by the broker; the count of OP records against that
+  // same actor_fp_lo (and, once a caller correlates by timestamp
+  // ordering, that same row_id) shows how many mutating operations
+  // were actually performed under it. A single grant covering 50,000
+  // recursively-deleted files now leaves 50,000 OP records rather than
+  // zero trace beyond the initial REQ/APR pair.
+  //
+  // Register plan / alignment: identical shape to journal_req --
+  // three callee-save pushes (r12=actor, r13=row_id, r14=needed_caps)
+  // = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0, no pad needed.
+  // ==========================================================================
+
+  pub let elevate_client_journal_op : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (actor_fp_lo: u64) (row_id: u64) (needed_caps: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.ENH-004 (#16): append a per-op audit record so grant amplification (1 REQ/APR pair, N mutating uses) is legible to an auditor. Shape mirrors elevate_client_journal_req -- see that function's justification for the alignment / gate reasoning; the only differences are body0 = ELVJ_EVT_OP (3) and body1/body2 = (row_id, needed_caps) rather than (caps, dur_ns). Failure normalises to ELVJ_ERR_OP_JOURNAL_FAIL and bumps ELVJ_ST_OP_FAILS; success bumps ELVJ_ST_OP_WRITES. Labels prefixed elcj_jo_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                    // actor_fp_lo
+        mov r13, rsi;                    // row_id
+        mov r14, rdx;                    // needed_caps
+
+        cmp r12, 0;
+        je  elcj_jo_bad_actor;
+
+        mov rdi, 5;                      // ELVJ_UEJ_KIND_ELEVATE
+        mov rsi, r12;                    // actor_fp_lo
+        xor rdx, rdx;                    // subject_fp_lo = 0
+        mov rcx, 3;                      // ELVJ_EVT_OP
+        mov r8,  r13;                    // row_id
+        mov r9,  r14;                    // needed_caps
+        call uej_append;
+
+        cmp rax, 256;                    // ELVJ_UEJ_SEQ_MAX
+        jae elcj_jo_fail;
+
+        push rax;
+        sub rsp, 8;
+        mov rdi, 5;                      // ELVJ_ST_OP_WRITES
+        call elevate_client_journal_note;
+        add rsp, 8;
+        pop rax;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcj_jo_fail:
+        mov rdi, 6;                      // ELVJ_ST_OP_FAILS
+        call elevate_client_journal_note;
+        mov rax, 0xFFFFEA43;             // ELVJ_ERR_OP_JOURNAL_FAIL
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcj_jo_bad_actor:
         mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
         call elevate_client_journal_note;
         mov rax, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR

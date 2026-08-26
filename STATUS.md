@@ -36,6 +36,12 @@ existing status-shaped one.
   (`elevate_client_require.pdx`) — cheap per-op re-assert against an
   acquired handle: freshness via `elevate_client_cap_check_and_revoke`
   + caps-subset against the shadow grant map, no broker hop.
+- **ENH-004 (#16, LANDED):** `elevate_client_journal_op`
+  (`elevate_client_journal.pdx`, `ELVJ_EVT_OP = 3`) and
+  `elevate_client_require_j` (`elevate_client_require.pdx`) — one
+  audit record per AUTHORIZED per-op use. The record count against a
+  single REQ/APR pair is the grant-amplification signal the
+  enhancement plan calls for (ENH-004 depends on ENH-002).
 
 ## Milestone rollup
 

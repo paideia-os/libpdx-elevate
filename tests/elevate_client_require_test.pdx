@@ -36,6 +36,12 @@
 //       revoke) or ELCC_ERR_REVOKE_FAIL (kernel refused -- no real
 //       cap minted at this slot in the witness). Both prove the
 //       expired branch reached elevate_client_cap_check_and_revoke.
+//   (f) ENH-004 (#16): require_j on row 0 (still live) -> ELCA_OK,
+//       and ELVJ_ST_OP_WRITES actually incremented -- the per-op
+//       journal write landed.
+//   (g) ENH-004 (#16): require_j on an out-of-range row -> ELCC_ERR_
+//       BAD_ROW passthrough, and ELVJ_ST_OP_WRITES is UNCHANGED -- a
+//       refused check is never journaled.
 //
 // =============================================================================
 // FINGERPRINT: LIBPDX-ELEVATE ENH-002 REQUIRE OK
@@ -67,9 +73,15 @@ module ElevateClientRequireTest = structure {
         mov [rcx], rax;
         call elevate_client_cap_reset;
         call elevate_client_require_reset;
+        call elevate_client_journal_reset;
 
         mov rdi, 0;                      // ELCA_ST_CHECKS
         call elevate_client_require_stat;
+        cmp rax, 0;
+        jne ecqw_fail_stage;
+
+        mov rdi, 5;                      // ELVJ_ST_OP_WRITES
+        call elevate_client_journal_stat;
         cmp rax, 0;
         jne ecqw_fail_stage;
 
@@ -207,6 +219,49 @@ module ElevateClientRequireTest = structure {
 
       ecqw_stage7_ok:
         // ------------------------------------------------------------
+        // Stage 8 (ENH-004, #16): require_j on row 0 (still live +
+        // granted 0x03 from stage 2) -> ELCA_OK, and the per-op
+        // journal write actually landed (ELVJ_ST_OP_WRITES == 1).
+        // ------------------------------------------------------------
+        mov rax, 8;
+        lea rcx, [rip + _ecqw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0xABCD;                 // actor_fp_lo
+        xor rsi, rsi;                    // row = 0
+        mov rdx, 0x01;                   // needed = subset of 0x03
+        call elevate_client_require_j;
+        cmp rax, 0;                      // ELCA_OK
+        jne ecqw_fail_stage;
+
+        mov rdi, 5;                      // ELVJ_ST_OP_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 1;
+        jne ecqw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 9 (ENH-004, #16): require_j on an out-of-range row ->
+        // ELCC_ERR_BAD_ROW passthrough, and NO journal write follows
+        // a refused check (ELVJ_ST_OP_WRITES stays at 1).
+        // ------------------------------------------------------------
+        mov rax, 9;
+        lea rcx, [rip + _ecqw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0xABCD;                 // actor_fp_lo
+        mov rsi, 17;                     // row (out of range)
+        mov rdx, 0x01;                   // needed
+        call elevate_client_require_j;
+        mov r10, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
+        cmp rax, r10;
+        jne ecqw_fail_stage;
+
+        mov rdi, 5;                      // ELVJ_ST_OP_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 1;                      // unchanged -- refusal not journaled
+        jne ecqw_fail_stage;
+
+        // ------------------------------------------------------------
         // Success. Log OK, scrub state, return 0.
         // ------------------------------------------------------------
         mov rdi, 3;                      // KLOG_LEVEL_INFO
@@ -216,6 +271,7 @@ module ElevateClientRequireTest = structure {
 
         call elevate_client_cap_reset;
         call elevate_client_require_reset;
+        call elevate_client_journal_reset;
         xor rax, rax;
         jmp ecqw_out;
 
@@ -229,6 +285,7 @@ module ElevateClientRequireTest = structure {
         call klog_s1_d1;
         call elevate_client_cap_reset;
         call elevate_client_require_reset;
+        call elevate_client_journal_reset;
         mov rax, 1;
 
       ecqw_out:
