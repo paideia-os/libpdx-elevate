@@ -42,6 +42,15 @@
 //   (g) ENH-004 (#16): require_j on an out-of-range row -> ELCC_ERR_
 //       BAD_ROW passthrough, and ELVJ_ST_OP_WRITES is UNCHANGED -- a
 //       refused check is never journaled.
+//   (h) ENH-003 (#15): row 4, scope + a 2-op budget bound.
+//       require_scoped with the matching scope succeeds twice
+//       (consuming the budget) then refuses BUDGET_EXHAUSTED on the
+//       third call -- proves the +1 storage encoding in
+//       elevate_client_cap_consume_budget keeps refusing past
+//       exhaustion rather than wrapping back to "unbounded".
+//   (i) ENH-003 (#15): row 5, scope bound, NO budget bound. A
+//       mismatched scope_fp refuses SCOPE_MISMATCH; the matching
+//       scope then succeeds every time (unbudgeted).
 //
 // =============================================================================
 // FINGERPRINT: LIBPDX-ELEVATE ENH-002 REQUIRE OK
@@ -259,6 +268,105 @@ module ElevateClientRequireTest = structure {
         mov rdi, 5;                      // ELVJ_ST_OP_WRITES
         call elevate_client_journal_stat;
         cmp rax, 1;                      // unchanged -- refusal not journaled
+        jne ecqw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 10 (ENH-003, #15): row 4 -- live + granted 0x01,
+        // scope bound to 0xAAA, budget bound to 2. require_scoped with
+        // the matching scope consumes the budget twice successfully,
+        // then the third call is refused BUDGET_EXHAUSTED.
+        // ------------------------------------------------------------
+        mov rax, 10;
+        lea rcx, [rip + _ecqw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 4;                      // row = 4
+        mov rsi, 60000000000;
+        call elevate_client_cap_bind_expire;
+        cmp rax, 0;
+        jne ecqw_fail_stage;
+
+        mov rdi, 4;
+        mov rsi, 0x01;
+        call elevate_client_cap_bind_grant;
+        cmp rax, 0;
+        jne ecqw_fail_stage;
+
+        mov rdi, 4;
+        mov rsi, 0xAAA;                  // scope_fp
+        call elevate_client_cap_bind_scope;
+        cmp rax, 0;
+        jne ecqw_fail_stage;
+
+        mov rdi, 4;
+        mov rsi, 2;                      // max_ops = 2
+        call elevate_client_cap_bind_budget;
+        cmp rax, 0;
+        jne ecqw_fail_stage;
+
+        mov rdi, 4;                      // row = 4
+        mov rsi, 0x01;                   // needed
+        mov rdx, 0xAAA;                  // scope_fp (matches)
+        call elevate_client_require_scoped;
+        cmp rax, 0;                      // ELCA_OK (1st consume)
+        jne ecqw_fail_stage;
+
+        mov rdi, 4;
+        mov rsi, 0x01;
+        mov rdx, 0xAAA;
+        call elevate_client_require_scoped;
+        cmp rax, 0;                      // ELCA_OK (2nd consume -- exhausts)
+        jne ecqw_fail_stage;
+
+        mov rdi, 4;
+        mov rsi, 0x01;
+        mov rdx, 0xAAA;
+        call elevate_client_require_scoped;
+        mov r10, 0xFFFFEA3A;             // ELCC_ERR_BUDGET_EXHAUSTED
+        cmp rax, r10;
+        jne ecqw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 11 (ENH-003, #15): row 5 -- live + granted 0x01,
+        // scope bound to 0xAAA, NO budget bound. A mismatched scope
+        // refuses SCOPE_MISMATCH; the matching scope then succeeds
+        // (unbudgeted -- never exhausts).
+        // ------------------------------------------------------------
+        mov rax, 11;
+        lea rcx, [rip + _ecqw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 5;
+        mov rsi, 60000000000;
+        call elevate_client_cap_bind_expire;
+        cmp rax, 0;
+        jne ecqw_fail_stage;
+
+        mov rdi, 5;
+        mov rsi, 0x01;
+        call elevate_client_cap_bind_grant;
+        cmp rax, 0;
+        jne ecqw_fail_stage;
+
+        mov rdi, 5;
+        mov rsi, 0xAAA;                  // scope_fp
+        call elevate_client_cap_bind_scope;
+        cmp rax, 0;
+        jne ecqw_fail_stage;
+
+        mov rdi, 5;                      // row = 5
+        mov rsi, 0x01;
+        mov rdx, 0xBBB;                  // WRONG scope
+        call elevate_client_require_scoped;
+        mov r10, 0xFFFFEA62;             // ELCA_ERR_SCOPE_MISMATCH
+        cmp rax, r10;
+        jne ecqw_fail_stage;
+
+        mov rdi, 5;
+        mov rsi, 0x01;
+        mov rdx, 0xAAA;                  // correct scope
+        call elevate_client_require_scoped;
+        cmp rax, 0;                      // ELCA_OK -- unbudgeted, never exhausts
         jne ecqw_fail_stage;
 
         // ------------------------------------------------------------

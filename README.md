@@ -118,6 +118,7 @@ N objects calls this once per item; the cost is a clock read.
 | `elevate_client_require_note(which) -> () !{mem} @{}` / `elevate_client_require_stat(which) -> u64 !{mem} @{}` | Bounded stats increment / read; out of range is a no-op resp. `0`. |
 | `elevate_client_require(row_id, needed_caps) -> u64 !{mem} @{cap, boot}` | Freshness (`elevate_client_cap_check_and_revoke`) then `(needed & granted) == needed` against the shadow grant map. `ELCA_ERR_EXPIRED` / `ELCA_ERR_CAPS_INSUFFICIENT` on refusal; `ELCC_ERR_BAD_ROW` / `_NO_DEADLINE` / `_NO_GRANT` pass through as caller-usage errors. |
 | `elevate_client_require_j(actor_fp_lo, row_id, needed_caps) -> u64 !{mem} @{cap, boot}` | ENH-004: audit-wrapped `elevate_client_require` — journals one per-op record (`elevate_client_journal_op`) on every AUTHORIZED use, none on a refusal. The per-op record count against one REQ/APR pair is the grant-amplification signal. |
+| `elevate_client_require_scoped(row_id, needed_caps, scope_fp) -> u64 !{mem} @{cap, boot}` | ENH-003: `elevate_client_require` plus a scope match (`elevate_client_cap_get_scope`) and a budget consume (`elevate_client_cap_consume_budget`), both no-ops when never bound. `ELCA_ERR_SCOPE_MISMATCH` / `ELCC_ERR_BUDGET_EXHAUSTED` on refusal. |
 
 ### `src/elevate_client_cap.pdx` — module `ElevateClientCap`
 
@@ -132,6 +133,8 @@ self-invalidation.
 | `elevate_client_cap_get_expire(row_id) -> u64 !{mem} @{}` | Read the shadow deadline; `0` means unbound or out of range. |
 | `elevate_client_cap_bind_expire_abs(row_id, deadline_ns) -> u64 !{mem} @{}` | ENH-001: store an ABSOLUTE deadline (no `hpet_now_ns` addition) — the counterpart `elevate_client_acquire` uses to shadow a broker-supplied `expire_ns` without re-deriving it against a later clock read. |
 | `elevate_client_cap_bind_grant(row_id, granted_caps) -> u64 !{mem} @{}` / `elevate_client_cap_get_grant(row_id) -> u64 !{mem} @{}` | ENH-001: shadow / read the APR's `granted_caps` for `row_id`, so `elevate_client_require` can re-check caps coverage with no broker hop. `0` means never bound (`ELCC_ERR_NO_GRANT`). |
+| `elevate_client_cap_bind_scope(row_id, scope_fp) -> u64 !{mem} @{}` / `elevate_client_cap_get_scope(row_id) -> u64 !{mem} @{}` | ENH-003: shadow / read an opaque scope fingerprint for `row_id`; `0` = unscoped (matches any `scope_fp`). |
+| `elevate_client_cap_bind_budget(row_id, max_ops) -> u64 !{mem} @{}` / `elevate_client_cap_get_budget_remaining(row_id) -> u64 !{mem} @{}` / `elevate_client_cap_consume_budget(row_id) -> u64 !{mem} @{}` | ENH-003: bind / read / consume a per-handle op budget. `max_ops == 0` clears (unbounded). Stored as `remaining + 1` internally so a bound-and-exhausted row stays distinguishable from an unbound one; `consume_budget` refuses `ELCC_ERR_BUDGET_EXHAUSTED` forever once spent, not just once. |
 | `elevate_client_cap_narrow_stub(rights_in) -> u64 !{} @{}` | **Stub** awaiting libpdx-cap.M2 `cap_narrow_rights`; returns rights unchanged. |
 | `elevate_client_cap_mint(parent_ep_slot, rights, request_id, requester_pid, target_cap_kind, target_cap_rights) -> u64 !{mem} @{cap}` | Wrapper over the kernel `elevate_channel_cap_mint_inner`; returns `row_id` (< 16) or `ELCC_ERR_MINT_FAIL`. |
 | `elevate_client_cap_expired(row_id) -> u64 !{mem} @{boot}` | `1` expired / `0` live, or `ELCC_ERR_BAD_ROW` / `ELCC_ERR_NO_DEADLINE`. |

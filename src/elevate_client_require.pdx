@@ -59,6 +59,12 @@
 //   0xFFFFEA61  ELCA_ERR_CAPS_INSUFFICIENT   -- needed_caps is not a
 //                                                subset of what this
 //                                                handle was granted
+//   0xFFFFEA62  ELCA_ERR_SCOPE_MISMATCH      -- ENH-003 (#15): the
+//                                                handle has a bound
+//                                                scope (elevate_client_
+//                                                cap_bind_scope) and the
+//                                                caller's scope_fp does
+//                                                not match it
 //
 // ELCC_ERR_BAD_ROW / ELCC_ERR_NO_DEADLINE / ELCC_ERR_NO_GRANT
 // (elevate_client_cap.pdx, 0xFFFFEA30 band) pass through unchanged
@@ -72,6 +78,7 @@ module ElevateClientRequire = structure {
   pub let ELCA_OK                    : u64 = 0
   pub let ELCA_ERR_EXPIRED           : u64 = 0xFFFFEA60
   pub let ELCA_ERR_CAPS_INSUFFICIENT : u64 = 0xFFFFEA61
+  pub let ELCA_ERR_SCOPE_MISMATCH    : u64 = 0xFFFFEA62
 
   // ---- Stats ----
   //
@@ -83,11 +90,13 @@ module ElevateClientRequire = structure {
 
   pub let mut _elevate_client_require_stats : [u64; 8] = uninit @align(64)
 
-  pub let ELCA_ST_CHECKS       : u64 = 0
-  pub let ELCA_ST_LIVE_OK      : u64 = 1
-  pub let ELCA_ST_EXPIRED      : u64 = 2
-  pub let ELCA_ST_INSUFFICIENT : u64 = 3
-  pub let ELCA_ST_MAX          : u64 = 8
+  pub let ELCA_ST_CHECKS           : u64 = 0
+  pub let ELCA_ST_LIVE_OK          : u64 = 1
+  pub let ELCA_ST_EXPIRED          : u64 = 2
+  pub let ELCA_ST_INSUFFICIENT     : u64 = 3
+  pub let ELCA_ST_SCOPE_MISMATCH   : u64 = 4  // ENH-003 (#15)
+  pub let ELCA_ST_BUDGET_EXHAUSTED : u64 = 5  // ENH-003 (#15)
+  pub let ELCA_ST_MAX              : u64 = 8
 
   // ==========================================================================
   // elevate_client_require_reset() -> ()
@@ -312,6 +321,102 @@ module ElevateClientRequire = structure {
         xor rax, rax;                    // ELCA_OK
 
       elcq_rj_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_require_scoped(row_id, needed_caps, scope_fp)
+  //   -> ELCA_OK | ELCA_ERR_EXPIRED | ELCA_ERR_CAPS_INSUFFICIENT
+  //      | ELCA_ERR_SCOPE_MISMATCH | ELCC_ERR_BUDGET_EXHAUSTED
+  //      | ELCC_ERR_BAD_ROW | ELCC_ERR_NO_DEADLINE | ELCC_ERR_NO_GRANT
+  //
+  // ENH-003 (#15). elevate_client_require plus the two structural
+  // bindings a caller may have set on the handle via elevate_client_
+  // cap_bind_scope / _bind_budget (elevate_client_cap.pdx): a scope
+  // match and a budget consumption, exactly once per call, in that
+  // order after the base freshness+caps check.
+  //
+  // Neither binding is required: an unscoped handle (scope never
+  // bound, or bound as 0) matches any scope_fp; an unbudgeted handle
+  // (budget never bound) never exhausts. A caller that never calls
+  // bind_scope / bind_budget gets IDENTICAL behavior to plain
+  // elevate_client_require -- this function is strictly additive.
+  //
+  // Sequence:
+  //   (1) elevate_client_require(row_id, needed_caps) -- non-zero
+  //       passes straight through (already the correct band).
+  //   (2) elevate_client_cap_get_scope(row_id) -- if the returned
+  //       scope is non-zero AND does not equal the caller's scope_fp,
+  //       refuse ELCA_ERR_SCOPE_MISMATCH.
+  //   (3) elevate_client_cap_consume_budget(row_id) -- ELCC_ERR_
+  //       BUDGET_EXHAUSTED passes straight through (already the
+  //       correct band; see that function's +1 storage-encoding note
+  //       for why it can refuse every call past exhaustion rather than
+  //       just the first).
+  //   (4) ELCA_OK.
+  //
+  // Register plan: r12=row_id, r13=needed_caps, r14=scope_fp. Three
+  // callee-save pushes = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 ==
+  // 0, no pad needed.
+  // ==========================================================================
+
+  pub let elevate_client_require_scoped : (u64, u64, u64) -> u64 !{mem} @{cap, boot} =
+    fn (row_id: u64) (needed_caps: u64) (scope_fp: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap, boot},
+      justification: "libpdx-elevate.ENH-003 (#15): elevate_client_require plus scope-match and budget-consume, both additive and both no-ops on a handle that never bound them (0 = unscoped / unbudgeted). Three callee-save pushes (r12=row_id, r13=needed_caps, r14=scope_fp) = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0, no pad needed, matching elevate_client_journal_req's shape. Step order (freshness+caps, then scope, then budget) matters only for which stat bumps first on a multi-reason refusal; a caller sees exactly one refusal code either way since each step returns immediately. capabilities {cap, boot} are elevate_client_require's own (unchanged; get_scope and consume_budget both need {}, only {mem}). Labels prefixed elcq_rs_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                    // row_id
+        mov r13, rsi;                    // needed_caps
+        mov r14, rdx;                    // scope_fp
+
+        mov rdi, r12;
+        mov rsi, r13;
+        call elevate_client_require;
+        cmp rax, 0;
+        jne elcq_rs_out;                 // passthrough (already correctly banded)
+
+        // (2) Scope match: bound scope == 0 (unscoped) OR == scope_fp.
+        mov rdi, r12;
+        call elevate_client_cap_get_scope;
+        cmp rax, 0;
+        je  elcq_rs_scope_ok;            // unscoped -- matches anything
+        cmp rax, r14;
+        je  elcq_rs_scope_ok;
+        // Mismatch.
+        mov rdi, 4;                      // ELCA_ST_SCOPE_MISMATCH
+        call elevate_client_require_note;
+        mov rax, 0xFFFFEA62;             // ELCA_ERR_SCOPE_MISMATCH
+        jmp elcq_rs_out;
+
+      elcq_rs_scope_ok:
+        // (3) Budget consume.
+        mov rdi, r12;
+        call elevate_client_cap_consume_budget;
+        cmp rax, 0;
+        je  elcq_rs_ok;
+        mov r10, 0xFFFFEA3A;             // ELCC_ERR_BUDGET_EXHAUSTED
+        cmp rax, r10;
+        jne elcq_rs_out;                 // some other ELCC_ERR_* -- passthrough
+        push rax;
+        sub rsp, 8;
+        mov rdi, 5;                      // ELCA_ST_BUDGET_EXHAUSTED
+        call elevate_client_require_note;
+        add rsp, 8;
+        pop rax;
+        jmp elcq_rs_out;
+
+      elcq_rs_ok:
+        xor rax, rax;                    // ELCA_OK
+
+      elcq_rs_out:
         pop r14;
         pop r13;
         pop r12;

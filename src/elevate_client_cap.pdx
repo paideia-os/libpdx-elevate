@@ -81,6 +81,13 @@
 //                                        elevate_client_cap_bind_grant,
 //                                        or the row was minted directly
 //                                        and bypassed elevate_client_acquire).
+//   0xFFFFEA39  ELCC_ERR_BAD_BUDGET   -- ENH-003 (#15): bind_budget
+//                                        called with an out-of-range
+//                                        max_ops.
+//   0xFFFFEA3A  ELCC_ERR_BUDGET_EXHAUSTED
+//                                     -- ENH-003 (#15): consume_budget
+//                                        called on a row whose bound
+//                                        budget has already reached 0.
 
 module ElevateClientCap = structure {
 
@@ -112,6 +119,8 @@ module ElevateClientCap = structure {
   pub let ELCC_STATE_REVOKED     : u64 = 0xFFFFEA36
   pub let ELCC_NOTE_NO_NARROW    : u64 = 0xFFFFEA37
   pub let ELCC_ERR_NO_GRANT      : u64 = 0xFFFFEA38
+  pub let ELCC_ERR_BAD_BUDGET    : u64 = 0xFFFFEA39
+  pub let ELCC_ERR_BUDGET_EXHAUSTED : u64 = 0xFFFFEA3A
 
   // ---- Client-side shadow deadline map ----
   //
@@ -135,6 +144,33 @@ module ElevateClientCap = structure {
   // kernel row_id.
 
   pub let mut _elevate_client_cap_grant_map : [u64; 16] = uninit @align(64)
+
+  // ---- Client-side shadow scope + op-budget maps (ENH-003, #15) ----
+  //
+  // The enhancement plan's structural answer to "one grant covering N
+  // objects is accidental and unbounded" (the `rm -r` regression's
+  // root shape): a handle from elevate_client_acquire may OPTIONALLY
+  // be bound to an opaque scope fingerprint and/or a bounded op count
+  // BEFORE a recursive walk starts consuming it. Neither binding is
+  // required -- a handle used only via elevate_client_require (ENH-
+  // 002) behaves exactly as before; scope/budget enforcement is
+  // additive, exercised only by elevate_client_require_scoped.
+  //
+  // _elevate_client_cap_scope_map[i]: an OPAQUE u64 the caller chooses
+  // (e.g. a hash of the recursive walk's root path) recording "what
+  // this handle's uses are supposed to be about." 0 means "unscoped"
+  // -- matches ANY scope_fp a caller supplies (same 0-means-wildcard
+  // convention as the kernel/client policy tables' target_fp_lo). This
+  // library has no filesystem vocabulary and does not interpret the
+  // value -- see the enhancement plan's explicit recommendation
+  // against a --recursive-aware helper.
+  //
+  // _elevate_client_cap_budget_map[i]: remaining op count. 0 means "no
+  // budget bound" (unlimited) -- same 0-means-unbound convention as
+  // the deadline map. A caller who never calls elevate_client_cap_
+  // bind_budget gets the pre-ENH-003 behavior exactly.
+  pub let mut _elevate_client_cap_scope_map  : [u64; 16] = uninit @align(64)
+  pub let mut _elevate_client_cap_budget_map : [u64; 16] = uninit @align(64)
 
   // ---- Client-side counters ----
   //
@@ -165,7 +201,7 @@ module ElevateClientCap = structure {
   pub let elevate_client_cap_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M2-003 (#5), extended at ENH-001 (#11): scrub the deadline map, the grant map, and the stats. Boot / teardown only. Three independent loops so the arrays' lengths do not have to be composed in code. Leaf. Labels prefixed elcc_rs_.",
+      justification: "libpdx-elevate.M2-003 (#5), extended at ENH-001 (#11) and ENH-003 (#15): scrub the deadline map, the grant map, the scope map, the budget map, and the stats. Boot / teardown only. Five independent loops so the arrays' lengths do not have to be composed in code. Leaf. Labels prefixed elcc_rs_.",
       block: {
         lea r10, [rip + _elevate_client_cap_expire_map];
         xor rax, rax;
@@ -183,6 +219,22 @@ module ElevateClientCap = structure {
         add rcx, 1;
         cmp rcx, 16;
         jb  elcc_rs_grant;
+
+        lea r10, [rip + _elevate_client_cap_scope_map];
+        xor rcx, rcx;
+      elcc_rs_scope:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  elcc_rs_scope;
+
+        lea r10, [rip + _elevate_client_cap_budget_map];
+        xor rcx, rcx;
+      elcc_rs_budget:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  elcc_rs_budget;
 
         lea r10, [rip + _elevate_client_cap_stats];
         xor rcx, rcx;
@@ -447,6 +499,201 @@ module ElevateClientCap = structure {
         ret;
       elcc_gg_zero:
         xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_cap_bind_scope(row_id, scope_fp) -> ELCC_OK | ELCC_ERR_BAD_ROW
+  // elevate_client_cap_get_scope(row_id) -> scope_fp | 0
+  //
+  // ENH-003 (#15). Shadow an opaque scope fingerprint for row_id.
+  // scope_fp == 0 clears the binding (same "0 = unbound" convention as
+  // the deadline map) -- a row with no scope bound matches ANY
+  // scope_fp a caller later presents to elevate_client_require_scoped
+  // (elevate_client_require.pdx), the same wildcard convention the
+  // policy table's target_fp_lo == 0 already establishes. See the
+  // file header for why this value is opaque to the library.
+  // ==========================================================================
+
+  pub let elevate_client_cap_bind_scope : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (scope_fp: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.ENH-003 (#15): shadow an opaque scope fingerprint for row_id; 0 clears (unbound = matches any scope). Two callee-save pushes (r12=row_id, r13=scope_fp); no nested call, no alignment pad needed. Labels prefixed elcc_bs_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rdi;                    // row_id
+        mov r13, rsi;                    // scope_fp
+
+        cmp r12, 16;
+        jae elcc_bs_bad_row;
+
+        lea r10, [rip + _elevate_client_cap_scope_map];
+        mov [r10 + r12 * 8], r13;
+
+        xor rax, rax;                    // ELCC_OK
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_bs_bad_row:
+        mov rax, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  pub let elevate_client_cap_get_scope : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.ENH-003 (#15): bounded read of the shadow scope map; out-of-range returns 0 (same convention as elevate_client_cap_get_expire / _get_grant). Leaf. Labels prefixed elcc_gs_.",
+      block: {
+        cmp rdi, 16;
+        jae elcc_gs_zero;
+        lea r10, [rip + _elevate_client_cap_scope_map];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      elcc_gs_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_cap_bind_budget(row_id, max_ops) -> ELCC_OK | ELCC_ERR_*
+  // elevate_client_cap_get_budget_remaining(row_id) -> remaining | 0
+  // elevate_client_cap_consume_budget(row_id)
+  //   -> ELCC_OK | ELCC_ERR_BUDGET_EXHAUSTED | ELCC_ERR_BAD_ROW
+  //
+  // ENH-003 (#15). The direct structural answer to the recursive-walk
+  // case: one grant covering N objects becomes an explicit, EXHAUSTIBLE
+  // count rather than an implicit, unbounded one.
+  //
+  // STORAGE ENCODING: the shadow slot holds (remaining + 1) when bound,
+  // 0 when unbound. A plain "0 = unbound" convention (as the deadline
+  // and scope maps use) is AMBIGUOUS here specifically: a budget of N
+  // that has been consumed exactly N times has 0 ops left, and without
+  // the +1 offset that state is bit-for-bit indistinguishable from
+  // "never bound" -- the (N+1)-th call would then see a bare 0 and
+  // wrongly read it as unlimited, silently letting the walk continue
+  // past its budget. The +1 offset keeps "0 remaining, still bound"
+  // (stored as 1) and "unbound" (stored as 0) distinct, so
+  // consume_budget can refuse every call once a bound budget is spent,
+  // forever, rather than exactly once.
+  //
+  // max_ops == 0 clears the binding (unlimited); max_ops ==
+  // 0xFFFFFFFFFFFFFFFF is refused as ELCC_ERR_BAD_BUDGET (the one value
+  // that would wrap the +1 encoding back to the unbound sentinel). A
+  // row that never calls bind_budget behaves exactly as it did before
+  // ENH-003.
+  // ==========================================================================
+
+  pub let elevate_client_cap_bind_budget : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (max_ops: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.ENH-003 (#15): bind (or, at max_ops==0, clear) the remaining-ops budget for row_id, stored as (max_ops + 1) so a bound-and-exhausted row stays distinguishable from an unbound one -- see the file's STORAGE ENCODING note above. Two callee-save pushes (r12=row_id, r13=max_ops); no nested call, no alignment pad needed. max_ops == 0xFFFFFFFFFFFFFFFF is refused (staged in r10 for the compare, exceeds imm32) because +1 would wrap it to 0, the unbound sentinel. Labels prefixed elcc_bb_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rdi;                    // row_id
+        mov r13, rsi;                    // max_ops
+
+        cmp r12, 16;
+        jae elcc_bb_bad_row;
+
+        cmp r13, 0;
+        je  elcc_bb_clear;
+
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp r13, r10;
+        je  elcc_bb_bad_budget;
+
+        // Store max_ops + 1 (see STORAGE ENCODING).
+        add r13, 1;
+        lea r10, [rip + _elevate_client_cap_budget_map];
+        mov [r10 + r12 * 8], r13;
+        xor rax, rax;                    // ELCC_OK
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_bb_clear:
+        lea r10, [rip + _elevate_client_cap_budget_map];
+        xor rax, rax;
+        mov [r10 + r12 * 8], rax;
+        xor rax, rax;                    // ELCC_OK
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_bb_bad_budget:
+        mov rax, 0xFFFFEA39;             // ELCC_ERR_BAD_BUDGET
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_bb_bad_row:
+        mov rax, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  pub let elevate_client_cap_get_budget_remaining : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.ENH-003 (#15): bounded read of the shadow budget map, undoing the +1 storage offset (a stored 0 -- unbound -- reads back as 0 remaining too; a caller that needs to tell 'unbound' from 'bound and exhausted' apart calls elevate_client_cap_consume_budget and reads ITS return instead, same as get_expire's documented ambiguity). Out-of-range row_id returns 0. Leaf. Labels prefixed elcc_gb_.",
+      block: {
+        cmp rdi, 16;
+        jae elcc_gb_zero;
+        lea r10, [rip + _elevate_client_cap_budget_map];
+        mov rax, [r10 + rdi * 8];
+        cmp rax, 0;
+        je  elcc_gb_zero;
+        sub rax, 1;                      // undo the +1 storage offset
+        ret;
+      elcc_gb_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let elevate_client_cap_consume_budget : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.ENH-003 (#15): consume one unit of the shadow budget using the +1 storage encoding (see the file's STORAGE ENCODING note): stored==0 is unbound (no-op ELCC_OK, nothing to exhaust); stored==1 represents 'bound, 0 remaining' and refuses ELCC_ERR_BUDGET_EXHAUSTED WITHOUT decrementing further, so it keeps refusing every subsequent call rather than wrapping past 0 and silently becoming unbound-shaped; stored>=2 decrements by 1 and succeeds. Leaf; no nested call. Labels prefixed elcc_cb_.",
+      block: {
+        cmp rdi, 16;
+        jae elcc_cb_bad_row;
+
+        lea r10, [rip + _elevate_client_cap_budget_map];
+        mov rax, [r10 + rdi * 8];
+
+        cmp rax, 0;
+        je  elcc_cb_unbound;
+        cmp rax, 1;
+        je  elcc_cb_exhausted;
+
+        sub rax, 1;
+        mov [r10 + rdi * 8], rax;
+        xor rax, rax;                    // ELCC_OK
+        ret;
+
+      elcc_cb_unbound:
+        xor rax, rax;                    // ELCC_OK -- nothing to exhaust
+        ret;
+
+      elcc_cb_exhausted:
+        mov rax, 0xFFFFEA3A;             // ELCC_ERR_BUDGET_EXHAUSTED
+        ret;
+
+      elcc_cb_bad_row:
+        mov rax, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
         ret
       }
     }

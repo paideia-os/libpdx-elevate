@@ -70,6 +70,12 @@
   # require's cap (above) and uej_append's write-to-audit-fanout cap
   # (same line elevate_client_journal_req/_apr already declare).
 
++entry elevate_client_require_scoped
+  KIND_ELEVATE_CHANNEL(revoke, row_id)
+  # ENH-003 (#15): elevate_client_require plus a scope match and a budget
+  # consume, both pure shadow-map reads/writes with no additional cap
+  # beyond what elevate_client_require itself already needs.
+
 +entry elevate_client_acquire
   KIND_IPC_ENDPOINT(read, "svc.elevate-broker")
   KIND_IPC_ENDPOINT(mint,  reply)

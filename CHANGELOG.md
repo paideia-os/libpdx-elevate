@@ -46,6 +46,16 @@ alongside the status-shaped one.
   (`elevate_client_require.pdx`): one audit record per authorized
   per-op use of an acquired handle, making grant amplification (1
   REQ/APR pair, N mutating uses) legible to an auditor.
+- **ENH-003 (#15)** — `elevate_client_require_scoped`
+  (`elevate_client_require.pdx`, `ELCA_ERR_SCOPE_MISMATCH =
+  0xFFFFEA62`) plus new `elevate_client_cap.pdx` shadow bindings:
+  `bind_scope`/`get_scope` (opaque per-handle scope fingerprint) and
+  `bind_budget`/`get_budget_remaining`/`consume_budget`
+  (`ELCC_ERR_BAD_BUDGET = 0xFFFFEA39`, `ELCC_ERR_BUDGET_EXHAUSTED =
+  0xFFFFEA3A`) — a bounded op count per handle, stored as `remaining +
+  1` so exhaustion cannot be mistaken for "never bound". Both bindings
+  are additive over plain `elevate_client_require`; a handle that never
+  binds them behaves exactly as it did before v1.1.0.
 
 ---
 

@@ -42,6 +42,15 @@ existing status-shaped one.
   audit record per AUTHORIZED per-op use. The record count against a
   single REQ/APR pair is the grant-amplification signal the
   enhancement plan calls for (ENH-004 depends on ENH-002).
+- **ENH-003 (#15, LANDED):** `elevate_client_require_scoped`
+  (`elevate_client_require.pdx`) plus new `elevate_client_cap.pdx`
+  primitives (`bind_scope`/`get_scope`, `bind_budget`/
+  `get_budget_remaining`/`consume_budget`) — a handle may optionally be
+  bound to an opaque scope fingerprint and/or a bounded op count, both
+  additive over plain `elevate_client_require`. The budget shadow slot
+  stores `remaining + 1` so exhaustion stays distinguishable from
+  "never bound" (a plain 0-means-unbound encoding would let the
+  (N+1)-th op silently read as unlimited).
 
 ## Milestone rollup
 
