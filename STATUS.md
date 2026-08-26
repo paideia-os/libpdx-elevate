@@ -51,6 +51,21 @@ existing status-shaped one.
   stores `remaining + 1` so exhaustion stays distinguishable from
   "never bound" (a plain 0-means-unbound encoding would let the
   (N+1)-th op silently read as unlimited).
+- **ENH-006 (#17, LANDED, scoped):** `elevate_client_request_ex_ctx`
+  (`elevate_client_send.pdx`) — explicit-context twin of
+  `elevate_client_request_ex` taking `target_fp_lo` + fast/human/
+  explicit timeout via a caller-owned `ctx_buf` instead of the three
+  process-global mutable slots, so concurrent flows in one process do
+  not race. Scoped deliberately: only the core full-flow primitive
+  gets a ctx variant this release; `elevate_client_request_ex_j` /
+  `_ex_r` / `elevate_client_acquire` and the underlying globals
+  themselves are UNCHANGED and remain the right choice for the
+  common single-flow-per-process case. Full singleton retirement
+  (ctx variants threaded all the way through the retry/journal/
+  acquire stack) is deferred to a follow-up once a real concurrent
+  consumer (shell) actually needs it — see the enhancement plan §4's
+  own framing: "worth fixing before shell links, not before shell
+  exists."
 
 ## Milestone rollup
 

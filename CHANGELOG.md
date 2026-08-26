@@ -56,6 +56,16 @@ alongside the status-shaped one.
   1` so exhaustion cannot be mistaken for "never bound". Both bindings
   are additive over plain `elevate_client_require`; a handle that never
   binds them behaves exactly as it did before v1.1.0.
+- **ENH-006 (#17, scoped)** — `elevate_client_request_ex_ctx`
+  (`elevate_client_send.pdx`, `ELVC_ERR_BAD_CTX = 0xFFFFEA06`, `ELVC_CTX_*_OFF`
+  layout constants): explicit-context twin of `elevate_client_request_ex`
+  reading `target_fp_lo` / fast / human / explicit timeout from a
+  caller-owned `ctx_buf` instead of the three process-global mutable
+  slots, so concurrent flows in one process do not race each other.
+  Deliberately scoped to the core primitive only; `_ex_j` / `_ex_r` /
+  `elevate_client_acquire` and the globals themselves are unchanged —
+  full singleton retirement is deferred until a concurrent consumer
+  needs it.
 
 ---
 

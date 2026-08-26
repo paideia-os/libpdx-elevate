@@ -91,6 +91,7 @@ validation, and the M2 full-flow entry point.
 | `elevate_client_recv_reply(reply_ep_id, reply_buf, timeout_ns) -> u64 !{mem} @{boot}` | Bounded poll of `endpoint_take_pending` against an `hpet_now_ns` deadline; validates op == APR and `expire_ns != 0`. |
 | `elevate_client_check_grant(reply_buf, requested_caps) -> u64 !{mem} @{}` | `(granted & requested) == granted`; mirror of kernel `elv_check_grant`. |
 | `elevate_client_request_ex(caps, dur, req_buf, reply_ep_id, reply_buf, timeout_ns) -> u64 !{mem} @{boot}` | Full M2 flow: policy consult → REQ assemble → broker lookup → send → recv → grant-subset check. `timeout_ns == 0` selects fast/human by policy classification. |
+| `elevate_client_request_ex_ctx(caps, dur, req_buf, reply_ep_id, reply_buf, ctx_buf) -> u64 !{mem} @{boot}` | ENH-006: explicit-context twin of `elevate_client_request_ex` — reads `target_fp_lo` / fast / human / explicit-timeout from a caller-owned 32-byte `ctx_buf` instead of the process-global singletons, so concurrent flows in one process (e.g. a shell brokering several jobs) do not race each other. `ELVC_ERR_BAD_CTX` if `ctx_buf == 0`. |
 
 ### `src/elevate_client_acquire.pdx` — module `ElevateClientAcquire`
 

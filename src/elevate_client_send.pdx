@@ -67,6 +67,7 @@
 //   0xFFFFEA03  ELVC_ERR_GRANT_INVALID -- granted caps not a subset of requested
 //   0xFFFFEA04  ELVC_ERR_BAD_EXPIRE    -- reply expire_ns is 0 or in the past
 //   0xFFFFEA05  ELVC_ERR_BAD_REPLY_EP  -- reply_ep_id out of [1..127]
+//   0xFFFFEA06  ELVC_ERR_BAD_CTX       -- ENH-006 (#17): ctx_buf is 0
 //   0xFFFFEA0C  ELVC_ERR_RECV_FAIL     -- endpoint_take_pending refused
 //                                          (kept as M1-reserved alias for parity)
 //   0xFFFFEA0D  ELVC_ERR_SEND_FAIL     -- endpoint_write_pending refused
@@ -81,6 +82,7 @@ module ElevateClientSend = structure {
   pub let ELVC_ERR_GRANT_INVALID  : u64 = 0xFFFFEA03
   pub let ELVC_ERR_BAD_EXPIRE     : u64 = 0xFFFFEA04
   pub let ELVC_ERR_BAD_REPLY_EP   : u64 = 0xFFFFEA05
+  pub let ELVC_ERR_BAD_CTX        : u64 = 0xFFFFEA06
 
   // ---- Default timeouts ----
   //
@@ -696,6 +698,206 @@ module ElevateClientSend = structure {
       elcs_rx_send_fail:
         mov rax, 0xFFFFEA0D;             // ELVC_ERR_SEND_FAIL
         jmp elcs_rx_out
+      }
+    }
+
+  // ==========================================================================
+  // ELVC_CTX_* -- byte offsets into the explicit-context buffer
+  // consumed by elevate_client_request_ex_ctx (ENH-006, #17).
+  // ==========================================================================
+  //
+  // 32 bytes, four u64 words. Every field is "0 = use the constant
+  // default", exactly the convention _elevate_client_human_timeout_ns
+  // / _elevate_client_fast_timeout_ns already use for THEIR mutable
+  // globals -- the difference is that these values live in a buffer
+  // the CALLER owns per call, so two callers running concurrently each
+  // supply their own without touching any process-wide state.
+  //
+  //   [+0]  target_fp_lo        -- explicit replacement for the
+  //                                 _elevate_client_target_fp_lo global
+  //   [+8]  fast_timeout_ns     -- 0 = ELVC_FAST_TIMEOUT_DEFAULT_NS
+  //   [+16] human_timeout_ns    -- 0 = ELVC_HUMAN_TIMEOUT_DEFAULT_NS
+  //   [+24] explicit_timeout_ns -- 0 = auto-select fast/human by policy
+  //                                 classification (same semantics as
+  //                                 elevate_client_request_ex's
+  //                                 timeout_ns == 0); non-zero uses it
+  //                                 directly regardless of the policy
+  //                                 hit/miss classification (the
+  //                                 consult still runs, for accounting)
+
+  pub let ELVC_CTX_TARGET_FP_LO_OFF     : u64 = 0
+  pub let ELVC_CTX_FAST_TIMEOUT_OFF     : u64 = 8
+  pub let ELVC_CTX_HUMAN_TIMEOUT_OFF    : u64 = 16
+  pub let ELVC_CTX_EXPLICIT_TIMEOUT_OFF : u64 = 24
+
+  // ==========================================================================
+  // elevate_client_request_ex_ctx(caps, dur, req_buf, reply_ep_id,
+  //                               reply_buf, ctx_buf) -> ELVC_*
+  //
+  // ENH-006 (#17).  BYTE-FOR-BYTE the same flow as elevate_client_
+  // request_ex (policy consult -> REQ assemble -> broker lookup ->
+  // send -> recv -> grant-subset check), with ONE difference: every
+  // value that flow reads from a process-global mutable slot
+  // (_elevate_client_target_fp_lo, _elevate_client_fast_timeout_ns,
+  // _elevate_client_human_timeout_ns) is instead read from the
+  // caller-owned ctx_buf (layout above). elevate_client_request_ex
+  // itself is UNCHANGED and remains the simpler call for a single-
+  // threaded-of-intent process; this variant exists for a process
+  // brokering several CONCURRENT elevate flows under different
+  // identities or timeout policies (shell managing several jobs is
+  // the motivating case in the enhancement plan) -- those globals
+  // would otherwise race between the flows.
+  //
+  // This does NOT retire elevate_client_request_ex, its policy/timeout
+  // getters, or their backing globals: those remain the right choice
+  // for the overwhelmingly common single-flow-per-process case, and
+  // retiring them outright would be a second source break with no
+  // safety benefit for that case. "Explicit-context variants" is the
+  // scoped fix; full singleton retirement is deferred (see STATUS.md).
+  //
+  // Register plan mirrors elevate_client_request_ex with one swap:
+  // rbx holds ctx_buf from entry through the timeout resolution below
+  // (the ORIGINAL function leaves rbx untouched over that exact same
+  // window, only writing it at step 3 with the resolved broker_ep_id
+  // -- so reusing rbx for ctx_buf costs nothing and needs no extra
+  // stack slot). dur is stashed at [rsp+0], same as the original.
+  //
+  //   rbx = ctx_buf, then (from step 3 on) broker_ep_id
+  //   r12 = caps
+  //   r13 = req_buf
+  //   r14 = reply_buf
+  //   r15 = reply_ep_id
+  //   rbp = effective_timeout_ns
+  //   [rsp + 0] = dur (stash)
+  //
+  // Six callee-save pushes + one 8-byte alignment pad = 56 bytes;
+  // entry rsp%16==8 -> (8-56) mod 16 == 0 across every nested call --
+  // identical shape to elevate_client_request_ex.
+  // ==========================================================================
+
+  pub let elevate_client_request_ex_ctx : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{boot} =
+    fn (caps: u64) (dur: u64) (req_buf: u64) (reply_ep_id: u64) (reply_buf: u64) (ctx_buf: u64) -> unsafe {
+      effects: {mem}, capabilities: {boot},
+      justification: "libpdx-elevate.ENH-006 (#17): explicit-context twin of elevate_client_request_ex. rbx holds ctx_buf from entry through the timeout-resolution block, then is overwritten with broker_ep_id at step 3 -- the ORIGINAL function leaves rbx untouched over that exact window (it is only written at step 3), so this reuse costs no extra callee-save slot and keeps the identical 56-byte / (8-56) mod 16 == 0 alignment shape. Every read that the original takes from a process-global (_elevate_client_target_fp_lo, _elevate_client_fast_timeout_ns via its getter, _elevate_client_human_timeout_ns via its getter) is replaced here with a direct load from ctx_buf at the ELVC_CTX_*_OFF offsets, with the SAME 0-means-default substitution the getters perform, just inlined instead of calling them (calling them would defeat the point -- they read the globals this variant exists to avoid touching). ctx_buf == 0 is gated up front as ELVC_ERR_BAD_CTX, mirroring elevate_client_acquire's mint_ctx_buf gate. Steps 2 onward (assemble, lookup, send, recv, check_grant) are copied verbatim from elevate_client_request_ex with only the label prefix changed to avoid collision. Labels prefixed elcx_rx_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;                      // align + stash slot for dur at [rsp + 0]
+
+        cmp r9, 0;
+        je  elcx_rx_bad_ctx;
+
+        mov r12, rdi;                    // caps
+        mov [rsp + 0], rsi;              // dur -> stash
+        mov r13, rdx;                    // req_buf
+        mov r15, rcx;                    // reply_ep_id
+        mov r14, r8;                     // reply_buf
+        mov rbx, r9;                     // ctx_buf
+
+        // ---- Step 1: policy consult (accounting + timeout selection) ----
+        mov rdi, [rbx + 0];              // target_fp_lo (ctx, not global)
+        mov rsi, r12;                    // caps
+        mov rdx, [rsp + 0];              // dur (from stash)
+        call elevate_client_policy_check;
+        mov r10, 0xFFFFEA12;             // ELCP_ERR_NO_MATCH
+        cmp rax, r10;
+        je  elcx_rx_policy_miss;
+
+        // Policy HIT.  Bump the rate on the row (rax = idx).
+        mov rdi, rax;
+        call elevate_client_policy_hit;
+
+        mov rax, [rbx + 24];             // explicit_timeout_ns (ctx)
+        cmp rax, 0;
+        jne elcx_rx_have_timeout;
+        mov rax, [rbx + 8];              // fast_timeout_ns (ctx)
+        cmp rax, 0;
+        jne elcx_rx_have_timeout;
+        mov rax, 500000000;              // ELVC_FAST_TIMEOUT_DEFAULT_NS
+        jmp elcx_rx_have_timeout;
+
+      elcx_rx_policy_miss:
+        mov rax, [rbx + 24];             // explicit_timeout_ns (ctx)
+        cmp rax, 0;
+        jne elcx_rx_have_timeout;
+        mov rax, [rbx + 16];             // human_timeout_ns (ctx)
+        cmp rax, 0;
+        jne elcx_rx_have_timeout;
+        mov rax, 30000000000;            // ELVC_HUMAN_TIMEOUT_DEFAULT_NS
+
+      elcx_rx_have_timeout:
+        mov rbp, rax;                    // effective_timeout_ns
+
+        // ---- Step 2: assemble REQ frame ----
+        mov rdi, r13;                    // req_buf
+        mov rsi, r12;                    // caps
+        mov rdx, [rsp + 0];              // dur (from stash)
+        call elevate_request_write_frame;
+        cmp rax, 0;
+        jne elcx_rx_pack_fail;
+
+        // ---- Step 3: resolve broker endpoint (rbx repurposed) ----
+        call elevate_client_lookup_broker;
+        mov r10, 0xFFFFFFFFFFFFFFFF;     // SVC_LOOKUP_NONE
+        cmp rax, r10;
+        je  elcx_rx_lookup_fail;
+        mov rbx, rax;                    // rbx <- broker_ep_id (ctx_buf no longer needed)
+
+        // ---- Step 4: send REQ ----
+        mov rdi, rbx;                    // broker_ep_id
+        mov rsi, r15;                    // reply_ep_id
+        mov rdx, r13;                    // req_buf
+        call elevate_client_send_req;
+        cmp rax, 0;
+        jne elcx_rx_send_fail;
+
+        // ---- Step 5: recv APR with timeout ----
+        mov rdi, r15;                    // reply_ep_id
+        mov rsi, r14;                    // reply_buf
+        mov rdx, rbp;                    // effective timeout
+        call elevate_client_recv_reply;
+        cmp rax, 0;
+        jne elcx_rx_out;                 // TIMEOUT / BAD_REPLY / BAD_EXPIRE pass through
+
+        // ---- Step 6: validate grant subset ----
+        mov rdi, r14;                    // reply_buf
+        mov rsi, r12;                    // requested caps
+        call elevate_client_check_grant;
+
+      elcx_rx_out:
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcx_rx_pack_fail:
+        mov rax, 0xFFFFEA0E;             // ELVC_ERR_PACK_FAIL
+        jmp elcx_rx_out;
+      elcx_rx_lookup_fail:
+        mov rax, 0xFFFFEA0F;             // ELVC_ERR_LOOKUP_FAIL
+        jmp elcx_rx_out;
+      elcx_rx_send_fail:
+        mov rax, 0xFFFFEA0D;             // ELVC_ERR_SEND_FAIL
+        jmp elcx_rx_out;
+
+      elcx_rx_bad_ctx:
+        mov rax, 0xFFFFEA06;             // ELVC_ERR_BAD_CTX
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
       }
     }
 }

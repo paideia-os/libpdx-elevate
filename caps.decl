@@ -76,6 +76,16 @@
   # consume, both pure shadow-map reads/writes with no additional cap
   # beyond what elevate_client_require itself already needs.
 
++entry elevate_client_request_ex_ctx
+  KIND_IPC_ENDPOINT(read, "svc.elevate-broker")
+  KIND_IPC_ENDPOINT(mint,  reply)
+  KIND_IPC_ENDPOINT(write, broker_ep_id)
+  KIND_IPC_ENDPOINT(read,  reply_ep_id)
+  # ENH-006 (#17): explicit-context twin of elevate_client_request_ex. Same
+  # cap set as that entry -- only the source of target_fp_lo/timeouts
+  # differs (a caller-owned ctx_buf instead of process globals), which
+  # carries no capability implications.
+
 +entry elevate_client_acquire
   KIND_IPC_ENDPOINT(read, "svc.elevate-broker")
   KIND_IPC_ENDPOINT(mint,  reply)
