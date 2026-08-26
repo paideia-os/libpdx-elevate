@@ -2,14 +2,15 @@
 
 **Wave:** R49 shared library
 **Current milestone:** M5 (signed 1.0 release) — complete; M6
-(enhancement wave, v1.1.0) in progress
-**Version:** 1.0.0 (2026-08-22), v1.1.0 hardening underway
+(enhancement wave, v1.1.0) — complete, unreleased (no signed tag cut yet)
+**Version:** 1.0.0 (2026-08-22) tagged; v1.1.0 hardening landed on
+`main`, tag/signing pending a release pass
 
 See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full
 M1–M5 breakdown, and `.plans/enhancement-plan.md` for the M6
 (post-1.0.0) rationale.
 
-## M6 — enhancement wave (in progress)
+## M6 — enhancement wave (complete)
 
 Filed 2026-08-25 from the org-wide 14-repo enhancement audit
 (`.plans/enhancement-plan.md`).  The audit's finding: the 1.0.0
@@ -391,13 +392,52 @@ target client-side state machines that stand up without a live APR.
 - Actual mirror push (blocked on `pkgs.paideia-os` mirror repo
   existing).  Runbook is ready.
 
+## M6 close-out (ENH-007, #14)
+
+All seven M6 issues (#11–#17) are LANDED as of this pass. What v1.1.0
+adds, in one place:
+
+| Issue | Landed |
+| --- | --- |
+| ENH-005 (#12) | `elevate_client_request` → `elevate_client_request_norealize`; `ELVC_STUB` → `ELVC_NOT_DISPATCHED`. Source-breaking, intentional. |
+| ENH-001 (#11) | `elevate_client_acquire` — composed flow returning a `row_id` handle. |
+| ENH-002 (#13) | `elevate_client_require` — cheap per-op re-assert, no broker hop. |
+| ENH-004 (#16) | `elevate_client_journal_op` / `elevate_client_require_j` — per-op audit trail. |
+| ENH-003 (#15) | `elevate_client_require_scoped` — opaque scope + exhaustible op budget on a handle. |
+| ENH-006 (#17) | `elevate_client_request_ex_ctx` — explicit-context variant of the core primitive (scoped; not threaded through the whole stack yet). |
+| ENH-007 (#14) | This pass: README/STATUS accuracy — retired the "`ELVC_OK` or `ELVC_STUB` both mean proceed" example, marked `rm`/`pkg` as needing migration, added the v1.1.0 credential-shaped example. |
+
+**What is still true and still deferred** (unchanged by M6, restated
+here so this file does not overclaim): end-to-end enforcement is still
+zero, because the paideia-os broker daemon body
+(`src/kernel/core/ipc/elevate_broker.pdx`, `ELVB_DISPATCH_STUB`) does
+not exist yet — every `_ex`/`_ex_j`/`_ex_r`/`_ctx`/`elevate_client_acquire`
+call can only reach `ELVC_ERR_TIMEOUT` against a live broker today. M6
+hardens the CLIENT-side API contract (unambiguous discrimination,
+credential-shaped handles, auditable per-op amplification) so that
+once the broker daemon lands, callers built against this surface are
+already structurally correct rather than needing a second migration.
+Also unchanged: the two libpdx-cap.M2 / libpdx-audit.M2 forward
+references in `deps.list`, and the process-global singletons
+`elevate_client_request_ex_ctx` provides an escape hatch from but does
+not retire.
+
 ## Next
 
 Downstream: pkg.M3 wires libpdx-elevate as one of its dual-signed
 deps.  When pkg.M4 closes and pkg.M5-001 opens, the mirror-push
-runbook above fires against `pkgs.paideia-os/staging`.
+runbook above fires against `pkgs.paideia-os/staging` — now for a
+v1.1.0 tag once one is cut (`manifest.pdxsig` / `caps.decl` /
+`deps.list` reflect the M6 entry points already; the signed tag itself
+is a separate release step not run by this pass).
 
-Followup: v1.1.0 lands the two PENDING dep swaps (libpdx-cap
+Followup: v1.1.0+ lands the two PENDING dep swaps (libpdx-cap
 `cap_narrow_rights` + libpdx-audit `audit_begin`/`_record_output`/
 `_commit`) once libpdx-cap.M2 and libpdx-audit.M2 close.  Entry-point
 signatures unchanged; only status codes retire (`ELCC_NOTE_NO_NARROW`).
+
+Also open: `rm` and `pkg` migrating off the retired
+`elevate_client_request` name (ENH-005, their own repos/issues); full
+singleton retirement across `_ex_j` / `_ex_r` / `elevate_client_acquire`
+if/when shell (or another concurrent consumer) actually links this
+library (ENH-006 follow-up).

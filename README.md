@@ -225,33 +225,45 @@ be built), `ELVC_*` `0xFFFFEA00..0F` (transport), `ELCP_ERR_*`
 
 ## Callers
 
-- **[rm](https://github.com/paideia-os/rm)** — *verified.*
-  `src/elevate.pdx` (`RmElevate`, rm.M3-004) calls
-  `elevate_client_request` for `/system/` and cross-subtree targets, and
-  treats `ELVC_OK` or `ELVC_STUB` as proceed, anything else as blocked.
-- **[pkg](https://github.com/paideia-os/pkg)** — *verified.*
-  `src/pkg_elevate.pdx` (`pkg_elevate_request_pdxfs_write_pkgs`,
-  pkg.M3-004) calls `elevate_client_request` with `caps = 0x01` and a
-  60 s duration, stashing the raw `ELVC_*` return for diagnostics.
+- **[rm](https://github.com/paideia-os/rm)** — *needs migration.* As of
+  the last verification pass, `src/elevate.pdx` (`RmElevate`,
+  rm.M3-004) called `elevate_client_request` for `/system/` and
+  cross-subtree targets and treated `ELVC_OK` **or** `ELVC_STUB` as
+  proceed. That name no longer exists (ENH-005, #12): `rm`'s build
+  breaks until it migrates to `elevate_client_request_ex` /
+  `elevate_client_acquire` (recommended — see the example below) or,
+  if it genuinely only wants the non-dispatching probe,
+  `elevate_client_request_norealize`. Tracked in rm's own repo per the
+  enhancement plan §6, not here.
+- **[pkg](https://github.com/paideia-os/pkg)** — *needs migration
+  (name only).* `src/pkg_elevate.pdx`
+  (`pkg_elevate_request_pdxfs_write_pkgs`, pkg.M3-004) called
+  `elevate_client_request` with `caps = 0x01` and a 60 s duration,
+  stashing the raw `ELVC_*` return for diagnostics — already
+  fail-closed (every non-zero return, `ELVC_STUB` included, routed to
+  `pi_err_parent`), so only the renamed call site needs updating, not
+  the disposition logic. Tracked in pkg's own repo.
 - **[shell](https://github.com/paideia-os/shell)** — *likely caller
-  (self-described elevate-integrated).* At HEAD, `src/broker_bind.pdx`
-  names `svc.elevate-broker` in its service list, and `src/shell.pdx`,
-  `src/exec.pdx`, `src/session.pdx` mirror this library's constants and
-  idioms (`SH_KIND_ELEVATE_CHANNEL = 0x191`, the `ELVC_STUB` return
-  convention). No direct call into a `libpdx-elevate` entry point was
-  found in the shell sources.
+  (self-described elevate-integrated), still not linked.* At HEAD,
+  `src/broker_bind.pdx` names `svc.elevate-broker` in its service
+  list, and `src/shell.pdx`, `src/exec.pdx`, `src/session.pdx` mirror
+  this library's constants and idioms (`SH_KIND_ELEVATE_CHANNEL =
+  0x191`, and shell minted its own `*_STUB`-is-the-happy-path
+  sentinels from the pre-ENH-005 convention — worth revisiting once
+  shell actually links this library, per the enhancement plan §4). No
+  direct call into a `libpdx-elevate` entry point was found in the
+  shell sources; `elevate_client_request_ex_ctx` (ENH-006, #17) exists
+  for exactly this caller's eventual multi-job concurrency need.
+
+**What "verified" means above:** confirmed against each repo's source
+at the enhancement audit's timestamp (2026-08-25). A caller repo's own
+issue tracker is authoritative for whether it has migrated since.
 
 ## Version
 
 **v1.0.0** — R49 shared library, first signed release (2026-08-22). M1–M5
-closed. `CHANGELOG.md` carries the per-milestone 1.0.0 entry and
-`STATUS.md` the milestone rollup. `caps.decl` declares the floor
-capability set a *consuming process* must hold per entry point.
-`deps.list` records the two forward references — `libpdx-cap >= 0.2.0`
-(the `elevate_client_cap_narrow_stub` swap) and `libpdx-audit >= 0.3.0`
-(the `journal_req` / `_apr` swap) — both wired to kernel primitives
-today, both source-compatible when they land. `manifest.pdxsig` is the
-dual-signed release manifest, its signature blocks carrying the
+closed. `manifest.pdxsig` is the dual-signed release manifest for THIS
+tag, its signature blocks carrying the
 `<MLDSA65-SIG:STUB-PENDING-V0.33-CRYPTO-KDF>` sentinel until the
 toolchain crypto tag is reachable. `doc/libpdx-elevate.pdxdoc` is the I7
 reference, with a §POSIX DIFFERENCES five-axis contrast against `sudo` /
@@ -259,25 +271,60 @@ reference, with a §POSIX DIFFERENCES five-axis contrast against `sudo` /
 `design/tooling/r49-r50-plan.md` §5.14 in
 [paideia-os](https://github.com/paideia-os/paideia-os).
 
+**v1.1.0 (in progress, unreleased)** — the post-1.0.0 hardening wave
+(`.plans/enhancement-plan.md`), issues #11–#17. The 1.0.0 client half
+was defensible as a *protocol helper* but not as *the elevate gate*:
+its one entry point every real caller reached for
+(`elevate_client_request`) never dispatched, and the library's own
+docs sanctioned reading its return either way. v1.1.0 adds a
+credential-shaped surface (`elevate_client_acquire` →
+`elevate_client_require[_scoped|_j]`) alongside the pre-existing
+status-shaped one (`elevate_client_request_ex[_j|_r|_ctx]`), retires
+the ambiguous stub name, and makes grant amplification auditable. See
+`STATUS.md`'s M6 section for the full per-issue breakdown and what
+remains explicitly deferred (kernel broker daemon body, full
+singleton retirement, libpdx-cap.M2 / libpdx-audit.M2 swaps).
+`CHANGELOG.md` carries the running Unreleased entry; `caps.decl` and
+`deps.list` are updated per-entry-point as each issue lands, but the
+NEXT signed manifest/tag is a separate release step (`.plans/
+mirror-push.md`) not yet run.
+
 ## Examples
 
-**Minimal request (M1 surface, as `rm` uses it).** Two 32-byte scratch
-buffers, one call; `ELVC_OK` or `ELVC_STUB` both mean proceed.
+**A credential-shaped grant, not a status to misread (v1.1.0,
+recommended for any new caller — ENH-001/002).** One call assembles,
+sends, journals-with-retry, mints, and shadow-binds; the return is
+either a `row_id` handle (`< 16`) or an error — never a sentinel that
+could be misread as "proceed" the way the retired `ELVC_STUB` was (see
+`elevate_client.pdx`'s WHY THE RENAME note). The privileged operation
+then re-asserts the SAME handle before every mutating step, so omitting
+the gate is a missing argument, not a skipped `cmp`.
 
 ```
-mov rdi, 0;                        // caps
-mov rsi, 0;                        // dur
-lea rdx, [rip + _elevate_req_buf];
-lea rcx, [rip + _elevate_reply_buf];
-call elevate_client_request;
-cmp rax, 0;                        // ELVC_OK -> proceed
-je  proceed;
-mov r10, 0xFFFFEA00;               // ELVC_STUB -> proceed
-cmp rax, r10;
-je  proceed;                       // anything else: blocked
+mov rdi, 0x01;                     // caps
+mov rsi, 60000000000;              // dur = 60 s
+lea rdx, [rip + _req_buf];         // 32-byte scratch
+mov rcx, 7;                        // reply_ep_id, must be in [1..127]
+lea r8,  [rip + _reply_buf];       // 32-byte scratch
+lea r9,  [rip + _mint_ctx];        // 40-byte: parent_ep_slot, request_id,
+                                    // requester_pid, target_cap_kind,
+                                    // target_cap_rights
+call elevate_client_acquire;
+cmp rax, 16;                       // row_id always < 16; every error >= 0xFFFFEA00
+jae handle_error;
+mov r13, rax;                      // r13 = row_id (the HANDLE)
+
+// ... later, once per mutating step of the privileged operation:
+mov rdi, r13;                      // row_id
+mov rsi, 0x01;                     // needed_caps for THIS step
+call elevate_client_require;       // no broker hop -- one clock read
+cmp rax, 0;                        // ELCA_OK -> proceed with this step
+jne handle_refused;                // ELCA_ERR_EXPIRED / _CAPS_INSUFFICIENT
 ```
 
-**Full flow with a seeded fast path (M2).** Seed the client policy with
+**The lower-level status-shaped surface `elevate_client_acquire` is
+built on (M2) still exists** for a caller that only wants a validated
+APR and no handle/mint. Seed the client policy with
 the same rule the founder signed into the kernel table, bind the caller
 identity, then let `timeout_ns = 0` pick the deadline by classification.
 

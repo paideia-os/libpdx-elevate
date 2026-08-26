@@ -8,13 +8,19 @@ covers.
 
 ---
 
-## Unreleased — v1.1.0 in progress — hardening the elevate gate
+## Unreleased — v1.1.0 (M6 hardening wave complete, no signed tag yet)
 
-Post-1.0.0 enhancement wave (`.plans/enhancement-plan.md`).  The
-1.0.0 client half was complete but advisory-only: nothing forced a
-consumer to present a grant before performing the privileged
-operation it gated.  v1.1.0 adds a credential-shaped surface
-alongside the status-shaped one.
+Post-1.0.0 enhancement wave (`.plans/enhancement-plan.md`), issues
+#11–#17, all LANDED on `main`.  The 1.0.0 client half was complete
+but advisory-only: nothing forced a consumer to present a grant
+before performing the privileged operation it gated, and its one
+real entry point never dispatched.  v1.1.0 adds a credential-shaped
+surface alongside the status-shaped one and retires the ambiguous
+stub name.  See `STATUS.md`'s M6 close-out for the full table and
+what remains explicitly deferred (kernel broker daemon body, full
+singleton retirement, libpdx-cap.M2 / libpdx-audit.M2 swaps).  Cutting
+the v1.1.0 tag + signed manifest is a separate release step
+(`.plans/mirror-push.md`), not part of this wave.
 
 - **ENH-005 (#12)** — `elevate_client_request` **renamed** to
   `elevate_client_request_norealize` (`elevate_client.pdx`); the old
@@ -66,6 +72,15 @@ alongside the status-shaped one.
   `elevate_client_acquire` and the globals themselves are unchanged —
   full singleton retirement is deferred until a concurrent consumer
   needs it.
+- **ENH-007 (#14)** — README/STATUS enforcement-status accuracy pass.
+  Retired the README example claiming `ELVC_OK` or `ELVC_STUB` "both
+  mean proceed" (the exact bug ENH-005 fixed) in favor of the
+  `elevate_client_acquire` + `elevate_client_require` credential-shaped
+  pattern. Marked `rm` as needing migration off the renamed entry point
+  and `pkg` as needing only the name update. Added a `v1.1.0` section
+  to the README's Version block and an M6 close-out table to
+  `STATUS.md` stating plainly what changed and what is still deferred
+  (broker daemon body, full singleton retirement, pending dep swaps).
 
 ---
 
