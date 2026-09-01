@@ -168,6 +168,25 @@ Bounded retry-with-backoff over the audit-wrapped flow.
 | `elevate_client_retry_delay(dur_ns) -> () !{mem} @{boot}` | Bounded busy-poll on `hpet_now_ns`; collapses to a no-op when the clock is unarmed. |
 | `elevate_client_request_ex_r(caps, dur, req_buf, reply_ep_id, reply_buf, timeout_ns) -> u64 !{mem} @{boot}` | Retry-wrapped full flow. Retriable set is exactly `{ELVC_ERR_TIMEOUT, ELVC_ERR_SEND_FAIL, ELVC_ERR_LOOKUP_FAIL}`; everything else passes through. Exhaustion returns `ELVR_ERR_EXHAUSTED`. |
 
+### `src/elevate_client_outcome.pdx` — module `ElevateClientOutcome`
+
+Client-side ALLOW / DENY / TIMEOUT reconciliation (R90-XREPO.011.M1-006,
+#18). Reduces the open-ended `ELV*_ERR_*` taxonomy the transport /
+retry layers speak in to the three variants a consumer gating a
+privileged operation must act on. Applies the org-wide fail-closed
+policy (paideia-os#2121, `.011.M1-007`) at the client boundary: only
+`ELVC_OK` surfaces as `ELVC_OUTCOME_ALLOW`, only `ELVC_ERR_TIMEOUT` and
+`ELVR_ERR_EXHAUSTED` surface as `ELVC_OUTCOME_TIMEOUT`, and every other
+status — broker DENY (whichever `ELVC_ERR_*` shape the wire encodes it
+as: `_BAD_EXPIRE` for `granted=0`/`expire=0`, `_GRANT_INVALID` for
+subset failure, `_BAD_REPLY` for a non-APR op), packer / journal /
+policy failures, unknown values — folds to `ELVC_OUTCOME_DENY`.
+
+| Signature | Purpose |
+| --- | --- |
+| `elevate_client_classify_outcome(status) -> u64 !{} @{}` | Pure reduction. `0` → `ALLOW (0)`, `ELVC_ERR_TIMEOUT` or `ELVR_ERR_EXHAUSTED` → `TIMEOUT (2)`, anything else → `DENY (1)`. Leaf; no memory touched. |
+| `elevate_client_request_outcome(caps, dur, req_buf, reply_ep_id, reply_buf, timeout_ns) -> u64 !{mem} @{boot}` | Convenience composition: `elevate_client_request_ex` + `classify_outcome`. A caller who wants retry composes `classify_outcome` over `elevate_client_request_ex_r` directly (two-CALL idiom). |
+
 ## Schemas exposed
 
 **REQ payload — 32 bytes** (`ElevateRequest`, mirror of the kernel
@@ -222,6 +241,15 @@ be built), `ELVC_*` `0xFFFFEA00..0F` (transport), `ELCP_ERR_*`
 `0xFFFFEA10..1F` (client policy), `ELVR_ERR_*` `0xFFFFEA20..2F` (retry),
 `ELCC_*` `0xFFFFEA30..3F` (cap lifecycle), `ELVJ_ERR_*` `0xFFFFEA40..4F`
 (journal). `0` is success in every band.
+
+**Outcome enum** (`ElevateClientOutcome`, R90-XREPO.011.M1-006) — a
+separate three-valued namespace, distinct from every `ELV*_ERR_*` band
+above. `ELVC_OUTCOME_ALLOW = 0` (matches `ELVC_OK`), `ELVC_OUTCOME_DENY
+= 1`, `ELVC_OUTCOME_TIMEOUT = 2`. None collide with any status-band
+value (all ≥ `0xFFFFEA00`), so a caller that accidentally passes an
+`OUTCOME_*` value back into a status-shaped entry point trips a
+bounded-value check somewhere down-chain rather than silently
+proceeding.
 
 ## Callers
 

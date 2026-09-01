@@ -1,0 +1,233 @@
+// src/elevate_client_outcome.pdx -- libpdx-elevate.R90-XREPO.011.M1-006
+//                                    (paideia-os/libpdx-elevate#18)
+//
+// Client-side ALLOW / DENY / TIMEOUT reconciliation.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Every entry point in this library returns a status from a band-
+// specific error taxonomy: `ELVC_*` for transport, `ELVR_*` for retry,
+// `ELCC_*` for the cap lifecycle, `ELVJ_*` for the audit journal,
+// `ELCP_*` for the cached policy, `ELV_*` for the packer, `ELCA_*` for
+// the composed acquire flow.  That is exactly the right shape when the
+// caller wants to know WHICH LAYER refused -- and every entry point
+// above this file gives that answer, unchanged.
+//
+// It is the wrong shape as the SECURITY DISPOSITION a consumer must
+// act on.  A consumer gating a privileged operation has to reduce every
+// possible non-zero status to one of three questions -- "did the broker
+// approve?", "did the broker deny?", "did we never hear back?" -- and
+// the pre-.011 shape of this library forced every caller to invent
+// that reduction on its own.  Two consumers (`rm` and `pkg`, per the
+// enhancement plan's post-1.0.0 audit) already reached OPPOSITE
+// dispositions from the SAME status when they wrote that reduction
+// independently.  ENH-005 (#12) fixed the specific ambiguous sentinel
+// (`ELVC_STUB` -> `ELVC_NOT_DISPATCHED`); this file fixes the shape.
+//
+// The .011 wave landed the last kernel-side blockers to a real broker
+// disposition (paideia-os#2117 sched_wait, #2118 elevate_channel_
+// row_set_expire, #2119 /system/policy format + seed, #2121 fail-closed
+// policy, #2122 broker daemon dispatch body).  Once those are live the
+// broker returns REAL DENY frames as well as REAL APPROVE frames; the
+// TIMEOUT branch remains reachable when the broker itself is not
+// available (unregistered, saturated, sched-blocked past deadline).
+// This file lets a consumer read the outcome of an elevate hop as one
+// of those three variants directly, without knowing the ELVC_/ELVR_/
+// ELCC_ taxonomy the transport layer speaks in.
+//
+// =============================================================================
+// FAIL-CLOSED CLASSIFICATION (.011.M1-007)
+// =============================================================================
+//
+// The org-wide policy on an unknown or unrecognized broker outcome
+// (paideia-os#2121) is fail-closed: absence of a positive APPROVE is
+// treated as denial.  This file applies that policy at the client
+// boundary so consumers do not have to spell it themselves and cannot
+// forget it on any single branch.  Concretely:
+//
+//   status == ELVC_OK          (0)               -> ELVC_OUTCOME_ALLOW
+//   status == ELVC_ERR_TIMEOUT (0xFFFFEA01)      -> ELVC_OUTCOME_TIMEOUT
+//   status == ELVR_ERR_EXHAUSTED (0xFFFFEA20)    -> ELVC_OUTCOME_TIMEOUT
+//   every other value                            -> ELVC_OUTCOME_DENY
+//
+// The two TIMEOUT-mapped codes are the ONLY inputs that a fail-closed
+// policy can safely surface as "we did not hear from the broker": one
+// is the transport-layer deadline (elevate_client_recv_reply), the
+// other is the retry wrapper giving up after exhausting its attempts
+// on the retriable subset {ELVC_ERR_TIMEOUT, ELVC_ERR_SEND_FAIL,
+// ELVC_ERR_LOOKUP_FAIL}.  ELVR_ERR_EXHAUSTED includes the
+// SEND_FAIL / LOOKUP_FAIL cases by construction (the wrapper only
+// retries the retriable set), so the caller still learns "the broker
+// was unreachable" from a TIMEOUT variant without having to inspect
+// the sub-taxonomy.
+//
+// A broker DENY reaches this classifier through whichever ELVC_ERR_*
+// the recv path emits for the actual DENY wire shape (an APR with
+// granted_caps == 0 arrives as ELVC_ERR_BAD_EXPIRE from
+// elevate_client_recv_reply's expire_ns > 0 gate; an APR whose
+// granted mask is not a subset of the requested caps arrives as
+// ELVC_ERR_GRANT_INVALID; a non-APR op arrives as ELVC_ERR_BAD_REPLY).
+// The classifier does not need to enumerate them: every non-OK,
+// non-TIMEOUT status collapses to DENY.  If a future broker adds a
+// dedicated DEN op, this file needs no change; the recv path already
+// refuses non-APR frames.
+//
+// The classifier does NOT re-interpret the numeric OUTCOME_* values as
+// a status band.  0 keeps its "authorized" meaning (matching
+// ELVC_OK), 1 and 2 are enum ordinals in a distinct namespace, and
+// every ELV*_ERR_* value is >= 0xFFFFEA00, so a caller that
+// accidentally passes an OUTCOME_* value back into any status-shaped
+// entry point trips a bounded-value check somewhere down-chain rather
+// than silently proceeding.
+//
+// =============================================================================
+// SURFACE
+// =============================================================================
+//
+//   elevate_client_classify_outcome(status)
+//     -- the pure reduction; the four ELV*_* status values above are
+//        recognized as ALLOW / TIMEOUT explicitly, everything else
+//        (unknown values included) folds to DENY under the fail-closed
+//        policy.  Leaf, no effects, no capabilities.
+//
+//   elevate_client_request_outcome(caps, dur, req_buf, reply_ep_id,
+//                                  reply_buf, timeout_ns)
+//     -- convenience composition: elevate_client_request_ex (M2 full
+//        flow: policy consult, REQ send, APR recv, grant subset check),
+//        then classify_outcome on its return value.  A caller who
+//        wants retry composes classify_outcome over
+//        elevate_client_request_ex_r directly; the reason this file
+//        provides one wrapper and not two is that classify_outcome is
+//        pure, and layering it over any *_ex variant is a two-CALL
+//        idiom the caller can write inline (see the README example).
+//
+// =============================================================================
+// FINGERPRINT: LIBPDX-ELEVATE R90-XREPO.011.M1-006 OUTCOME OK
+// =============================================================================
+//
+// One fingerprint covers every branch of the classifier -- the OK line
+// means each of the three variants was reached from its representative
+// status input and every non-{ALLOW,TIMEOUT} representative sample
+// folded to DENY, which is exactly the fail-closed contract this file
+// exists to enforce.  The test emitter is
+// tests/elevate_client_outcome_test.pdx and its labels prefixed ecow_.
+//
+// =============================================================================
+
+module ElevateClientOutcome = structure {
+
+  // ---- Outcome enum values (distinct from every ELV*_ERR_* band) ----
+  //
+  // Values chosen so the numeric ALLOW is 0 -- the same "0 means
+  // success" convention every other module in this library uses.  DENY
+  // and TIMEOUT are 1 and 2 respectively, both small imm8s so callers
+  // can `cmp rax, 1` / `cmp rax, 2` without staging.  None of the
+  // three collide with any ELV*_ERR_* value (all >= 0xFFFFEA00).
+
+  pub let ELVC_OUTCOME_ALLOW   : u64 = 0
+  pub let ELVC_OUTCOME_DENY    : u64 = 1
+  pub let ELVC_OUTCOME_TIMEOUT : u64 = 2
+
+  // ==========================================================================
+  // elevate_client_classify_outcome(status) -> ELVC_OUTCOME_*
+  //
+  // The pure reduction of any status returned from
+  // elevate_client_request_ex / _ex_ctx / _ex_j / _ex_r into one of
+  // the three variants documented in the file header.  Leaf.  Never
+  // touches memory.
+  //
+  // Recognized inputs:
+  //   0             (ELVC_OK)              -> ALLOW
+  //   0xFFFFEA01    (ELVC_ERR_TIMEOUT)     -> TIMEOUT
+  //   0xFFFFEA20    (ELVR_ERR_EXHAUSTED)   -> TIMEOUT
+  //   every other u64                      -> DENY  (fail-closed)
+  //
+  // The DENY branch is the fail-closed default (.011.M1-007).  Adding
+  // a future dedicated broker outcome (e.g. a DEN op that the recv
+  // path grows a distinct ELVC_ERR_* for) needs no change here -- an
+  // unrecognized status is already DENY.
+  //
+  // Both TIMEOUT-mapped constants exceed imm32 (bit 31 set), so they
+  // are staged in r10 before the compare per the paideia-as
+  // compliance discipline the rest of this library follows.
+  // ==========================================================================
+
+  pub let elevate_client_classify_outcome : (u64) -> u64 !{} @{} =
+    fn (status: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-elevate.R90-XREPO.011.M1-006 (#18): pure reduction of any status from elevate_client_request_ex* / _r into one of ELVC_OUTCOME_ALLOW/DENY/TIMEOUT. Fail-closed per paideia-os#2121 policy: only two positive matches surface as TIMEOUT (ELVC_ERR_TIMEOUT from the transport recv, ELVR_ERR_EXHAUSTED from the retry wrapper -- the latter subsumes SEND_FAIL/LOOKUP_FAIL by construction, since the retry set is exactly {TIMEOUT, SEND_FAIL, LOOKUP_FAIL}); ELVC_OK surfaces as ALLOW; everything else -- broker DENY (whichever ELVC_ERR_* shape the wire encodes it as: BAD_EXPIRE for granted=0/expire=0, GRANT_INVALID for subset failure, BAD_REPLY for non-APR op), packer/journal/policy failures, unknown values -- folds to DENY. Leaf, no callee-save writes, no memory touched. Both TIMEOUT constants (0xFFFFEA01, 0xFFFFEA20) have bit 31 set so imm32 sign-extension would produce the wrong u64; staged in r10 before compare. ELVC_OUTCOME_* values are small imm8s and go straight into rax. Labels prefixed elco_cl_ -- disjoint from every other elc*_ prefix in this library.",
+      block: {
+        cmp rdi, 0;
+        je  elco_cl_allow;
+
+        mov r10, 0xFFFFEA01;             // ELVC_ERR_TIMEOUT
+        cmp rdi, r10;
+        je  elco_cl_timeout;
+
+        mov r10, 0xFFFFEA20;             // ELVR_ERR_EXHAUSTED
+        cmp rdi, r10;
+        je  elco_cl_timeout;
+
+        mov rax, 1;                      // ELVC_OUTCOME_DENY (fail-closed)
+        ret;
+
+      elco_cl_allow:
+        xor rax, rax;                    // ELVC_OUTCOME_ALLOW
+        ret;
+
+      elco_cl_timeout:
+        mov rax, 2;                      // ELVC_OUTCOME_TIMEOUT
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_request_outcome(caps, dur, req_buf, reply_ep_id,
+  //                                reply_buf, timeout_ns) -> ELVC_OUTCOME_*
+  //
+  // Convenience composition: run the full M2 flow
+  // (elevate_client_request_ex -- policy consult, REQ assemble, broker
+  // lookup, send, recv, grant subset check) and reduce its raw ELVC_*
+  // return through classify_outcome so the caller sees only the three
+  // variants.
+  //
+  // All six arguments pass straight through to elevate_client_request_ex
+  // in the same register positions (rdi..r9), so no register moves are
+  // needed before the first CALL.  The second CALL feeds request_ex's
+  // rax into classify_outcome's rdi.  A single 8-byte sub keeps rsp
+  // 16-byte aligned across both CALLs (entry rsp%16 == 8; after the
+  // sub, rsp%16 == 0).
+  //
+  // A consumer who wants the retry wrapper composes classify_outcome
+  // over elevate_client_request_ex_r themselves:
+  //
+  //     call elevate_client_request_ex_r
+  //     mov rdi, rax
+  //     call elevate_client_classify_outcome
+  //
+  // -- the same two-CALL idiom this wrapper uses, over a different
+  // full-flow entry point.  Providing separate wrappers for every
+  // *_ex variant would inflate the surface without adding any
+  // discrimination the pure classifier does not already supply.
+  //
+  // Effects/capabilities inherit unchanged from elevate_client_request_ex.
+  // ==========================================================================
+
+  pub let elevate_client_request_outcome : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{boot} =
+    fn (caps: u64) (dur: u64) (req_buf: u64) (reply_ep_id: u64) (reply_buf: u64) (timeout_ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {boot},
+      justification: "libpdx-elevate.R90-XREPO.011.M1-006 (#18): convenience composition of elevate_client_request_ex + elevate_client_classify_outcome. All six SysV args (rdi=caps, rsi=dur, rdx=req_buf, rcx=reply_ep_id, r8=reply_buf, r9=timeout_ns) are forwarded to elevate_client_request_ex in place, so no callee-save is required to preserve them across the first CALL. The second CALL takes request_ex's rax as classify_outcome's rdi -- no live value spans anything else. `sub rsp, 8` (entry rsp%16 == 8 -> 0 after) is the only stack adjustment; both nested calls see aligned rsp. Effect band {mem} and capability {boot} propagate from elevate_client_request_ex (which pulls them from hpet_now_ns / endpoint_write_pending / endpoint_take_pending down its own chain); classify_outcome contributes nothing (leaf, no effects). Labels prefixed elco_rq_.",
+      block: {
+        sub rsp, 8;                      // align for nested calls
+
+        call elevate_client_request_ex;
+        mov rdi, rax;
+        call elevate_client_classify_outcome;
+
+        add rsp, 8;
+        ret
+      }
+    }
+}

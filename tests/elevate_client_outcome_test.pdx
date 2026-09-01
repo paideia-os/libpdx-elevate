@@ -1,0 +1,283 @@
+// tests/elevate_client_outcome_test.pdx -- libpdx-elevate.R90-XREPO.011.M1-006
+//                                            (paideia-os/libpdx-elevate#18)
+//
+// Client-side ALLOW / DENY / TIMEOUT reconciliation -- classifier witness.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Boot witness for src/elevate_client_outcome.pdx.  The load-bearing
+// claim of #18 is that after the .011 kernel-side wave lands (broker
+// dispatch body + fail-closed policy at paideia-os#2121, #2122), a
+// consumer sees ONE of THREE variants from an elevate hop -- ALLOW,
+// DENY, TIMEOUT -- rather than an open-ended ELV*_ERR_* taxonomy it
+// has to reduce itself.  This witness drives elevate_client_classify_
+// outcome across the full input universe (every ELV*_ERR_* the
+// transport / retry layers can produce, plus a representative
+// unrecognized value) and asserts each folds to the correct enum
+// variant under the fail-closed policy.
+//
+// The classifier is the pure reduction; the composed wrapper
+// elevate_client_request_outcome is a two-CALL sequence over
+// elevate_client_request_ex whose behavior is exactly "run request_ex,
+// then classify its return".  Exercising the wrapper end-to-end here
+// would require a live broker (hpet_now_ns, an endpoint_write_pending
+// implementation, an approver process), none of which are available
+// in this repo's compile-only test harness.  We assert the wrapper
+// EXISTS as a linkable symbol (the build script's --emit elf64 pass
+// over src/elevate_client_outcome.pdx already does that) and drive
+// its reduction step -- the interesting part -- through the
+// classifier directly.
+//
+// Stages drive the three ALLOW / DENY / TIMEOUT branches against
+// representative inputs from each error band this library owns:
+//
+//   (a) status = ELVC_OK (0)                    -> ALLOW
+//   (b) status = ELVC_ERR_TIMEOUT (0xFFFFEA01)  -> TIMEOUT
+//   (c) status = ELVR_ERR_EXHAUSTED (0xFFFFEA20) -> TIMEOUT
+//       -- proves the retry-wrapper's "gave up" surface is treated
+//          the same as the transport-layer deadline.
+//   (d) status = ELVC_ERR_BAD_EXPIRE (0xFFFFEA04) -> DENY
+//       -- the natural landing site for a broker DENY: an APR with
+//          expire_ns == 0 (the wire shape of "not authorized" once
+//          the broker daemon body at paideia-os#2122 lands).
+//   (e) status = ELVC_ERR_GRANT_INVALID (0xFFFFEA03) -> DENY
+//       -- a broker that returns an APR with a granted mask that is
+//          not a subset of the requested caps; the fail-closed policy
+//          refuses regardless of intent.
+//   (f) status = ELVC_ERR_BAD_REPLY (0xFFFFEA02) -> DENY
+//       -- a non-APR op; a broker DEN op would land here today and
+//          the classifier collapses it to DENY without needing to
+//          know the wire form.
+//   (g) status = ELVC_ERR_LOOKUP_FAIL (0xFFFFEA0F) -> DENY
+//       -- a broker that is not registered.  Distinct from TIMEOUT
+//          (the broker WAS reachable but never replied); the failure
+//          mode here is "we could not even find the broker", which
+//          fail-closed treats as denial.
+//   (h) status = ELVC_ERR_SEND_FAIL (0xFFFFEA0D) -> DENY
+//       -- endpoint_write_pending refusal; publish never landed.
+//   (i) status = ELVC_ERR_BAD_BUF (0xFFFFEA0B) -> DENY
+//       -- caller-side buffer violation; not the broker's fault, but
+//          under fail-closed the caller still gets refused.
+//   (j) status = ELVC_ERR_BAD_CTX (0xFFFFEA06) -> DENY
+//       -- explicit-context (ENH-006) variant's missing ctx buffer.
+//   (k) status = ELVJ_ERR_APR_JOURNAL_FAIL (0xFFFFEA42) -> DENY
+//       -- audit-journal failure AFTER a grant; the caller loses the
+//          audit record and must refuse under fail-closed.
+//   (l) status = 0xDEADBEEF -> DENY
+//       -- an unrecognized value; the classifier does not enumerate
+//          every possible input, so the fail-closed default catches
+//          any future band this file has not been updated to know
+//          about.
+//
+// =============================================================================
+// FINGERPRINT: LIBPDX-ELEVATE R90-XREPO.011.M1-006 OUTCOME OK
+// =============================================================================
+//
+// Same string emitted by the module's file header for cross-reference.
+// Labels prefixed ecow_ so this witness's emitter does not overlap
+// eccw_ / ecpw_ / ecqw_ / elvbw_ when they run in the same boot.
+
+module ElevateClientOutcomeTest = structure {
+
+  pub let mut _ecow_stage : u64 = 0
+
+  pub let ecow_ok   : [u8; 43] = "LIBPDX-ELEVATE R90-XREPO.011.M1-006 OK\n\0\0\0\0\0"
+  pub let ecow_fail : [u8; 45] = "LIBPDX-ELEVATE R90-XREPO.011.M1-006 FAIL\n\0\0\0\0\0"
+
+  pub let elevate_client_outcome_witness : () -> u64 !{sysreg, mem} @{boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "libpdx-elevate.R90-XREPO.011.M1-006 (#18): boot witness for the ALLOW/DENY/TIMEOUT classifier. Every stage passes its representative status as an immediate into rdi and asserts rax matches the expected ELVC_OUTCOME_* small value. No live value spans a CALL across stages because each stage reloads its rdi input as a fresh mov before the CALL and records only the stage id in _ecow_stage (memory) for the FAIL path to klog. A bare `sub rsp, 24` reserves the alignment budget the two-push-plus-pad idiom elsewhere in this library uses (24 bytes); entry rsp%16 == 8 -> (8 - 24) mod 16 == 0, so every nested call in this witness sees aligned rsp. Every ELV*_ERR_* input constant exceeds imm32 (bit 31 set) so is staged in a scratch reg before the mov into rdi. Capability {boot} is inherited from klog_s1's own {boot} band; the classifier itself is pure (no effects, no capabilities) so contributes nothing. Labels prefixed ecow_.",
+      block: {
+        sub rsp, 24;                     // alignment only
+
+        // ------------------------------------------------------------
+        // Stage 1: ELVC_OK (0) -> ALLOW (0)
+        // ------------------------------------------------------------
+        mov rax, 1;
+        lea rcx, [rip + _ecow_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;                    // status = ELVC_OK
+        call elevate_client_classify_outcome;
+        cmp rax, 0;                      // ELVC_OUTCOME_ALLOW
+        jne ecow_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 2: ELVC_ERR_TIMEOUT (0xFFFFEA01) -> TIMEOUT (2)
+        // ------------------------------------------------------------
+        mov rax, 2;
+        lea rcx, [rip + _ecow_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA01;             // ELVC_ERR_TIMEOUT
+        mov rdi, r10;
+        call elevate_client_classify_outcome;
+        cmp rax, 2;                      // ELVC_OUTCOME_TIMEOUT
+        jne ecow_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 3: ELVR_ERR_EXHAUSTED (0xFFFFEA20) -> TIMEOUT (2)
+        // ------------------------------------------------------------
+        mov rax, 3;
+        lea rcx, [rip + _ecow_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA20;             // ELVR_ERR_EXHAUSTED
+        mov rdi, r10;
+        call elevate_client_classify_outcome;
+        cmp rax, 2;                      // ELVC_OUTCOME_TIMEOUT
+        jne ecow_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 4: ELVC_ERR_BAD_EXPIRE (0xFFFFEA04) -> DENY (1)
+        //   -- the natural landing site for a broker DENY (APR with
+        //   granted=0 / expire=0 refused by the expire_ns > 0 gate)
+        // ------------------------------------------------------------
+        mov rax, 4;
+        lea rcx, [rip + _ecow_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA04;             // ELVC_ERR_BAD_EXPIRE
+        mov rdi, r10;
+        call elevate_client_classify_outcome;
+        cmp rax, 1;                      // ELVC_OUTCOME_DENY
+        jne ecow_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 5: ELVC_ERR_GRANT_INVALID (0xFFFFEA03) -> DENY (1)
+        // ------------------------------------------------------------
+        mov rax, 5;
+        lea rcx, [rip + _ecow_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA03;             // ELVC_ERR_GRANT_INVALID
+        mov rdi, r10;
+        call elevate_client_classify_outcome;
+        cmp rax, 1;                      // ELVC_OUTCOME_DENY
+        jne ecow_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 6: ELVC_ERR_BAD_REPLY (0xFFFFEA02) -> DENY (1)
+        //   -- non-APR op; would catch a hypothetical DEN op without
+        //   needing to know its wire form
+        // ------------------------------------------------------------
+        mov rax, 6;
+        lea rcx, [rip + _ecow_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA02;             // ELVC_ERR_BAD_REPLY
+        mov rdi, r10;
+        call elevate_client_classify_outcome;
+        cmp rax, 1;                      // ELVC_OUTCOME_DENY
+        jne ecow_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 7: ELVC_ERR_LOOKUP_FAIL (0xFFFFEA0F) -> DENY (1)
+        // ------------------------------------------------------------
+        mov rax, 7;
+        lea rcx, [rip + _ecow_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA0F;             // ELVC_ERR_LOOKUP_FAIL
+        mov rdi, r10;
+        call elevate_client_classify_outcome;
+        cmp rax, 1;                      // ELVC_OUTCOME_DENY
+        jne ecow_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 8: ELVC_ERR_SEND_FAIL (0xFFFFEA0D) -> DENY (1)
+        // ------------------------------------------------------------
+        mov rax, 8;
+        lea rcx, [rip + _ecow_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA0D;             // ELVC_ERR_SEND_FAIL
+        mov rdi, r10;
+        call elevate_client_classify_outcome;
+        cmp rax, 1;                      // ELVC_OUTCOME_DENY
+        jne ecow_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 9: ELVC_ERR_BAD_BUF (0xFFFFEA0B) -> DENY (1)
+        // ------------------------------------------------------------
+        mov rax, 9;
+        lea rcx, [rip + _ecow_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA0B;             // ELVC_ERR_BAD_BUF
+        mov rdi, r10;
+        call elevate_client_classify_outcome;
+        cmp rax, 1;                      // ELVC_OUTCOME_DENY
+        jne ecow_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 10: ELVC_ERR_BAD_CTX (0xFFFFEA06) -> DENY (1)
+        // ------------------------------------------------------------
+        mov rax, 10;
+        lea rcx, [rip + _ecow_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA06;             // ELVC_ERR_BAD_CTX
+        mov rdi, r10;
+        call elevate_client_classify_outcome;
+        cmp rax, 1;                      // ELVC_OUTCOME_DENY
+        jne ecow_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 11: ELVJ_ERR_APR_JOURNAL_FAIL (0xFFFFEA42) -> DENY (1)
+        // ------------------------------------------------------------
+        mov rax, 11;
+        lea rcx, [rip + _ecow_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA42;             // ELVJ_ERR_APR_JOURNAL_FAIL
+        mov rdi, r10;
+        call elevate_client_classify_outcome;
+        cmp rax, 1;                      // ELVC_OUTCOME_DENY
+        jne ecow_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 12: unrecognized value (0xDEADBEEF) -> DENY (1)
+        //   -- fail-closed default catches any band not enumerated
+        //   above.
+        // ------------------------------------------------------------
+        mov rax, 12;
+        lea rcx, [rip + _ecow_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xDEADBEEF;             // unknown value
+        mov rdi, r10;
+        call elevate_client_classify_outcome;
+        cmp rax, 1;                      // ELVC_OUTCOME_DENY
+        jne ecow_fail_stage;
+
+        // ------------------------------------------------------------
+        // Success.
+        // ------------------------------------------------------------
+        mov rdi, 3;                      // KLOG_LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecow_ok];
+        call klog_s1;
+
+        xor rax, rax;
+        jmp ecow_out;
+
+      ecow_fail_stage:
+        lea rax, [rip + _ecow_stage];
+        mov r8, [rax];                   // value1 -- failing stage id
+        mov rdi, 1;                      // KLOG_LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecow_fail];
+        lea rcx, [rip + k_line];         // key1 = "line"
+        call klog_s1_d1;
+        mov rax, 1;
+
+      ecow_out:
+        add rsp, 24;
+        ret
+      }
+    }
+}

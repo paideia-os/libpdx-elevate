@@ -72,6 +72,28 @@ the v1.1.0 tag + signed manifest is a separate release step
   `elevate_client_acquire` and the globals themselves are unchanged —
   full singleton retirement is deferred until a concurrent consumer
   needs it.
+- **R90-XREPO.011.M1-006 (#18)** — client-side ALLOW / DENY / TIMEOUT
+  reconciliation (new `elevate_client_outcome.pdx`, module
+  `ElevateClientOutcome`). Reduces the open-ended `ELV*_ERR_*` taxonomy
+  the transport / retry layers speak in to three enum variants
+  (`ELVC_OUTCOME_ALLOW = 0`, `ELVC_OUTCOME_DENY = 1`,
+  `ELVC_OUTCOME_TIMEOUT = 2`, distinct from every status band since all
+  `ELV*_ERR_*` are ≥ `0xFFFFEA00`). Applies the org-wide fail-closed
+  policy (paideia-os#2121) at the client boundary: only `ELVC_OK`
+  surfaces as `ALLOW`, only `ELVC_ERR_TIMEOUT` and `ELVR_ERR_EXHAUSTED`
+  surface as `TIMEOUT`, everything else — broker DENY (whichever wire
+  shape it takes: `BAD_EXPIRE` / `GRANT_INVALID` / `BAD_REPLY`), packer
+  / journal / policy failures, unknown values — folds to `DENY`.
+  Landed the last kernel-side blockers unblock this: paideia-os#2117
+  (sched_wait), #2118 (`elevate_channel_row_set_expire`), #2119
+  (`/system/policy` format + seed), #2121 (fail-closed policy), #2122
+  (broker daemon dispatch body). Surface: `elevate_client_classify_
+  outcome(status)` (pure reduction, leaf) and `elevate_client_request_
+  outcome(...)` (convenience composition over `elevate_client_request_
+  ex`). Witness at `tests/elevate_client_outcome_test.pdx` drives all
+  three variants across every representative input from every error
+  band, plus a `0xDEADBEEF` unknown-value probe for the fail-closed
+  default.
 - **ENH-007 (#14)** — README/STATUS enforcement-status accuracy pass.
   Retired the README example claiming `ELVC_OK` or `ELVC_STUB` "both
   mean proceed" (the exact bug ENH-005 fixed) in favor of the
