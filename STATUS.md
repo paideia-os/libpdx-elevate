@@ -282,25 +282,39 @@ existing status-shaped one.
   `audit_begin`/`audit_record_output`/`audit_commit` calls; the
   wrapper `elevate_client_request_ex_j` keeps its signature.
 
-## Followups for paideia-os (not blocking M3)
+## Followups for paideia-os (post-M3 landing state — see CHANGELOG for authoritative status)
 
-- Kernel-side `elevate_channel_row_set_expire(row_id, expire_ns)` or
-  a mint variant accepting `expire_ns` would let the shadow deadline
-  map in `elevate_client_cap.pdx` collapse back into the row's
-  `[+32]` slot. API is designed to make that migration transparent
-  to callers.
-- Broker daemon body (currently `ELVB_DISPATCH_STUB` in
-  `src/kernel/core/ipc/elevate_broker.pdx`) — until it consumes REQ
-  frames and produces APR replies, `elevate_client_request_ex*` will
-  reliably time out. M4 will exercise the full loop once the broker
-  daemon lands. The retry wrapper at M3-002 turns that timeout into
-  a bounded three-attempt sequence rather than a single 30 s stall.
-- Userspace-visible sleep primitive (R51 scheduler-wait syscall).
-  Once landed, `elevate_client_retry_delay` becomes a thin wrapper
-  and the polling loop retires.
+Every kernel-side blocker below LANDED with the R90-XREPO.011.M1-006
+wave; see `CHANGELOG.md`'s R90-XREPO.011.M1-006 entry for the
+authoritative post-M3 landing state.  When these two documents ever
+disagree, CHANGELOG wins.
+
+- Kernel-side `elevate_channel_row_set_expire(row_id, expire_ns)` —
+  **LANDED** as paideia-os#2118.  The shadow deadline map in
+  `elevate_client_cap.pdx` can now be collapsed back into the row's
+  `[+32]` slot; the API is unchanged and the migration is
+  transparent to callers.  The shadow map stays in this library
+  until a scheduled follow-up wave removes it.
+- Broker daemon body — **LANDED** as paideia-os#2122.  The dispatch
+  body in `src/kernel/core/ipc/elevate_broker.pdx` now consumes REQ
+  frames and produces APR replies; `elevate_client_request_ex*` no
+  longer reliably times out against the stub.  M4 end-to-end broker
+  witness (issue #24) unblocks with this.
+- Userspace-visible sleep primitive (R51 scheduler-wait syscall) —
+  **LANDED** as paideia-os#2117.  `elevate_client_retry_delay` can
+  now retire its bounded busy-poll on `hpet_now_ns` in favor of a
+  thin `sched_wait` wrapper; scheduled follow-up.
+- `/system/policy` format + seed — **LANDED** as paideia-os#2119.
+  The client-side policy table (`elevate_client_policy.pdx`) reads
+  from the same on-disk format the kernel-side authoritative table
+  loads at boot.
+- Fail-closed policy directive — **LANDED** as paideia-os#2121.  The
+  client-side outcome reducer (`elevate_client_classify_outcome`,
+  R90-XREPO.011.M1-006) enforces the same fail-closed default at the
+  client boundary.
 - `tick_ns` wire in `uej_append` (currently placeholder 0 per
-  user_events_journal.pdx L226). Not blocking; audit records still
-  carry seq for ordering.
+  user_events_journal.pdx L226).  Not blocking; audit records still
+  carry seq for ordering.  Deferred, no cross-repo dependency.
 
 ## M4 — tests + smoke (complete)
 

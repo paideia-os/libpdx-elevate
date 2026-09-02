@@ -287,19 +287,24 @@ module ElevateClient = structure {
   //   r13 = dur
   //   r14 = req_buf
   //   r15 = reply_buf    (gate-only; never dereferenced)
-  // Four callee-save pushes = 32 bytes; keeps rsp%16 stable across
-  // three nested calls (write_frame, lookup_broker, client_note).
+  // Four callee-save pushes = 32 bytes; entry rsp%16==8 -> after four
+  // pushes rsp%16==8 (still misaligned).  One 8-byte alignment pad
+  // brings rsp%16==0 across every nested call (write_frame,
+  // lookup_broker, client_note) -- the same shape every other 4-push
+  // wrapper in this library uses (elevate_client_send_req L326-330).
+  // v1.1.2 fix per LE.M1-polish #40 (G1).
   // ==========================================================================
 
   pub let elevate_client_request_norealize : (u64, u64, u64, u64) -> u64 !{mem} @{} =
     fn (caps: u64) (dur: u64) (req_buf: u64) (reply_buf: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.ENH-005 (#12): renamed from elevate_client_request (M1-002, #2) -- see the file header WHY THE RENAME note. Behavior unchanged: four callee-save pushes (r12=caps, r13=dur, r14=req_buf, r15=reply_buf) preserve the args across three nested calls (elevate_request_write_frame, elevate_client_lookup_broker, elevate_client_note) so the argument sources are unambiguous at every fork. Each error path bumps ELVC_ST_ERRORS before returning so the client's own stats table records the failure without needing the caller to touch the journal. The reply_buf gate refuses a 0 pointer up-front; this function does not touch reply_buf beyond the gate and NEVER dispatches -- ELVC_NOT_DISPATCHED is its only non-error return and must never be read as authorization. SVC_LOOKUP_NONE (0xFFFFFFFFFFFFFFFF) is staged in r10 for the miss compare. Labels prefixed elc_rq_.",
+      justification: "libpdx-elevate.ENH-005 (#12) with v1.1.2 alignment fix (#40, LE.M1-polish G1): renamed from elevate_client_request (M1-002, #2) -- see the file header WHY THE RENAME note. Four callee-save pushes (r12=caps, r13=dur, r14=req_buf, r15=reply_buf) preserve the args across three nested calls (elevate_request_write_frame, elevate_client_lookup_broker, elevate_client_note). Entry rsp%16==8; four pushes leave rsp%16==8 (still misaligned), so a single 8-byte alignment pad brings rsp%16==0 across every nested call -- matching the 4-push shape elsewhere in this library (elevate_client_send_req L326-330). Every exit path unwinds the pad before popping. Each error path bumps ELVC_ST_ERRORS before returning so the client's own stats table records the failure without needing the caller to touch the journal. The reply_buf gate refuses a 0 pointer up-front; this function does not touch reply_buf beyond the gate and NEVER dispatches -- ELVC_NOT_DISPATCHED is its only non-error return and must never be read as authorization. SVC_LOOKUP_NONE (0xFFFFFFFFFFFFFFFF) is staged in r10 for the miss compare. Labels prefixed elc_rq_.",
       block: {
         push r12;
         push r13;
         push r14;
         push r15;
+        sub rsp, 8;                      // alignment pad (see justification)
 
         mov r12, rdi;                    // caps
         mov r13, rsi;                    // dur
@@ -333,6 +338,7 @@ module ElevateClient = structure {
         mov rdi, 4;                      // ELVC_ST_STUBS
         call elevate_client_note;
         mov rax, 0xFFFFEA00;             // ELVC_NOT_DISPATCHED
+        add rsp, 8;
         pop r15;
         pop r14;
         pop r13;
@@ -343,6 +349,7 @@ module ElevateClient = structure {
         mov rdi, 3;                      // ELVC_ST_ERRORS
         call elevate_client_note;
         mov rax, 0xFFFFEA0E;             // ELVC_ERR_PACK_FAIL
+        add rsp, 8;
         pop r15;
         pop r14;
         pop r13;
@@ -353,6 +360,7 @@ module ElevateClient = structure {
         mov rdi, 3;                      // ELVC_ST_ERRORS
         call elevate_client_note;
         mov rax, 0xFFFFEA0F;             // ELVC_ERR_LOOKUP_FAIL
+        add rsp, 8;
         pop r15;
         pop r14;
         pop r13;
@@ -363,6 +371,7 @@ module ElevateClient = structure {
         mov rdi, 3;                      // ELVC_ST_ERRORS
         call elevate_client_note;
         mov rax, 0xFFFFEA0B;             // ELVC_ERR_BAD_BUF
+        add rsp, 8;
         pop r15;
         pop r14;
         pop r13;

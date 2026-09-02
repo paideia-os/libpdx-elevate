@@ -8,6 +8,209 @@ covers.
 
 ---
 
+## 1.1.2 — 2026-09-02 — LE.M1-polish + LE.M2-hardening (13 fixes across encoder, tests, docs, correctness gaps)
+
+v1.1.2 bundles two follow-up waves on top of v1.1.1 into a single
+patch bump.  The polish wave (LE.M1-polish, issues #40-#47, eight
+fixes) closes documentation / diagnostics / test-tag / encoder-
+correctness gaps without changing the overall shape; the hardening
+wave (LE.M2-hardening, issues #48-#52, five fixes) closes correctness
+gaps found by an adversarial audit of the v1.1.1 send + acquire +
+derive paths.  None of the fixes is source-breaking to a correctly-
+written v1.1.1 consumer.  Everything from the v1.1.1-unreleased state
+carries forward unchanged.
+
+### LE.M1-polish — eight fixes (issues #40-#47)
+
+- **#40 (G1)** — Alignment fix in
+  `elevate_client_request_norealize` (`src/elevate_client.pdx`
+  L294-372).  Four callee-save pushes leave rsp%16==8 (still
+  misaligned); added `sub rsp, 8` after the pushes + `add rsp, 8`
+  before every pop, matching the shape every other 4-push wrapper in
+  this library uses (e.g. `elevate_client_send_req` L326-330).
+  Behavior: nested calls to `elevate_request_write_frame`,
+  `elevate_client_lookup_broker`, and `elevate_client_note` now see
+  aligned rsp on both entry and exit.  Justification comment updated
+  to state "keeps rsp%16 aligned across nested calls" instead of the
+  misleading "keeps rsp%16 stable".
+
+- **#41 (G5)** — Stripped embedded `\n\0` from every test-fingerprint
+  string in favor of just `\0`.  `klog_s1` frames the newline itself
+  (paideia-os#2226 pattern), so the tests were duplicating it.  Four
+  files touched, eight strings shrunk by 1 byte each:
+  `tests/elevate_client_cap_test.pdx` (`eccw_ok` / `eccw_fail`,
+  L59-60), `tests/elevate_client_policy_test.pdx` (`ecpw_ok` /
+  `ecpw_fail`, L42-43),
+  `tests/elevate_client_outcome_test.pdx` (`ecow_ok` / `ecow_fail`,
+  L86-87), `tests/elevate_client_require_test.pdx` (`ecqw_ok` /
+  `ecqw_fail`, L67-68).  Array sizes updated to match (each shrunk
+  by 1).
+
+- **#42 (G6)** — `doc/libpdx-elevate.pdxdoc` refreshed from v1.0.0 to
+  v1.1.2.  Added every missing SYNOPSIS entry: renamed
+  `elevate_client_request_norealize`, `_ex_ctx`, `_acquire`,
+  `_require` / `_require_scoped` / `_require_j`, `_journal_op`, every
+  `elevate_client_cap_*` extension (`bind_expire_abs`, `bind_grant`,
+  `get_grant`, `bind_scope`, `get_scope`, `bind_budget`,
+  `get_budget_remaining`, `consume_budget`, `derive`, `bind_parent`,
+  `get_parent`, `get_depth`), and `elevate_client_classify_outcome`
+  / `_request_outcome`.  STATUS CODES section rewritten to cover
+  every current band (base 0xFFFFEA00..0xFFFFEA4F, ELCA_
+  0xFFFFEA50..0xFFFFEA6F, extension 0xFFFFEA70..0xFFFFEA7F including
+  the new ELCC_ERR_ZERO_GRANT from #47) and the ELVC_OUTCOME_* enum
+  namespace.
+
+- **#43 (G7)** — New test file
+  `tests/elevate_client_cap_m3_test.pdx` (`ElevateClientCapM3Test`
+  module, fingerprint `LIBPDX-ELEVATE LE.M3 CAP OK`).  Twelve stages
+  covering the LE.M3 client-side refusal paths that had no witness
+  before: BAD_CTX (null `mint_ctx_ptr`), BAD_ROW (parent >= 16),
+  PARENT_EXPIRED (unbound parent), NO_GRANT (parent grant unbound),
+  CHILD_CAPS_ESCALATION (bit-wise superset), depth walker sanity
+  (root == depth 0, chain 4->3->2->1 == depth 3),
+  DELEGATION_TOO_DEEP (parent depth == 3 refuses the derive),
+  ELCC_ERR_CYCLE_DETECTED (poked 5<->6 cycle triggers the walker's
+  bounded-hop defense), ELCC_ERR_ZERO_GRANT sanity vs.
+  ELCC_ERR_BAD_ROW discrimination (#47 witness), and parent-map
+  cleanup on revoke (asserts stage-12 that the parent slot is 0 after
+  `check_and_revoke` on a past-deadline row; enabled by the G3 fix in
+  the LE.M2-hardening wave, #49 below).  Post-mint state (clamped
+  deadline, child grant binding) is NOT asserted — those need a live
+  kernel row and belong in the deferred LE.M4 end-to-end broker
+  witness.  Labels prefixed `em3w_`, disjoint from every other
+  witness prefix.
+
+- **#44 (G10)** — Renamed `elcq_rs_*` labels to `elcq_sc_*` in
+  `elevate_client_require_scoped` (`src/elevate_client_require.pdx`
+  L370).  Both `elevate_client_require_reset` (L111) and
+  `elevate_client_require_scoped` (L370) had claimed the `elcq_rs_`
+  prefix and both defined `elcq_rs_out`, which compiled today only
+  because paideia-as label scope is function-scope; a future scope-
+  tightening to file-scope would have broken the build.  Renamed the
+  scoped function's prefix to `elcq_sc_` (mnemonic: "scoped").
+  Reset's `elcq_rs_*` labels are unchanged.
+
+- **#45 (G11)** — README.md Callers section gained a new "Structural
+  consumers (fail-closed today, awaiting broker-cap plumbing)"
+  subsection listing mount.pdxfs (`mount_elev_require_system`),
+  umount.pdxfs (`elevate_request_force_unmount`), and mkfs.pdxfs
+  (`mkfs_elev_require_device_write`) with their current stub
+  function names and their planned `elevate_client_acquire` /
+  `elevate_client_require` call sites.  None is migrated yet; they
+  are architecturally committed callers whose fail-closed refusal
+  path already routes through this library's error taxonomy.
+
+- **#46 (G12)** — STATUS.md `Followups for paideia-os (not blocking
+  M3)` section rewritten to the post-M3 landing state.  Struck items
+  that LANDED per CHANGELOG's R90-XREPO.011.M1-006 entry:
+  paideia-os#2117 (sched_wait), #2118 (row_set_expire), #2119
+  (/system/policy), #2121 (fail-closed policy), #2122 (broker
+  daemon dispatch body).  Section header now points at CHANGELOG as
+  the authoritative post-M3 landing state so the two documents no
+  longer disagree on which kernel-side blockers remain.
+
+- **#47 (G13)** — New distinct sentinel `ELCC_ERR_ZERO_GRANT`
+  (0xFFFFEA73, extension band, next after `ELCC_ERR_CYCLE_DETECTED`
+  = 0xFFFFEA71 and `ELCC_ERR_BAD_CTX` = 0xFFFFEA72).
+  `elevate_client_cap_bind_grant` (`src/elevate_client_cap.pdx`
+  L531-570) now returns this code instead of reusing
+  `ELCC_ERR_BAD_ROW` on the `granted_caps == 0` gate.  A consumer
+  can now distinguish "row_id out of range" (BAD_ROW) from "grant
+  mask empty" (ZERO_GRANT); both are client-side program-defect
+  gates but have different fixes, so a merged code was actively
+  misleading.  Justification updated in-source; witness stage 11 in
+  `tests/elevate_client_cap_m3_test.pdx` exercises both codes and
+  asserts they are distinct.  Folds cleanly with the LE.M2-hardening
+  #50 (G4) derive rollback path: bind_grant's ZERO_GRANT return
+  triggers the child-row revoke + shadow scrub.
+
+### LE.M2-hardening — five correctness fixes (issues #48-#52)
+
+- **#48 G2 — recv_reply rdx clobber (`src/elevate_client_send.pdx`)**
+  `elevate_client_recv_reply` pre-fix computed
+  `deadline = hpet_now_ns() + rdx`, but rdx is caller-saved and
+  hpet_now_ns's internal rdtsc/imul path writes it (the imul high
+  half).  The recv loop then spun against a `(now + garbage)`
+  deadline — practically forever when the garbage exceeded any
+  realistic elapsed clock, effectively neutralising the caller-
+  supplied timeout.  Fix: stash timeout_ns into the already-pushed r14
+  (callee-save) before hpet_now_ns and consume from r14 in the add.
+  No new error code; the observable change is that a broker that
+  never replies now surfaces `ELVC_ERR_TIMEOUT` on the caller's
+  actual bound rather than hanging.
+
+- **#49 G3 — check_and_revoke shadow-map cleanup
+  (`src/elevate_client_cap.pdx`)**
+  `elevate_client_cap_check_and_revoke` pre-fix cleared only
+  `_elevate_client_cap_expire_map[row_id]` on the revoked branch,
+  leaving `_grant_map`, `_scope_map`, `_budget_map`, and
+  `_parent_map` populated with the pre-revoke values.  A long-lived
+  process that then re-minted into the same row_id (without
+  `elevate_client_cap_reset`) inherited the previous grant's shadow
+  bookkeeping, and `elevate_client_require` answered against a stale
+  granted_caps mask.  Fix: scrub every shadow slot for the row on
+  the revoke branch (same map set `elevate_client_cap_reset` walks),
+  restoring the "row present <=> every shadow field freshly bound"
+  invariant.
+
+- **#50 G4 — derive discards bind_* return codes
+  (`src/elevate_client_cap.pdx`)**
+  `elevate_client_cap_derive` pre-fix called `bind_expire_abs`,
+  `bind_grant`, and `bind_parent` back-to-back and ignored every
+  return, so a failure at any of them (post-G13 `ELCC_ERR_ZERO_GRANT`,
+  a stale `ELCC_ERR_PARENT_ALREADY_BOUND` when G3 hadn't been
+  applied, etc.) left the kernel row minted but half-bound in the
+  shadow maps.  Fix: check each bind_* return; on the FIRST non-OK,
+  scrub every shadow slot for the just-minted child and issue a
+  best-effort `elevate_channel_cap_revoke` before propagating that
+  ORIGINAL error code upward.  The refuse-then-propagate shape is
+  order-independent with respect to #47 (bind_grant's ZERO_GRANT
+  check) — either landing first, the other still folds cleanly.
+
+- **#51 G8 — recv_reply upper-bound gate
+  (`src/elevate_client_send.pdx`)**
+  `elevate_client_recv_reply` pre-fix compared the substrate's
+  returned payload_len only against the PENDING_TAKE_EMPTY sentinel
+  and the lower bound of 32 (`< 32 -> BAD_REPLY`).  A corrupted or
+  substrate-bug-produced len above the frame max let the subsequent
+  `[reply_buf+0]/[+8]/[+16]` reads run against an implausible buffer.
+  Fix: add `cmp rax, 8192; ja elcs_rr_bad_reply_len` (frame max
+  matches `src/kernel/core/ipc/frame.pdx MAX_FRAME_BYTES`) with a
+  new refusal code `ELVC_ERR_BAD_REPLY_LEN = 0xFFFFEA07`, distinct
+  from `ELVC_ERR_BAD_REPLY` (semantic mismatch of a validly-shaped
+  APR) so an auditor can separate "APR was validly shaped but
+  semantically wrong" from "APR frame length was implausible before
+  we ever tried".
+
+- **#52 G9 — acquire null-check on reply_buf
+  (`src/elevate_client_acquire.pdx`)**
+  `elevate_client_acquire` pre-fix dereferenced `[r15+8]` (granted_
+  caps) and `[r15+16]` (expire_ns) without a null gate on reply_buf,
+  so an accidental null caller argument would #PF inside the library
+  rather than surface a diagnostic.  Fix: null gate right after the
+  mint_ctx_buf gate, refusing with a new code `ELCA_ERR_BAD_REPLY_BUF
+  = 0xFFFFEA51` — distinct from `ELCA_ERR_BAD_BUF` (which covers
+  mint_ctx_buf) so the consumer can tell "you forgot the context"
+  from "you forgot the reply buffer".
+
+### Error-band footprint added by this wave
+
+- `0xFFFFEA07 ELVC_ERR_BAD_REPLY_LEN` — LE.M2-hardening #51 (G8).
+  First use of the 0x07..0x0B gap between the transport error codes
+  and the M1-reserved RECV/SEND_FAIL aliases at 0x0C/0x0D.
+- `0xFFFFEA51 ELCA_ERR_BAD_REPLY_BUF` — LE.M2-hardening #52 (G9).
+  Extends the `ELCA_*` band by one slot; 0x52..0x5F remain reserved.
+- `0xFFFFEA73 ELCC_ERR_ZERO_GRANT` — LE.M1-polish #47 (G13).
+  Extension band, distinguishing `bind_grant(row, 0)` from
+  `bind_grant(bad_row, mask)`; 0x74..0x7F remain reserved.
+
+### Dependency deltas
+
+None.  `libpdx-cap` (still PENDING, blocks M2-001) and `libpdx-audit`
+(still PENDING, blocks M2-002) statuses unchanged from v1.1.1.
+
+---
+
 ## Unreleased — v1.1.1 (LE.M3-001 real-mint-args pass on top of the v1.1.0 wave, no signed tag yet)
 
 v1.1.1 is a PATCH over the v1.1.0-unreleased state on `main`.  It

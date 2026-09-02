@@ -1,4 +1,4 @@
-.pdxdoc  libpdx-elevate  1.0.0
+.pdxdoc  libpdx-elevate  1.1.2
 .audience  tool-author, security-auditor, kernel-integrator
 .format-version  1
 .rendered-by  doc (§5.3 of design/tooling/r49-r50-plan.md)
@@ -11,9 +11,51 @@ capability requests on PaideiaOS.
 .section  SYNOPSIS
 
   ;; assembly-level (from src/*.pdx)
+
+  ;; --- Broker binding + wire ---
   call  elevate_client_lookup_broker
-  call  elevate_client_request_ex_r   ;; full-featured: retry + audit + policy
+  call  elevate_client_set_target_fp_lo
+  call  elevate_client_set_human_timeout
+  call  elevate_client_set_fast_timeout
+
+  ;; --- Non-dispatching probe (renamed v1.1.0) ---
+  call  elevate_client_request_norealize   ;; formerly elevate_client_request
+
+  ;; --- Full-flow requests ---
+  call  elevate_client_request_ex          ;; base flow (M2)
+  call  elevate_client_request_ex_j        ;; audit-first wrapper  (M3-001)
+  call  elevate_client_request_ex_r        ;; retry + audit + policy (M3-002)
+  call  elevate_client_request_ex_ctx      ;; explicit-context twin  (ENH-006)
+
+  ;; --- Handle acquire / require (credential shape, ENH-001..004) ---
+  call  elevate_client_acquire             ;; request_ex_r + mint + shadow-bind
+  call  elevate_client_require             ;; per-op re-assert (freshness+caps)
+  call  elevate_client_require_scoped      ;; require + scope + budget consume
+  call  elevate_client_require_j           ;; require + per-op audit record
+
+  ;; --- Cap-lifetime enforcement (M2-003, LE.M3) ---
+  call  elevate_client_cap_mint
+  call  elevate_client_cap_bind_expire
+  call  elevate_client_cap_bind_expire_abs
+  call  elevate_client_cap_bind_grant
+  call  elevate_client_cap_get_grant
+  call  elevate_client_cap_bind_scope
+  call  elevate_client_cap_get_scope
+  call  elevate_client_cap_bind_budget
+  call  elevate_client_cap_get_budget_remaining
+  call  elevate_client_cap_consume_budget
   call  elevate_client_cap_check_and_revoke
+  call  elevate_client_cap_derive          ;; LE.M3-001 (v1.1.1 mint_ctx_ptr)
+  call  elevate_client_cap_bind_parent     ;; LE.M3-002
+  call  elevate_client_cap_get_parent      ;; LE.M3-002
+  call  elevate_client_cap_get_depth       ;; LE.M3-002 (bounded walk)
+
+  ;; --- Audit records (ENH-004) ---
+  call  elevate_client_journal_op
+
+  ;; --- Outcome reduction (R90-XREPO.011.M1-006) ---
+  call  elevate_client_classify_outcome
+  call  elevate_client_request_outcome
 
   ;; conceptual (tool-side)
   hold  Cap<KIND_IPC_ENDPOINT(read,  "svc.elevate-broker")>
@@ -29,9 +71,11 @@ libpdx-elevate wraps the R48.M7 kernel elevate protocol
 machine tools need to request a bounded-lifetime capability from
 `svc.elevate-broker`.  It is a shared library — no binary, no daemon.
 Consumers are `pkg` (§5.1, elevate for `/pkgs` write), the R50
-coreutils (`cp` and `mv` for cross-subtree destinations), and every
-future tool that needs to escalate a single operation without becoming
-setuid or claiming persistent supervisor authority.
+coreutils (`cp` and `mv` for cross-subtree destinations), the R50
+filesystem tools (`mount.pdxfs` / `umount.pdxfs` / `mkfs.pdxfs`, all
+fail-closed today pending broker-cap plumbing), and every future tool
+that needs to escalate a single operation without becoming setuid or
+claiming persistent supervisor authority.
 
 The library does not replace `sudo`.  There is no `sudo` in PaideiaOS
 (see .see-also §5 of design/user/model.md).  What replaces it is the
@@ -42,16 +86,35 @@ cap dies at its expire_ns.  No lingering root shell exists to hijack;
 no persistent group membership grants standing authority; every request
 is journaled to `/system/audit/user-events/`.
 
+Since v1.1.0 the recommended surface for consumers holding a handle
+across more than a single wire hop is the acquire/require pair rather
+than a bare request:
+
+  * `elevate_client_acquire` performs one full REQ+APR round-trip
+    (retry+audit+policy) and returns a `row_id` HANDLE (< 16),
+    shadow-binding the granted caps and the broker's absolute
+    `expire_ns` in one call.
+  * `elevate_client_require` (and its `_scoped` / `_j` variants) is
+    the per-op re-assert against that handle: freshness plus caps
+    subset, with NO broker round-trip and NO shell-timestamp
+    persistence.  Grant amplification (1 REQ/APR pair, N mutating
+    uses) is legible to an auditor via the per-op record
+    `elevate_client_journal_op` writes.
+
 .section  INVARIANTS  I4  I5  I7  D3  D4
 
 Every entry point in libpdx-elevate enforces the following:
 
   D3 (audit-first)
-    Every mutating flow (request_ex_j, request_ex_r) writes its REQ
-    audit record before it reaches the broker.  A REQ-journal failure
-    aborts the operation with ELVJ_ERR_REQ_JOURNAL_FAIL — no wire hop
-    occurs.  Successful APR writes its APR audit record before the
-    cap is returned to the caller.
+    Every mutating flow (request_ex_j, request_ex_r, require_j) writes
+    its REQ or per-op audit record before it reaches the broker or
+    marks the op as authorized.  A REQ-journal failure aborts the
+    operation with ELVJ_ERR_REQ_JOURNAL_FAIL — no wire hop occurs.
+    Successful APR writes its APR audit record before the cap is
+    returned to the caller.  ELVJ_ERR_OP_JOURNAL_FAIL is the require_j
+    counterpart: the op was authorized but the audit record recording
+    that fact did not land; the caller should NOT treat the op as
+    audit-covered.
 
   D4 (dual-signed manifest)
     libpdx-elevate ships with manifest.pdxsig carrying author +
@@ -61,7 +124,10 @@ Every entry point in libpdx-elevate enforces the following:
   I4 (never silent failure)
     Every entry point returns a nonzero status code on the failure
     path (see .section STATUS CODES).  No path silently returns
-    success on partial completion.
+    success on partial completion.  The client-side outcome reducer
+    `elevate_client_classify_outcome` folds every ELV*_ERR_* value
+    into a three-valued (ALLOW / DENY / TIMEOUT) enum with the
+    org-wide fail-closed default (any unrecognized value -> DENY).
 
   I5 (destructive ops undoable)
     Not applicable at library level — libpdx-elevate holds no state
@@ -69,6 +135,9 @@ Every entry point in libpdx-elevate enforces the following:
     bound (M2-003) is the equivalent invariant: the cap self-
     invalidates at expire_ns and calls to it thereafter fail with
     ELCC_STATE_REVOKED.  A caller cannot "forget" to release it.
+    LE.M3 adds a depth-bounded delegation chain
+    (ELCC_MAX_DELEGATION_DEPTH = 4) so a child cap can never outlive
+    its parent or exceed its rights.
 
   I7 (help + tutorial + example-gallery)
     This .pdxdoc file is the doc(1) back-end.  Callers hit --help
@@ -97,6 +166,21 @@ raise the human budget above 30 s should also raise their own
 user-visible progress indication — the founder may take that long to
 respond, and the terminal will otherwise appear stuck.
 
+.section  ENTRY  elevate_client_request_norealize
+
+.signature  fn elevate_client_request_norealize(caps: u64, dur: u64,
+.signature                                      req_buf: *u8, reply_buf: *u8)
+.signature                                      -> ELVC_NOT_DISPATCHED | ELVC_ERR_*
+
+Renamed from `elevate_client_request` at ENH-005 (#12).  The M1
+send-and-block skeleton preserved from v1.0.0 for callers who
+legitimately want the non-dispatching probe (frame-assemble +
+broker-name lookup, no wire hop).  Its ONLY non-error return is
+`ELVC_NOT_DISPATCHED` (0xFFFFEA00, formerly `ELVC_STUB`); consumers
+MUST NOT read that code as authorization.  Callers wanting a real
+dispatch use `elevate_client_request_ex*` or `elevate_client_acquire`.
+See the file header WHY THE RENAME note in `src/elevate_client.pdx`.
+
 .section  ENTRY  elevate_client_request_ex
 
 .signature  fn elevate_client_request_ex(caps: u64, dur: u64, req_buf: *u8,
@@ -111,6 +195,23 @@ grant subset check via `elevate_client_check_grant`.
 classification.  `target_fp_lo` comes from the process-global set via
 `elevate_client_set_target_fp_lo`.  Caller must supply a
 64-byte-aligned `req_buf` and `reply_buf`.
+
+.section  ENTRY  elevate_client_request_ex_ctx
+
+.signature  fn elevate_client_request_ex_ctx(caps: u64, dur: u64,
+.signature                                   req_buf: *u8, reply_ep_id: u32,
+.signature                                   reply_buf: *u8, ctx_buf: *u8)
+.signature                                   -> ELVC_*/ELVC_ERR_BAD_CTX
+
+ENH-006 (#17) explicit-context twin of `elevate_client_request_ex`.
+Reads `target_fp_lo`, fast timeout, human timeout, and an explicit
+per-call timeout from a caller-owned `ctx_buf` (see
+`ELVC_CTX_*_OFF` layout constants) instead of the three process-
+global mutable slots, so concurrent flows in one process do not race
+each other.  Refuses `ELVC_ERR_BAD_CTX` (0xFFFFEA06) on a null
+ctx_buf.  Scoped to the core primitive only; full singleton
+retirement of `_ex_j` / `_ex_r` / `elevate_client_acquire` is deferred
+until a concurrent consumer surfaces.
 
 .section  ENTRY  elevate_client_request_ex_j
 
@@ -135,49 +236,271 @@ M3-002 retry wrapper over _ex_j.  Retriable set is
 success writes its APR record; the auditor sees a per-attempt trail.
 Non-retriable failures pass through unchanged on the first attempt.
 
-.section  ENTRY  elevate_client_cap_mint / _bind_expire / _check_and_revoke
+.section  ENTRY  elevate_client_acquire
+
+.signature  fn elevate_client_acquire(caps: u64, dur: u64, req_buf: *u8,
+.signature                            reply_ep_id: u64, reply_buf: *u8,
+.signature                            mint_ctx_buf: *u8) -> row_id
+.signature                            | ELCA_ERR_BAD_BUF | ELVC_*/ELVR_*/ELCC_*
+
+ENH-001 (#11) composed handle acquire.  Runs `request_ex_r`
+(retry+journal+dispatch), then on success mints a
+Cap<KIND_ELEVATE_CHANNEL> via `elevate_client_cap_mint` and shadow-
+binds the broker's absolute `expire_ns` (`bind_expire_abs`) plus the
+granted caps (`bind_grant`) in one call.  Returns a `row_id` HANDLE
+(< 16) discriminated from every error band (>= 0xFFFFEA00) by a bare
+`cmp rax, 16; jae refuse`.  See `src/elevate_client_acquire.pdx`'s
+mint_ctx_buf LAYOUT (40 bytes, 5 u64 words: parent_ep_slot /
+request_id / requester_pid / target_cap_kind / target_cap_rights) for
+the caller-owned scratch buffer format.  ELCA_ERR_BAD_BUF
+(0xFFFFEA50) is the ONLY code this function owns; every other refusal
+is a passthrough from a composed call.
+
+.section  ENTRY  elevate_client_require / _require_scoped / _require_j
+
+.signature  fn elevate_client_require(row_id: u64, needed_caps: u64)
+.signature                            -> ELCA_OK | ELCA_ERR_*/ELCC_ERR_*
+.signature  fn elevate_client_require_scoped(row_id: u64, needed_caps: u64,
+.signature                                   scope_fp: u64)
+.signature                                   -> ELCA_OK | ELCA_ERR_*/ELCC_ERR_*
+.signature  fn elevate_client_require_j(actor_fp_lo: u64, row_id: u64,
+.signature                              needed_caps: u64)
+.signature                              -> ELCA_OK | ELCA_ERR_*/ELVJ_ERR_*
+
+ENH-002 (#13), ENH-003 (#15), ENH-004 (#16) per-op re-assert against a
+handle from `elevate_client_acquire`.  No broker hop — freshness
+(`elevate_client_cap_check_and_revoke`) + caps subset against the
+shadow grant map (`elevate_client_cap_get_grant`).
+
+  * `_scoped` adds an optional per-handle scope fingerprint match and
+    a per-handle bounded op count (`bind_scope` / `bind_budget`); a
+    handle that never binds them behaves identically to plain
+    `_require`.
+  * `_j` adds one `elevate_client_journal_op` per authorized use so
+    grant amplification is legible to an auditor.  Refused checks are
+    NOT journaled here (see `elevate_client_journal_op`'s doc for
+    why); the require stats table records attempted checks
+    regardless.
+
+Every ELCC_ERR_* refusal (BAD_ROW, NO_DEADLINE, NO_GRANT) passes
+through unchanged so the caller can distinguish caller-side usage
+errors from per-op refusals.  ELCA_ERR_EXPIRED (0xFFFFEA60) and
+ELCA_ERR_CAPS_INSUFFICIENT (0xFFFFEA61) are the per-op refusals;
+`_scoped` adds ELCA_ERR_SCOPE_MISMATCH (0xFFFFEA62).
+
+.section  ENTRY  elevate_client_cap_mint / _bind_expire / _bind_expire_abs / _check_and_revoke
 
 .signature  fn elevate_client_cap_mint(...) -> Cap<KIND_ELEVATE_CHANNEL>
 .signature  fn elevate_client_cap_bind_expire(row_id: u32, dur_ns: u64)
+.signature  fn elevate_client_cap_bind_expire_abs(row_id: u32, deadline_ns: u64)
 .signature  fn elevate_client_cap_expired(row_id: u32) -> u32
 .signature  fn elevate_client_cap_check_and_revoke(row_id: u32) -> ELCC_*
 
 M2-003 cap-lifetime wrapper.  Kernel default `expire_ns == 0` is
 compensated by a client-side shadow deadline map (16 slots, one per
-possible row_id).  `check_and_revoke` invokes kernel
-`elevate_channel_cap_revoke` when past deadline; the call is
-idempotent (`REVOKE_ALREADY` collapses to `STATE_REVOKED`).
+possible row_id).  `bind_expire` computes `hpet_now_ns() + dur_ns`;
+`bind_expire_abs` stores an absolute value the broker's APR already
+carried without re-adding `hpet_now_ns` (ENH-001).
+`check_and_revoke` invokes kernel `elevate_channel_cap_revoke` when
+past deadline; the call is idempotent (`REVOKE_ALREADY` collapses to
+`STATE_REVOKED`).
 
 Callers should invoke `check_and_revoke` at every re-entry to a
 guarded region; the M4 witness `elevate_client_cap_witness`
 demonstrates the pattern (12 stages, fingerprint
 `LIBPDX-ELEVATE M4 CAP OK`).
 
+.section  ENTRY  elevate_client_cap_bind_grant / _get_grant
+
+.signature  fn elevate_client_cap_bind_grant(row_id: u64, granted_caps: u64)
+.signature                                    -> ELCC_OK | ELCC_ERR_BAD_ROW
+.signature                                    | ELCC_ERR_ZERO_GRANT
+.signature  fn elevate_client_cap_get_grant(row_id: u64) -> granted_caps | 0
+
+ENH-001 (#11) shadow the APR's `granted_caps` bitmask per row.
+`elevate_client_acquire` calls `bind_grant` immediately after a
+successful mint using the SAME granted_caps it already validated as a
+subset of the request.  `bind_grant` refuses `granted_caps == 0` with
+`ELCC_ERR_ZERO_GRANT` (0xFFFFEA73, extension band, v1.1.2 LE.M1-polish
+G13) — distinct from `ELCC_ERR_BAD_ROW` so a caller can tell "row_id
+out of range" from "grant mask empty".  `get_grant` returns 0 for a
+row that never bound (out of range OR minted without going through
+`elevate_client_acquire`); `elevate_client_require` treats that as
+`ELCC_ERR_NO_GRANT` (0xFFFFEA38).
+
+.section  ENTRY  elevate_client_cap_bind_scope / _get_scope
+
+.signature  fn elevate_client_cap_bind_scope(row_id: u64, scope_fp: u64)
+.signature                                    -> ELCC_OK | ELCC_ERR_BAD_ROW
+.signature  fn elevate_client_cap_get_scope(row_id: u64) -> scope_fp | 0
+
+ENH-003 (#15) shadow an opaque scope fingerprint per row.  `0` clears
+(unbound = matches ANY `scope_fp` a caller later presents to
+`require_scoped`).  The value is opaque to this library — the caller
+picks the fingerprint (typically a hash of a recursive walk's root
+path); no filesystem vocabulary is imposed.
+
+.section  ENTRY  elevate_client_cap_bind_budget / _get_budget_remaining / _consume_budget
+
+.signature  fn elevate_client_cap_bind_budget(row_id: u64, max_ops: u64)
+.signature                                     -> ELCC_OK | ELCC_ERR_BAD_ROW
+.signature                                     | ELCC_ERR_BAD_BUDGET
+.signature  fn elevate_client_cap_get_budget_remaining(row_id: u64) -> u64
+.signature  fn elevate_client_cap_consume_budget(row_id: u64)
+.signature                                        -> ELCC_OK | ELCC_ERR_BAD_ROW
+.signature                                        | ELCC_ERR_BUDGET_EXHAUSTED
+
+ENH-003 (#15) per-handle bounded op count.  Storage encoding is
+`remaining + 1` so a bound handle at exhaustion returns a distinct
+`ELCC_ERR_BUDGET_EXHAUSTED` (0xFFFFEA3A) forever, rather than
+wrapping to "unbounded" the next call.  `bind_budget` refuses
+`max_ops > ELCC_MAX_BUDGET` with `ELCC_ERR_BAD_BUDGET` (0xFFFFEA39).
+`consume_budget` decrements the counter; on an unbudgeted handle
+(never bound) it silently returns OK.  `require_scoped` composes the
+budget consume with the freshness + caps check.
+
+.section  ENTRY  elevate_client_cap_derive / _bind_parent / _get_parent / _get_depth
+
+.signature  fn elevate_client_cap_derive(parent_row: u64, child_caps: u64,
+.signature                               child_dur_ns: u64,
+.signature                               mint_ctx_ptr: *u8)
+.signature                               -> child_row_id | ELCC_ERR_*
+.signature  fn elevate_client_cap_bind_parent(child: u64, parent: u64)
+.signature                                    -> ELCC_OK | ELCC_ERR_*
+.signature  fn elevate_client_cap_get_parent(row_id: u64) -> parent | 0
+.signature  fn elevate_client_cap_get_depth(row_id: u64) -> depth
+.signature                                                  | ELCC_ERR_CYCLE_DETECTED
+
+LE.M3-001..003 multilevel delegation.  `derive` mints a fresh
+KIND_ELEVATE_CHANNEL row narrowed to `child_caps` (subset-checked
+against the parent's granted mask), with a deadline clamped to
+`min(now + child_dur_ns, parent_expire)` so a child can never outlive
+its parent, and records the child->parent edge via `bind_parent`.
+`mint_ctx_ptr` (v1.1.1 fix) points at a caller-owned 24-byte scratch
+buffer — `[+0] parent_ep_slot`, `[+8] request_id`,
+`[+16] requester_pid` — layout-compatible with the FIRST three words
+of `elevate_client_acquire`'s `mint_ctx_buf`.  A null `mint_ctx_ptr`
+is refused before any nested call with `ELCC_ERR_BAD_CTX`
+(0xFFFFEA72, extension band).
+
+`get_depth` is a bounded walk of the parent map returning
+`ELCC_ERR_CYCLE_DETECTED` (0xFFFFEA71) if the map is corrupted past
+`ELCC_MAX_DELEGATION_DEPTH = 4` hops; `bind_parent`'s SELF_LOOP and
+ALREADY_BOUND gates make the happy-path unreachable, so the cycle
+sentinel is a corruption-defense signal.  `derive` refuses
+`ELCC_ERR_DELEGATION_TOO_DEEP` (0xFFFFEA3F) when
+`get_depth(parent) >= ELCC_MAX_DELEGATION_DEPTH - 1`.
+
+.section  ENTRY  elevate_client_journal_op
+
+.signature  fn elevate_client_journal_op(actor_fp_lo: u64, row_id: u64,
+.signature                               needed_caps: u64)
+.signature                               -> ELVJ_OK | ELVJ_ERR_OP_JOURNAL_FAIL
+
+ENH-004 (#16) per-op audit record for a use of an acquired handle
+(`ELVJ_EVT_OP = 3`).  `elevate_client_require_j` calls this on
+`ELCA_OK` (an authorized use); a refused check is NOT journaled here
+because journaling refusals would make the per-op write count
+meaningless as a grant-amplification signal.
+`ELVJ_ERR_OP_JOURNAL_FAIL` (0xFFFFEA43) means the op was authorized
+but the audit record recording that fact did not land; the caller
+should NOT treat the op as audit-covered (retry the journal write out
+of band, or abort if audit coverage is a hard requirement).
+
+.section  ENTRY  elevate_client_classify_outcome / _request_outcome
+
+.signature  fn elevate_client_classify_outcome(status: u64) -> ELVC_OUTCOME_*
+.signature  fn elevate_client_request_outcome(caps: u64, dur: u64, ...)
+.signature                                     -> ELVC_OUTCOME_*
+
+R90-XREPO.011.M1-006 (#18) client-side ALLOW / DENY / TIMEOUT
+reconciliation.  Reduces the open-ended `ELV*_ERR_*` taxonomy the
+transport / retry layers speak in to three enum ordinals:
+
+  * `ELVC_OUTCOME_ALLOW   = 0`  (matches `ELVC_OK`)
+  * `ELVC_OUTCOME_DENY    = 1`  (broker DENY / packer / journal / policy
+                                  failures, unknown values -- fail-closed)
+  * `ELVC_OUTCOME_TIMEOUT = 2`  (`ELVC_ERR_TIMEOUT` /
+                                  `ELVR_ERR_EXHAUSTED`)
+
+None of the three collide with any status-band value (all
+`ELV*_ERR_*` are >= `0xFFFFEA00`), so a caller passing an
+`ELVC_OUTCOME_*` back into a status-shaped entry point trips a
+bounded-value check down-chain rather than silently proceeding.
+Applies the org-wide fail-closed policy (paideia-os#2121) at the
+client boundary.
+
 .section  STATUS  CODES
 
 Codes are grouped by band; the numeric value is a u32 return code.
 Every entry point returns 0 on success.
 
+  0xFFFFEA00  ELVC_NOT_DISPATCHED        non-dispatching probe's only
+                                         non-error return (renamed from
+                                         ELVC_STUB, ENH-005 #12); MUST NOT
+                                         be read as authorization
   0xFFFFEA01  ELVC_ERR_TIMEOUT           recv-timeout expired (retriable)
   0xFFFFEA02  ELVC_ERR_BAD_REPLY         reply frame malformed (non-retriable)
   0xFFFFEA03  ELVC_ERR_GRANT_INVALID     granted caps not subset of requested
   0xFFFFEA04  ELVC_ERR_BAD_EXPIRE        expire_ns == 0 in APR
   0xFFFFEA05  ELVC_ERR_BAD_REPLY_EP      caller-supplied reply_ep_id invalid
+  0xFFFFEA06  ELVC_ERR_BAD_CTX           ENH-006 (#17): ctx_buf is null in
+                                         elevate_client_request_ex_ctx
+  0xFFFFEA0B  ELVC_ERR_BAD_BUF           req_buf or reply_buf is null
+  0xFFFFEA0E  ELVC_ERR_PACK_FAIL         REQ frame assemble refused
+  0xFFFFEA0F  ELVC_ERR_LOOKUP_FAIL       svc_lookup returned SVC_LOOKUP_NONE
   0xFFFFEA10..1F  ELCP_ERR_*             policy table (BAD_ARG, RATE_LIMIT,
                                          NO_MATCH, ENOSPC, BAD_DUR, BAD_CAPS)
   0xFFFFEA20  ELVR_ERR_EXHAUSTED         retry attempts exhausted
   0xFFFFEA21  ELVR_ERR_BAD_ARG           retry config out of bounds
-  0xFFFFEA30..3F  ELCC_*                 cap-lifetime (BAD_ROW, MINT_FAIL,
-                                         NO_DEADLINE, REVOKE_FAIL, STATE_LIVE,
-                                         EXPIRED, REVOKED, NOTE_NO_NARROW)
+  0xFFFFEA30..3A  ELCC_*                 cap-lifetime base band
+                                         (BAD_ROW, MINT_FAIL, NO_DEADLINE,
+                                         REVOKE_FAIL, STATE_LIVE, EXPIRED,
+                                         REVOKED, NOTE_NO_NARROW, NO_GRANT,
+                                         BAD_BUDGET, BUDGET_EXHAUSTED)
+  0xFFFFEA3B  ELCC_ERR_CHILD_CAPS_ESCALATION  LE.M3-001 (#26): derive with
+                                         child mask exceeding parent grant
+  0xFFFFEA3C  ELCC_ERR_PARENT_EXPIRED    LE.M3-001 (#26): parent's shadow
+                                         deadline past (or 0 = unbound)
+  0xFFFFEA3D  ELCC_ERR_PARENT_SELF_LOOP  LE.M3-002 (#27): bind_parent(r,r)
+  0xFFFFEA3E  ELCC_ERR_PARENT_ALREADY_BOUND  LE.M3-002 (#27): rebind attempt
+  0xFFFFEA3F  ELCC_ERR_DELEGATION_TOO_DEEP  LE.M3-003 (#28): depth >= MAX-1
   0xFFFFEA40  ELVJ_ERR_BAD_ACTOR         no target_fp_lo set (process-global)
   0xFFFFEA41  ELVJ_ERR_REQ_JOURNAL_FAIL  audit REQ write failed; abort
   0xFFFFEA42  ELVJ_ERR_APR_JOURNAL_FAIL  audit APR write failed; revoke grant
+  0xFFFFEA43  ELVJ_ERR_OP_JOURNAL_FAIL   ENH-004 (#16): per-op audit record
+                                         write failed (op WAS authorized)
+  0xFFFFEA50  ELCA_ERR_BAD_BUF           ENH-001 (#11): acquire's mint_ctx_buf
+                                         is null
+  0xFFFFEA51  ELCA_ERR_BAD_REPLY_BUF     ENH-001 (#11): reply_buf is null
+  0xFFFFEA60  ELCA_ERR_EXPIRED           ENH-002 (#13): handle deadline passed
+  0xFFFFEA61  ELCA_ERR_CAPS_INSUFFICIENT ENH-002 (#13): needed_caps not a
+                                         subset of granted_caps
+  0xFFFFEA62  ELCA_ERR_SCOPE_MISMATCH    ENH-003 (#15): require_scoped scope_fp
+                                         did not match bound scope
+  0xFFFFEA71  ELCC_ERR_CYCLE_DETECTED    LE.M3-002 (#27, extension band):
+                                         get_depth walker exhausted its bound
+  0xFFFFEA72  ELCC_ERR_BAD_CTX           LE.M3-001 (v1.1.1 #26, extension
+                                         band): derive with null mint_ctx_ptr
+  0xFFFFEA73  ELCC_ERR_ZERO_GRANT        LE.M1-polish (v1.1.2 #47, extension
+                                         band): bind_grant with
+                                         granted_caps == 0
+
+Outcome enum (`ElevateClientOutcome`, separate namespace):
+
+  0           ELVC_OUTCOME_ALLOW         only ELVC_OK reduces here
+  1           ELVC_OUTCOME_DENY          fail-closed default; broker DENY,
+                                         packer / journal / policy failures,
+                                         unknown values
+  2           ELVC_OUTCOME_TIMEOUT       ELVC_ERR_TIMEOUT or
+                                         ELVR_ERR_EXHAUSTED
 
 Consumers map these to the shared exit codes (design/tooling/plan.md
-§4.1 I4 table): every ELVC_/ELCP_/ELCC_ failure is exit 4
+§4.1 I4 table): every ELVC_/ELCP_/ELCC_/ELCA_ failure is exit 4
 (capability denied); ELVR_ERR_EXHAUSTED is exit 3 (system error);
-ELVJ_ERR_* is exit 4 (capability + audit denied).
+ELVJ_ERR_* is exit 4 (capability + audit denied).  `_classify_outcome`
+folds this taxonomy for callers whose disposition only needs the
+three-way distinction.
 
 .section  EXAMPLES
 
@@ -207,6 +530,31 @@ ELVJ_ERR_* is exit 4 (capability + audit denied).
   ;;   .cap_expired_or_bad:
   ;;     ;; cap dead — either re-request or bail
 
+  ;; #3 — credential-shape acquire + require (ENH-001..004)
+  ;;
+  ;;   elevate_client_acquire   caps, dur, req_buf, reply_ep, reply_buf,
+  ;;                            mint_ctx_buf
+  ;;   cmp     rax, 16
+  ;;   jae     .refused                     ;; every error is >= 0xFFFFEA00
+  ;;   mov     [handle], rax                ;; row_id (0..15)
+  ;;   ;; ...one broker round-trip; now N per-op re-asserts:
+  ;;   .op_start:
+  ;;     mov     rdi, [handle]
+  ;;     mov     rsi, needed_caps
+  ;;     call    elevate_client_require     ;; no broker hop
+  ;;     cmp     rax, 0                     ;; ELCA_OK
+  ;;     jne     .refused
+  ;;     ;; ...do the guarded op...
+
+  ;; #4 — outcome reduction for a caller that only branches on ALLOW/DENY/TIMEOUT
+  ;;
+  ;;   call    elevate_client_request_outcome
+  ;;   cmp     rax, 0                       ;; ELVC_OUTCOME_ALLOW
+  ;;   je      .allowed
+  ;;   cmp     rax, 2                       ;; ELVC_OUTCOME_TIMEOUT
+  ;;   je      .timed_out
+  ;;   ;; fall through: DENY (fail-closed default)
+
 .section  POSIX  DIFFERENCES
 
 The Unix analog is `sudo`.  libpdx-elevate is different on five
@@ -224,7 +572,7 @@ observable axes:
      the scope; no in-kernel superuser exists to bypass.  See §3.3
      of design/user/model.md ("Founder is not magic").
   5. sudo logs to /var/log/auth.log optionally.  libpdx-elevate
-     journals every REQ and every APR to
+     journals every REQ, APR, and per-op use to
      /system/audit/user-events/ before the wire hop (D3 audit-first).
 
 .section  SEE  ALSO
@@ -236,6 +584,11 @@ observable axes:
   paideia-os issue #1626       KIND_ELEVATE_CHANNEL = 0x191
   paideia-os issue #1627       svc.elevate-broker registration
   paideia-os issue #1544       user_events_journal / uej_append
+  paideia-os issue #2117       sched_wait syscall (LANDED)
+  paideia-os issue #2118       elevate_channel_row_set_expire (LANDED)
+  paideia-os issue #2119       /system/policy format + seed (LANDED)
+  paideia-os issue #2121       fail-closed policy directive (LANDED)
+  paideia-os issue #2122       broker daemon dispatch body (LANDED)
 
 .section  AUTHORS
 

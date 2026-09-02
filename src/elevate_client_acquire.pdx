@@ -87,6 +87,10 @@
 // =============================================================================
 //
 //   (1) Gate mint_ctx_buf != 0                   -> ELCA_ERR_BAD_BUF.
+//   (1b) Gate reply_buf != 0                     -> ELCA_ERR_BAD_REPLY_BUF
+//        (LE.M2-hardening G9, #52: steps 4-5 read
+//        [reply_buf+8] and [reply_buf+16], so null must
+//        refuse with a diagnostic, not #PF).
 //   (2) elevate_client_request_ex_r(caps, dur, req_buf, reply_ep_id,
 //       reply_buf, timeout_ns=0) -- the full M3 flow: policy-classified
 //       timeout, REQ+APR audit journaling, retry-with-backoff on
@@ -125,7 +129,12 @@
 // ERROR BAND 0xFFFFEA50..0xFFFFEA5F
 // =============================================================================
 //
-//   0xFFFFEA50  ELCA_ERR_BAD_BUF  -- mint_ctx_buf is 0
+//   0xFFFFEA50  ELCA_ERR_BAD_BUF        -- mint_ctx_buf is 0
+//   0xFFFFEA51  ELCA_ERR_BAD_REPLY_BUF  -- LE.M2-hardening G9 (#52):
+//                                            reply_buf is 0; steps 4-5
+//                                            would #PF on the field
+//                                            loads at [reply_buf+8]
+//                                            and [reply_buf+16].
 //
 // Every other non-success return is a passthrough from a composed
 // call (ELVC_*, ELVJ_ERR_*, ELVR_ERR_*, ELCC_ERR_*) -- this function
@@ -136,6 +145,17 @@ module ElevateClientAcquire = structure {
 
   pub let ELCA_OK          : u64 = 0
   pub let ELCA_ERR_BAD_BUF : u64 = 0xFFFFEA50
+
+  // LE.M2-hardening G9 (#52): distinct diagnostic for a null reply_buf.
+  // Pre-fix the function dereferenced reply_buf ([r15+8] granted_caps,
+  // [r15+16] expire_ns) without a null gate; every caller happened to
+  // pass a real buffer today, but a null (accidentally uninitialised
+  // stack slot / a defensive integration test / a shim caller) would
+  // #PF inside libpdx-elevate rather than surface a diagnostic the
+  // consumer could branch on.  Distinct from ELCA_ERR_BAD_BUF (which
+  // covers mint_ctx_buf) so a caller can tell "you forgot the
+  // context" from "you forgot the reply buffer".
+  pub let ELCA_ERR_BAD_REPLY_BUF : u64 = 0xFFFFEA51
 
   // ==========================================================================
   // elevate_client_acquire(caps, dur, req_buf, reply_ep_id, reply_buf,
@@ -183,6 +203,15 @@ module ElevateClientAcquire = structure {
 
         cmp rbp, 0;
         je  elca_aq_bad_buf;
+        // LE.M2-hardening G9 (#52): null gate on reply_buf too.
+        // Steps 4-5 dereference [r15+8] and [r15+16]; a null r15 here
+        // is a caller programming defect that must surface as a
+        // diagnostic (ELCA_ERR_BAD_REPLY_BUF) rather than a #PF the
+        // consumer cannot classify.  Placed right after the
+        // mint_ctx_buf gate so the two "bad pointer" refusals sit
+        // together and no state is touched before either fires.
+        cmp r15, 0;
+        je  elca_aq_bad_reply_buf;
 
         // ---- Step 2: full retry+journal+dispatch flow ----
         mov rdi, rbx;                    // caps
@@ -228,6 +257,10 @@ module ElevateClientAcquire = structure {
 
       elca_aq_bad_buf:
         mov rax, 0xFFFFEA50;             // ELCA_ERR_BAD_BUF
+        jmp elca_aq_out;
+
+      elca_aq_bad_reply_buf:
+        mov rax, 0xFFFFEA51;             // ELCA_ERR_BAD_REPLY_BUF
 
       elca_aq_out:
         add rsp, 8;

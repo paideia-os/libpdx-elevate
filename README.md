@@ -283,6 +283,46 @@ proceeding.
   shell sources; `elevate_client_request_ex_ctx` (ENH-006, #17) exists
   for exactly this caller's eventual multi-job concurrency need.
 
+### Structural consumers (fail-closed today, awaiting broker-cap plumbing)
+
+Three R50 filesystem tools name `libpdx-elevate` explicitly in their
+source as the target API but ship fail-closed stubs today — the
+broker-endpoint cap plumbing they need (a real
+`Cap<KIND_IPC_ENDPOINT>` over `svc.elevate-broker` installed at a
+known cap-table slot) is not yet available at their call sites, so
+the stubs return refusals rather than half-request against a null
+broker.  When broker-cap plumbing lands (paideia-os side — the same
+kernel primitive `elevate_client_acquire`'s `mint_ctx_buf` already
+depends on), swap the stub bodies for real
+`elevate_client_acquire` + `elevate_client_require` calls; the entry
+points and their disposition logic are already in place.
+
+- **[mount.pdxfs](https://github.com/paideia-os/mount)** — call site
+  `mount_elev_require_system` (mount.M3-002 fail-closed stub, `src/
+  mount_elev.pdx`).  Target API: `elevate_client_acquire` for the
+  mount capability + `elevate_client_require` at each mount-table
+  write.  Fingerprint on the fail-closed branch names this library
+  as the planned dispatch target.
+- **[umount.pdxfs](https://github.com/paideia-os/umount)** — call
+  site `elevate_request_force_unmount` (umount.M3-002 fail-closed
+  stub, `src/umount_elev.pdx`).  Target API:
+  `elevate_client_request_ex_r` for the force-unmount grant, then
+  `elevate_client_require` for the per-mount-point unmount op.  Same
+  fingerprint discipline as mount.
+- **[mkfs.pdxfs](https://github.com/paideia-os/mkfs)** — call site
+  `mkfs_elev_require_device_write` (mkfs.M2-001 fail-closed stub,
+  `src/mkfs_elev.pdx`).  Target API: `elevate_client_acquire` for
+  the device-write capability + `elevate_client_require` at each
+  raw-block write in the format loop.  Distinct from mount / umount
+  in that mkfs uses a longer duration budget (device-format may take
+  minutes for a large volume).
+
+None of these three is *migrated* yet; they are architecturally
+committed callers whose refusal-path already routes through
+`libpdx-elevate`'s taxonomy.  A cross-repo change list matching
+broker-cap plumbing to their call sites is filed on the paideia-os
+side.
+
 **What "verified" means above:** confirmed against each repo's source
 at the enhancement audit's timestamp (2026-08-25). A caller repo's own
 issue tracker is authoritative for whether it has migrated since.

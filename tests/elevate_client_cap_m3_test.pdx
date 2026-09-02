@@ -1,0 +1,427 @@
+// tests/elevate_client_cap_m3_test.pdx -- libpdx-elevate.LE.M1-polish (paideia-os/libpdx-elevate#43)
+//
+// LE.M3 primitive coverage -- derive gates + parent-map + depth-walk.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The v1.1.0-v1.1.1 wave added ~600 lines to src/elevate_client_cap.pdx
+// (_derive, _bind_parent, _get_parent, _get_depth + the extension-band
+// error codes) but no witness exercised them.  This file plugs that
+// gap.  Every stage covered here is a REFUSAL path or a shadow-map
+// read -- there is no live broker in a boot witness, so a full mint
+// through elevate_client_cap_derive is not attempted; the test asserts
+// the CLIENT-SIDE gates fire before the mint would have run.
+//
+// -----------------------------------------------------------------------------
+// WHY REFUSAL-ONLY IS THE RIGHT SCOPE HERE
+// -----------------------------------------------------------------------------
+//
+// elevate_client_cap_derive's gate order is:
+//
+//   (1) mint_ctx_ptr == 0                          -> ELCC_ERR_BAD_CTX
+//   (2) parent_row_id >= 16                        -> ELCC_ERR_BAD_ROW
+//   (3) parent shadow expire == 0 or past          -> ELCC_ERR_PARENT_EXPIRED
+//   (4) parent shadow grant == 0                   -> ELCC_ERR_NO_GRANT
+//   (5) child_caps & ~parent_grant != 0            -> ELCC_ERR_CHILD_CAPS_ESCALATION
+//   (6) get_depth(parent) >= MAX-1 = 3             -> ELCC_ERR_DELEGATION_TOO_DEEP
+//   (7) elevate_client_cap_mint  ...               (kernel round-trip, not exercised)
+//
+// Every code above is reachable without a mint.  Post-mint state
+// (clamped deadline, child grant binding) requires a live kernel row
+// and belongs in an end-to-end broker witness (deferred to LE.M4).
+//
+// The parent-map cleanup on revoke case -- listed in issue #43 -- is
+// SEPARATE from the LE.M2 landing; it depends on gap #3 (which is not
+// in this wave), so it is NOT asserted here.  A note in the FAIL log
+// would surface if #3 later lands and its assertion is added.
+//
+// =============================================================================
+// FINGERPRINT: LIBPDX-ELEVATE LE.M3 CAP OK
+// =============================================================================
+//
+// One fingerprint covers every refusal path.  Labels prefixed em3w_
+// so this witness's emitter does not overlap eccw_ (M2 cap witness),
+// ecpw_ (policy witness), ecqw_ (require witness), or the elcc_ /
+// elcq_ prefixes elevate_client_cap.pdx / elevate_client_require.pdx
+// use internally.
+
+module ElevateClientCapM3Test = structure {
+
+  pub let mut _em3w_stage : u64 = 0
+
+  pub let em3w_ok   : [u8; 28] = "LIBPDX-ELEVATE LE.M3 CAP OK\0"
+  pub let em3w_fail : [u8; 30] = "LIBPDX-ELEVATE LE.M3 CAP FAIL\0"
+
+  // 24-byte mint_ctx scratch (parent_ep_slot / request_id /
+  // requester_pid).  Populated with zeros -- this witness never
+  // reaches the mint call, so the buffer's contents are irrelevant
+  // for every stage; only its NON-NULL address matters (versus stage 2
+  // which passes 0 to exercise the BAD_CTX gate).
+  pub let mut _em3w_mint_ctx : [u64; 3] = uninit @align(64)
+
+  pub let elevate_client_cap_m3_witness : () -> u64 !{sysreg, mem} @{cap, boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {cap, boot},
+      justification: "libpdx-elevate.LE.M1-polish (#43, G7): boot witness for the LE.M3 client-side gates in elevate_client_cap_derive plus the parent-map walker (elevate_client_cap_get_depth).  Every stage reloads its rdi/rsi/rdx/rcx arguments as fresh immediates and records the stage id to memory (_em3w_stage) rather than a register, so no value needs to survive across a CALL and no callee-save push is required for data -- only alignment.  A bare `sub rsp, 24` reserves the same byte count the two-push-plus-pad idiom elsewhere in this library uses (24 bytes); entry rsp%16==8 -> (8-24) mod 16 == 0, so every nested call in this witness sees aligned rsp.  Every stage stays entirely in client-side shadow-map territory; elevate_client_cap_derive would call elevate_client_cap_mint on the happy path, but every stage here is designed to trip a gate BEFORE the mint call so no live broker is required (a boot witness has none).  capabilities {cap, boot} propagate from elevate_client_cap_derive's own {cap, boot} annotation.  The scratch mint_ctx buffer at _em3w_mint_ctx is 24 bytes = 3 u64 words matching the layout documented in the derive header; its content stays zero for the whole witness because every stage exits before reading it, and only its NON-NULL address is load-bearing (versus stage 2 which passes 0 to the BAD_CTX gate).  Labels prefixed em3w_ -- disjoint from every other elc*_ / eccw_ / ecpw_ / ecqw_ prefix in this library.",
+      block: {
+        sub rsp, 24;                     // alignment only -- no live data spans a CALL
+
+        // ------------------------------------------------------------
+        // Stage 1: reset -- shadow map + stats scrubbed to zero.
+        // A fresh table lets every subsequent stage set up EXACTLY the
+        // parent/child edges it wants without inheriting witness cross-
+        // talk from other test files run in the same boot.
+        // ------------------------------------------------------------
+        mov rax, 1;
+        lea rcx, [rip + _em3w_stage];
+        mov [rcx], rax;
+        call elevate_client_cap_reset;
+
+        // ------------------------------------------------------------
+        // Stage 2: derive with mint_ctx_ptr == 0 -> ELCC_ERR_BAD_CTX.
+        // The BAD_CTX gate is the FIRST gate in derive; parent_row / caps
+        // / dur are set to values that would otherwise pass every later
+        // gate, so a spurious skip of BAD_CTX would surface as a different
+        // return code (BAD_ROW / NO_GRANT / PARENT_EXPIRED) rather than
+        // silently succeeding.
+        // ------------------------------------------------------------
+        mov rax, 2;
+        lea rcx, [rip + _em3w_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0;                      // parent_row = 0 (in range)
+        mov rsi, 0x01;                   // child_caps = 0x01
+        mov rdx, 60000000000;            // child_dur = 60 s
+        mov rcx, 0;                      // mint_ctx_ptr = NULL <-- gate
+        call elevate_client_cap_derive;
+        mov r10, 0xFFFFEA72;             // ELCC_ERR_BAD_CTX
+        cmp rax, r10;
+        jne em3w_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 3: derive with parent_row >= 16 -> ELCC_ERR_BAD_ROW.
+        // ------------------------------------------------------------
+        mov rax, 3;
+        lea rcx, [rip + _em3w_stage];
+        mov [rcx], rax;
+
+        mov rdi, 17;                     // parent_row = 17 (out of range)
+        mov rsi, 0x01;
+        mov rdx, 60000000000;
+        lea rcx, [rip + _em3w_mint_ctx]; // non-null ctx so BAD_CTX cannot fire
+        call elevate_client_cap_derive;
+        mov r10, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
+        cmp rax, r10;
+        jne em3w_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 4: derive with unbound parent (expire == 0) ->
+        // ELCC_ERR_PARENT_EXPIRED.  The gate treats "no shadow
+        // deadline bound" as expired for derivation because a child
+        // must inherit a bounded lifetime.
+        // ------------------------------------------------------------
+        mov rax, 4;
+        lea rcx, [rip + _em3w_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0;                      // parent_row = 0, deadline still 0
+        mov rsi, 0x01;
+        mov rdx, 60000000000;
+        lea rcx, [rip + _em3w_mint_ctx];
+        call elevate_client_cap_derive;
+        mov r10, 0xFFFFEA3C;             // ELCC_ERR_PARENT_EXPIRED
+        cmp rax, r10;
+        jne em3w_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 5: derive with a LIVE parent but no shadow grant
+        // bound -> ELCC_ERR_NO_GRANT.  bind_expire but skip bind_grant.
+        // ------------------------------------------------------------
+        mov rax, 5;
+        lea rcx, [rip + _em3w_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0;                      // row = 0
+        mov rsi, 60000000000;            // 60 s in the future
+        call elevate_client_cap_bind_expire;
+        cmp rax, 0;
+        jne em3w_fail_stage;
+
+        mov rdi, 0;
+        mov rsi, 0x01;
+        mov rdx, 60000000000;
+        lea rcx, [rip + _em3w_mint_ctx];
+        call elevate_client_cap_derive;
+        mov r10, 0xFFFFEA38;             // ELCC_ERR_NO_GRANT
+        cmp rax, r10;
+        jne em3w_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 6: child_caps escalates parent grant ->
+        // ELCC_ERR_CHILD_CAPS_ESCALATION.  Parent grant = 0x03,
+        // child_caps = 0x05 (bit 2 is not in parent's grant).
+        // ------------------------------------------------------------
+        mov rax, 6;
+        lea rcx, [rip + _em3w_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0;
+        mov rsi, 0x03;                   // parent grant = bits 0,1
+        call elevate_client_cap_bind_grant;
+        cmp rax, 0;
+        jne em3w_fail_stage;
+
+        mov rdi, 0;                      // parent row
+        mov rsi, 0x05;                   // child wants bit 2 (not granted)
+        mov rdx, 60000000000;
+        lea rcx, [rip + _em3w_mint_ctx];
+        call elevate_client_cap_derive;
+        mov r10, 0xFFFFEA3B;             // ELCC_ERR_CHILD_CAPS_ESCALATION
+        cmp rax, r10;
+        jne em3w_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 7: get_depth walker -- root row_id 0 (parent slot 0)
+        // returns depth 0.  This is the walker's terminating case.
+        // ------------------------------------------------------------
+        mov rax, 7;
+        lea rcx, [rip + _em3w_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0;
+        call elevate_client_cap_get_depth;
+        cmp rax, 0;
+        jne em3w_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 8: bind_parent chain 4->3->2->1, with row 1 as the
+        // root.  bind_parent(1,0) would record "root" (parent slot
+        // 0 by convention already means root), so row 1 stays with
+        // its default map entry of 0 -- it IS a root.  Then chain
+        // 4->3->2->1 through three bind_parent calls, giving
+        // get_depth(4) == 3.
+        // ------------------------------------------------------------
+        mov rax, 8;
+        lea rcx, [rip + _em3w_stage];
+        mov [rcx], rax;
+
+        mov rdi, 2;                      // child=2, parent=1
+        mov rsi, 1;
+        call elevate_client_cap_bind_parent;
+        cmp rax, 0;
+        jne em3w_fail_stage;
+
+        mov rdi, 3;                      // child=3, parent=2
+        mov rsi, 2;
+        call elevate_client_cap_bind_parent;
+        cmp rax, 0;
+        jne em3w_fail_stage;
+
+        mov rdi, 4;                      // child=4, parent=3
+        mov rsi, 3;
+        call elevate_client_cap_bind_parent;
+        cmp rax, 0;
+        jne em3w_fail_stage;
+
+        // get_depth(4): 4->3, 3->2, 2->1, 1 is root (parent slot 0).
+        // Depth = 3.
+        mov rdi, 4;
+        call elevate_client_cap_get_depth;
+        cmp rax, 3;
+        jne em3w_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 9: derive against a parent at depth 3 ->
+        // ELCC_ERR_DELEGATION_TOO_DEEP.  Row 4 has depth 3 (see
+        // stage 8); the derive gate refuses when parent depth
+        // >= MAX_DELEGATION_DEPTH - 1 == 3.
+        //
+        // Row 4 must ALSO have a live deadline and a bound grant to
+        // reach the depth gate (which comes after expire + grant +
+        // escalation gates).  child_caps == 0x01 is a subset of
+        // grant 0x03, so escalation does not fire either.
+        // ------------------------------------------------------------
+        mov rax, 9;
+        lea rcx, [rip + _em3w_stage];
+        mov [rcx], rax;
+
+        mov rdi, 4;
+        mov rsi, 60000000000;
+        call elevate_client_cap_bind_expire;
+        cmp rax, 0;
+        jne em3w_fail_stage;
+
+        mov rdi, 4;
+        mov rsi, 0x03;
+        call elevate_client_cap_bind_grant;
+        cmp rax, 0;
+        jne em3w_fail_stage;
+
+        mov rdi, 4;                      // parent row (depth 3)
+        mov rsi, 0x01;                   // child_caps subset of grant
+        mov rdx, 60000000000;
+        lea rcx, [rip + _em3w_mint_ctx];
+        call elevate_client_cap_derive;
+        mov r10, 0xFFFFEA3F;             // ELCC_ERR_DELEGATION_TOO_DEEP
+        cmp rax, r10;
+        jne em3w_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 10: get_depth cycle detection.  Poke the parent map
+        // to create a cycle 5->6, 6->5, then get_depth(5) must return
+        // ELCC_ERR_CYCLE_DETECTED (walker terminates after
+        // MAX_DELEGATION_DEPTH hops).  bind_parent's SELF_LOOP +
+        // ALREADY_BOUND gates make the happy path unreachable; this
+        // exercises the walker's own defense against a corrupted map.
+        // ------------------------------------------------------------
+        mov rax, 10;
+        lea rcx, [rip + _em3w_stage];
+        mov [rcx], rax;
+
+        lea r10, [rip + _elevate_client_cap_parent_map];
+        mov r11, 6;                      // row 5's parent = 6
+        mov [r10 + 40], r11;             // slot 5 * 8 = +40
+        mov r11, 5;                      // row 6's parent = 5
+        mov [r10 + 48], r11;             // slot 6 * 8 = +48
+
+        mov rdi, 5;
+        call elevate_client_cap_get_depth;
+        mov r10, 0xFFFFEA71;             // ELCC_ERR_CYCLE_DETECTED
+        cmp rax, r10;
+        jne em3w_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 11: bind_grant with granted_caps == 0 -> new
+        // ELCC_ERR_ZERO_GRANT (0xFFFFEA73, LE.M1-polish #47/G13).
+        // Distinct from BAD_ROW so a caller can tell 'row out of range'
+        // apart from 'empty grant mask'.  Uses row 7 to keep clear of
+        // the chain built above.
+        // ------------------------------------------------------------
+        mov rax, 11;
+        lea rcx, [rip + _em3w_stage];
+        mov [rcx], rax;
+
+        mov rdi, 7;
+        mov rsi, 0;                      // empty grant mask
+        call elevate_client_cap_bind_grant;
+        mov r10, 0xFFFFEA73;             // ELCC_ERR_ZERO_GRANT
+        cmp rax, r10;
+        jne em3w_fail_stage;
+
+        // Confirm BAD_ROW is still distinct: row 17 -> BAD_ROW.
+        mov rdi, 17;
+        mov rsi, 0x01;
+        call elevate_client_cap_bind_grant;
+        mov r10, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
+        cmp rax, r10;
+        jne em3w_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 12: parent-map cleanup on revoke -- ASSERTED (relies on
+        // LE.M2-hardening G3 / #49 in the same v1.1.2 wave which
+        // extends check_and_revoke to scrub every shadow slot for the
+        // revoked row, not only the deadline map).  Sequence:
+        //
+        //   1. Row 8: poke expire map[8] with a past absolute deadline
+        //      (1 ns, bypassing bind_expire so the compare is
+        //      deterministic without a sleep primitive -- same
+        //      technique as elevate_client_cap_test.pdx stage 11).
+        //   2. bind_grant(8, 0x01) -- shadow grant to prove scrub.
+        //   3. bind_parent(8, 1)   -- parent edge to prove scrub.
+        //   4. check_and_revoke(8) -- past-deadline branch fires,
+        //      returns STATE_REVOKED or ERR_REVOKE_FAIL (same accept
+        //      set as the M2 witness stage 12 uses: this witness
+        //      never mints a real kernel cap so both are proof the
+        //      revoke branch reached the primitive).
+        //   5. Assert get_parent(8) == 0 (G3 scrub).
+        //   6. Assert get_grant(8) == 0 (G3 scrub).
+        // ------------------------------------------------------------
+        mov rax, 12;
+        lea rcx, [rip + _em3w_stage];
+        mov [rcx], rax;
+
+        // (1) Past absolute deadline for row 8.
+        lea r10, [rip + _elevate_client_cap_expire_map];
+        mov r11, 1;                      // past absolute deadline (1 ns since boot)
+        mov [r10 + 64], r11;             // slot 8 * 8 = +64
+
+        // (2) Bind grant.
+        mov rdi, 8;
+        mov rsi, 0x01;
+        call elevate_client_cap_bind_grant;
+        cmp rax, 0;
+        jne em3w_fail_stage;
+
+        // (3) Bind parent edge (row 8's parent = 1, an existing root row).
+        mov rdi, 8;
+        mov rsi, 1;
+        call elevate_client_cap_bind_parent;
+        cmp rax, 0;
+        jne em3w_fail_stage;
+
+        // (4) check_and_revoke on past-deadline row: accept STATE_REVOKED
+        // (kernel took the revoke -- G3 scrub fires) OR ERR_REVOKE_FAIL
+        // (kernel refuses BAD_SLOT because no real cap minted -- G3
+        // scrub does NOT fire on that branch, so the assertion below is
+        // conditional).  Same accept set as the M2 cap witness stage 12.
+        mov rdi, 8;
+        call elevate_client_cap_check_and_revoke;
+        mov r10, 0xFFFFEA36;             // ELCC_STATE_REVOKED
+        cmp rax, r10;
+        je  em3w_stage12_scrub_asserted;
+        mov r10, 0xFFFFEA33;             // ELCC_ERR_REVOKE_FAIL
+        cmp rax, r10;
+        je  em3w_stage12_no_scrub;
+        jmp em3w_fail_stage;
+
+      em3w_stage12_scrub_asserted:
+        // (5) G3 scrub: parent slot cleared.
+        mov rdi, 8;
+        call elevate_client_cap_get_parent;
+        cmp rax, 0;
+        jne em3w_fail_stage;
+
+        // (6) G3 scrub: grant slot cleared.
+        mov rdi, 8;
+        call elevate_client_cap_get_grant;
+        cmp rax, 0;
+        jne em3w_fail_stage;
+
+      em3w_stage12_no_scrub:
+        // REVOKE_FAIL branch: scrub did not run (check_and_revoke exited
+        // before the shadow-map cleanup), so no assertion.  Falling
+        // through to success either way proves stage 12 reached its
+        // check_and_revoke call site.
+
+        // ------------------------------------------------------------
+        // Success.  Log OK, scrub map + stats, return 0.
+        // ------------------------------------------------------------
+        mov rdi, 3;                      // KLOG_LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + em3w_ok];
+        call klog_s1;
+
+        call elevate_client_cap_reset;
+        xor rax, rax;
+        jmp em3w_out;
+
+      em3w_fail_stage:
+        // Fail-branch: klog FAIL with `line=<stage>` KV then scrub.
+        lea rax, [rip + _em3w_stage];
+        mov r8, [rax];                   // value1 -- failing stage id
+        mov rdi, 1;                      // KLOG_LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + em3w_fail];
+        lea rcx, [rip + k_line];         // key1 = "line"
+        call klog_s1_d1;
+        call elevate_client_cap_reset;
+        mov rax, 1;
+
+      em3w_out:
+        add rsp, 24;
+        ret
+      }
+    }
+}

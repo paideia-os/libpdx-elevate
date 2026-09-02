@@ -68,6 +68,12 @@
 //   0xFFFFEA04  ELVC_ERR_BAD_EXPIRE    -- reply expire_ns is 0 or in the past
 //   0xFFFFEA05  ELVC_ERR_BAD_REPLY_EP  -- reply_ep_id out of [1..127]
 //   0xFFFFEA06  ELVC_ERR_BAD_CTX       -- ENH-006 (#17): ctx_buf is 0
+//   0xFFFFEA07  ELVC_ERR_BAD_REPLY_LEN -- LE.M2-hardening G8 (#51):
+//                                          endpoint_take_pending returned
+//                                          a payload_len above the frame
+//                                          max (8192); reply_buf field
+//                                          parses refused before touching
+//                                          the buffer.
 //   0xFFFFEA0C  ELVC_ERR_RECV_FAIL     -- endpoint_take_pending refused
 //                                          (kept as M1-reserved alias for parity)
 //   0xFFFFEA0D  ELVC_ERR_SEND_FAIL     -- endpoint_write_pending refused
@@ -83,6 +89,21 @@ module ElevateClientSend = structure {
   pub let ELVC_ERR_BAD_EXPIRE     : u64 = 0xFFFFEA04
   pub let ELVC_ERR_BAD_REPLY_EP   : u64 = 0xFFFFEA05
   pub let ELVC_ERR_BAD_CTX        : u64 = 0xFFFFEA06
+
+  // LE.M2-hardening G8 (#51): defensive upper-bound refusal for a
+  // reply the substrate reports as bigger than any legitimate frame.
+  // The APR payload is fixed at 32 bytes (ELVS_APR_PAYLOAD_BYTES),
+  // and the substrate frame max is 8192 (src/kernel/core/ipc/
+  // frame.pdx MAX_FRAME_BYTES).  A returned length above 8192
+  // therefore cannot correspond to any real frame the broker could
+  // have produced, and reflects either a corrupted len field or a
+  // substrate bug -- refusing before touching reply_buf keeps
+  // downstream field parses (op word at +0, granted_caps at +8,
+  // expire_ns at +16) from reading past whatever buffer the caller
+  // supplied.  Distinct from ELVC_ERR_BAD_REPLY so a caller / audit
+  // sink can tell "APR was validly shaped but semantically wrong"
+  // from "APR frame length was implausible before we ever tried".
+  pub let ELVC_ERR_BAD_REPLY_LEN  : u64 = 0xFFFFEA07
 
   // ---- Default timeouts ----
   //
@@ -430,10 +451,24 @@ module ElevateClientSend = structure {
         // Compute deadline = hpet_now_ns() + timeout_ns.  If hpet is
         // unarmed (returns 0), we treat "no monotonic clock" as
         // "cannot bound a wait" and return TIMEOUT after one loop iter.
+        //
+        // LE.M2-hardening G2 (#48) fix: timeout_ns arrives in rdx, but
+        // rdx is caller-saved -- hpet_now_ns is free to clobber it,
+        // and empirically does on the current substrate (its own
+        // internal rdtsc mulqx path writes rdx as the imul high half).
+        // Stash timeout_ns into the ALREADY-PUSHED r14 (callee-save,
+        // survives the CALL) BEFORE hpet_now_ns runs; consume from r14
+        // in the deadline compute.  Without this stash the deadline
+        // was `now + (whatever rdx happened to be)`, which is
+        // typically a huge value -- the recv loop then spins for the
+        // full u64 wraparound rather than the caller's actual
+        // timeout.  r14 is only reused later as an APR-op-word scratch
+        // at elcs_rr_got_msg, well after this add.
+        mov r14, rdx;                    // stash timeout_ns
         call hpet_now_ns;
         cmp rax, 0;
         je  elcs_rr_no_clock;
-        add rax, rdx;                    // rdx still holds timeout_ns
+        add rax, r14;                    // deadline = now + timeout_ns
         mov r13, rax;
         jmp elcs_rr_loop;
 
@@ -465,6 +500,15 @@ module ElevateClientSend = structure {
         // full op_word + body -> BAD_REPLY.
         cmp rax, 32;
         jb  elcs_rr_bad_reply;
+        // LE.M2-hardening G8 (#51): defensive upper-bound gate.  The
+        // substrate frame max is 8192 (src/kernel/core/ipc/frame.pdx
+        // MAX_FRAME_BYTES) -- a length above that reflects a
+        // corrupted len field or a substrate bug and the subsequent
+        // field parses (op word at +0, granted_caps at +8, expire_ns
+        // at +16) must never proceed against an implausible buffer.
+        // 8192 fits imm32 -> immediate compare.
+        cmp rax, 8192;
+        ja  elcs_rr_bad_reply_len;
 
         // First 8 bytes of reply_buf are the packed op_word.
         mov r14, [r12 + 0];
@@ -492,6 +536,15 @@ module ElevateClientSend = structure {
 
       elcs_rr_bad_reply:
         mov rax, 0xFFFFEA02;             // ELVC_ERR_BAD_REPLY
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcs_rr_bad_reply_len:
+        mov rax, 0xFFFFEA07;             // ELVC_ERR_BAD_REPLY_LEN
         pop r15;
         pop r14;
         pop r13;

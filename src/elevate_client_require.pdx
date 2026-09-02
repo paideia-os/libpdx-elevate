@@ -367,7 +367,7 @@ module ElevateClientRequire = structure {
   pub let elevate_client_require_scoped : (u64, u64, u64) -> u64 !{mem} @{cap, boot} =
     fn (row_id: u64) (needed_caps: u64) (scope_fp: u64) -> unsafe {
       effects: {mem}, capabilities: {cap, boot},
-      justification: "libpdx-elevate.ENH-003 (#15): elevate_client_require plus scope-match and budget-consume, both additive and both no-ops on a handle that never bound them (0 = unscoped / unbudgeted). Three callee-save pushes (r12=row_id, r13=needed_caps, r14=scope_fp) = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0, no pad needed, matching elevate_client_journal_req's shape. Step order (freshness+caps, then scope, then budget) matters only for which stat bumps first on a multi-reason refusal; a caller sees exactly one refusal code either way since each step returns immediately. capabilities {cap, boot} are elevate_client_require's own (unchanged; get_scope and consume_budget both need {}, only {mem}). Labels prefixed elcq_rs_.",
+      justification: "libpdx-elevate.ENH-003 (#15) with v1.1.2 label-prefix uniqueness fix (#44, LE.M1-polish G10): elevate_client_require plus scope-match and budget-consume, both additive and both no-ops on a handle that never bound them (0 = unscoped / unbudgeted). Three callee-save pushes (r12=row_id, r13=needed_caps, r14=scope_fp) = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0, no pad needed, matching elevate_client_journal_req's shape. Step order (freshness+caps, then scope, then budget) matters only for which stat bumps first on a multi-reason refusal; a caller sees exactly one refusal code either way since each step returns immediately. capabilities {cap, boot} are elevate_client_require's own (unchanged; get_scope and consume_budget both need {}, only {mem}). Labels prefixed elcq_sc_ (distinct from elevate_client_require_reset's elcq_rs_ so a future paideia-as label-scope tightening from function-scope to file-scope would not collide).",
       block: {
         push r12;
         push r13;
@@ -381,42 +381,42 @@ module ElevateClientRequire = structure {
         mov rsi, r13;
         call elevate_client_require;
         cmp rax, 0;
-        jne elcq_rs_out;                 // passthrough (already correctly banded)
+        jne elcq_sc_out;                 // passthrough (already correctly banded)
 
         // (2) Scope match: bound scope == 0 (unscoped) OR == scope_fp.
         mov rdi, r12;
         call elevate_client_cap_get_scope;
         cmp rax, 0;
-        je  elcq_rs_scope_ok;            // unscoped -- matches anything
+        je  elcq_sc_scope_ok;            // unscoped -- matches anything
         cmp rax, r14;
-        je  elcq_rs_scope_ok;
+        je  elcq_sc_scope_ok;
         // Mismatch.
         mov rdi, 4;                      // ELCA_ST_SCOPE_MISMATCH
         call elevate_client_require_note;
         mov rax, 0xFFFFEA62;             // ELCA_ERR_SCOPE_MISMATCH
-        jmp elcq_rs_out;
+        jmp elcq_sc_out;
 
-      elcq_rs_scope_ok:
+      elcq_sc_scope_ok:
         // (3) Budget consume.
         mov rdi, r12;
         call elevate_client_cap_consume_budget;
         cmp rax, 0;
-        je  elcq_rs_ok;
+        je  elcq_sc_ok;
         mov r10, 0xFFFFEA3A;             // ELCC_ERR_BUDGET_EXHAUSTED
         cmp rax, r10;
-        jne elcq_rs_out;                 // some other ELCC_ERR_* -- passthrough
+        jne elcq_sc_out;                 // some other ELCC_ERR_* -- passthrough
         push rax;
         sub rsp, 8;
         mov rdi, 5;                      // ELCA_ST_BUDGET_EXHAUSTED
         call elevate_client_require_note;
         add rsp, 8;
         pop rax;
-        jmp elcq_rs_out;
+        jmp elcq_sc_out;
 
-      elcq_rs_ok:
+      elcq_sc_ok:
         xor rax, rax;                    // ELCA_OK
 
-      elcq_rs_out:
+      elcq_sc_out:
         pop r14;
         pop r13;
         pop r12;

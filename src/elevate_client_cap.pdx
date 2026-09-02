@@ -133,6 +133,19 @@
 //                                          the buffer layout).  Refused
 //                                          before any nested call so no
 //                                          shadow map has been touched.
+//   0xFFFFEA73  ELCC_ERR_ZERO_GRANT
+//                                       -- LE.M1-polish (#47, G13) v1.1.2 fix:
+//                                          elevate_client_cap_bind_grant called
+//                                          with granted_caps == 0.  Distinct
+//                                          from ELCC_ERR_BAD_ROW so a consumer
+//                                          can tell "row_id out of range"
+//                                          apart from "empty grant mask" -- a
+//                                          broker never returns an empty grant
+//                                          (elv_check_grant / ELV_CAP_MASK_VALID
+//                                          both exclude 0), so a caller reaching
+//                                          this code has a programming defect
+//                                          on the client side, not a runtime
+//                                          protocol failure.
 
 module ElevateClientCap = structure {
 
@@ -175,6 +188,7 @@ module ElevateClientCap = structure {
   // Extension band -- collides with nothing (see file header).
   pub let ELCC_ERR_CYCLE_DETECTED        : u64 = 0xFFFFEA71
   pub let ELCC_ERR_BAD_CTX               : u64 = 0xFFFFEA72
+  pub let ELCC_ERR_ZERO_GRANT            : u64 = 0xFFFFEA73  // LE.M1-polish (#47)
 
   // LE.M3-003 (#28) delegation depth cap.  Root grant (depth 0) + up
   // to 3 derived-child hops covers every currently-imagined consumer
@@ -526,12 +540,18 @@ module ElevateClientCap = structure {
   // a caller passing 0 here is a programming error, not a legitimate
   // "no caps" grant -- refusing it keeps a 0 slot meaning exactly one
   // thing: "never bound" (see ELCC_ERR_NO_GRANT in the file header).
+  //
+  // v1.1.2 (#47, LE.M1-polish G13): the empty-grant gate returns a
+  // distinct ELCC_ERR_ZERO_GRANT (0xFFFFEA73) rather than reusing
+  // ELCC_ERR_BAD_ROW.  A caller inspecting the return can now tell
+  // "row_id out of range" from "empty grant mask"; the two conditions
+  // have different fixes and both are worth surfacing separately.
   // ==========================================================================
 
   pub let elevate_client_cap_bind_grant : (u64, u64) -> u64 !{mem} @{} =
     fn (row_id: u64) (granted_caps: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.ENH-001 (#11): shadow the APR's granted_caps for row_id. Two callee-save pushes (r12=row_id, r13=granted_caps); no nested call, no alignment pad needed. granted_caps==0 is refused (BAD_ROW's error code is reused for this gate too -- see ELCC_ERR_BAD_CAPS discussion in the function doc; a distinct code is not warranted because this is a caller-side program-defect gate, not a runtime condition a caller branches on) so a 0 slot in the map keeps exactly one meaning: 'never bound'. Labels prefixed elcc_bg_.",
+      justification: "libpdx-elevate.ENH-001 (#11) with v1.1.2 zero-grant sentinel (#47, LE.M1-polish G13): shadow the APR's granted_caps for row_id. Two callee-save pushes (r12=row_id, r13=granted_caps); no nested call, no alignment pad needed. granted_caps==0 is refused with a DISTINCT sentinel (ELCC_ERR_ZERO_GRANT 0xFFFFEA73, extension band) so a consumer reading the return can discriminate 'row_id >= 16' (ELCC_ERR_BAD_ROW 0xFFFFEA30) from 'grant mask empty' (ELCC_ERR_ZERO_GRANT 0xFFFFEA73). A broker never returns granted=0 (elv_check_grant / ELV_CAP_MASK_VALID both exclude 0), so a caller reaching ELCC_ERR_ZERO_GRANT has a programming defect on the client side, not a runtime protocol failure; the two codes therefore point at genuinely different fixes. A 0 slot in the grant map still means exactly one thing ('never bound' -> ELCC_ERR_NO_GRANT on read, see file header). Labels prefixed elcc_bg_.",
       block: {
         push r12;
         push r13;
@@ -542,7 +562,7 @@ module ElevateClientCap = structure {
         cmp r12, 16;
         jae elcc_bg_bad_row;
         cmp r13, 0;
-        je  elcc_bg_bad_row;
+        je  elcc_bg_zero_grant;
 
         lea r10, [rip + _elevate_client_cap_grant_map];
         mov [r10 + r12 * 8], r13;
@@ -554,6 +574,12 @@ module ElevateClientCap = structure {
 
       elcc_bg_bad_row:
         mov rax, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_bg_zero_grant:
+        mov rax, 0xFFFFEA73;             // ELCC_ERR_ZERO_GRANT (extension band)
         pop r13;
         pop r12;
         ret
@@ -1008,10 +1034,33 @@ module ElevateClientCap = structure {
         ret;
 
       elcc_cr_revoked:
-        // Clear the shadow deadline so a second check_and_revoke
-        // returns NO_DEADLINE (the row is truly gone).
-        lea r10, [rip + _elevate_client_cap_expire_map];
+        // Clear EVERY shadow slot for this row_id so a second
+        // check_and_revoke returns NO_DEADLINE and no subsequent
+        // require / require_scoped / derive can see stale bookkeeping
+        // for a row the kernel has taken away.  LE.M2-hardening G3
+        // (#49): pre-fix only the deadline map was cleared; the
+        // grant / scope / budget / parent maps kept their pre-revoke
+        // values, so if the kernel later reused this row_id (either
+        // because ownership was reassigned or, more concretely,
+        // because elevate_client_cap_reset() was NOT called between
+        // uses in a long-lived process), the freshly-minted-into slot
+        // inherited the previous grant's granted_caps and delegation
+        // chain -- and elevate_client_require would answer "yes,
+        // still covers those caps" against the STALE mask.  Clearing
+        // every field-map here matches elevate_client_cap_reset's
+        // per-map scrub set (see that function's loop list); adding
+        // a new field map elsewhere is now a paste-and-rename here
+        // too, kept intentionally parallel.
         xor r11, r11;
+        lea r10, [rip + _elevate_client_cap_expire_map];
+        mov [r10 + r12 * 8], r11;
+        lea r10, [rip + _elevate_client_cap_grant_map];
+        mov [r10 + r12 * 8], r11;
+        lea r10, [rip + _elevate_client_cap_scope_map];
+        mov [r10 + r12 * 8], r11;
+        lea r10, [rip + _elevate_client_cap_budget_map];
+        mov [r10 + r12 * 8], r11;
+        lea r10, [rip + _elevate_client_cap_parent_map];
         mov [r10 + r12 * 8], r11;
 
         mov rdi, 1;                      // ELCC_ST_AUTO_REVOKES
@@ -1315,22 +1364,73 @@ module ElevateClientCap = structure {
         call elevate_client_cap_note;
 
         // ---- Bind child deadline (clamped absolute) ----
+        // LE.M2-hardening G4 (#50): every bind_* return is checked
+        // and, on any non-OK, the just-minted kernel row is revoked +
+        // every shadow slot for it is scrubbed before the FIRST
+        // non-OK error is propagated upward.  Rationale: post-fix,
+        // bind_grant refuses granted_caps==0 with ELCC_ERR_ZERO_GRANT
+        // (LE.M1-polish add) and bind_parent refuses a stale slot
+        // with ELCC_ERR_PARENT_ALREADY_BOUND (surfaces when G3 has
+        // NOT yet cleared the parent map on a prior revoke) --
+        // either failure means the child row exists in the kernel
+        // and MAY be partially shadow-bound (deadline set, grant
+        // not, say) which every downstream _require path would then
+        // misread.  Revoking + scrubbing on failure keeps the "row
+        // present <=> every shadow field bound" invariant.
         mov rdi, r14;
         mov rsi, r13;                    // clamped deadline
         call elevate_client_cap_bind_expire_abs;
-        // (Ignore return: BAD_ROW impossible after mint returned r14<16.)
+        cmp rax, 0;
+        jne elcc_dv_bind_fail;
 
         // ---- Bind child grant ----
         mov rdi, r14;
         mov rsi, r12;                    // child_caps
         call elevate_client_cap_bind_grant;
+        cmp rax, 0;
+        jne elcc_dv_bind_fail;
 
         // ---- Bind parent edge ----
         mov rdi, r14;                    // child
         mov rsi, rbx;                    // parent (preserved through the whole function)
         call elevate_client_cap_bind_parent;
+        cmp rax, 0;
+        jne elcc_dv_bind_fail;
 
         mov rax, r14;                    // child_row_id
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcc_dv_bind_fail:
+        // Stash the failure code (r15 held parent_expire, dead since
+        // the clamp step -- reuse it as the saved-error slot).  Then
+        // scrub every shadow slot for r14 in the exact same order
+        // elevate_client_cap_reset uses per map and issue the kernel
+        // revoke.  Best-effort cleanup: the revoke return is ignored
+        // because the caller already has a diagnostic (the original
+        // bind_* code in r15) and a BAD_SLOT here would only mean
+        // "no row to revoke", which is fine.
+        mov r15, rax;                    // save first non-OK
+        xor r11, r11;
+        lea r10, [rip + _elevate_client_cap_expire_map];
+        mov [r10 + r14 * 8], r11;
+        lea r10, [rip + _elevate_client_cap_grant_map];
+        mov [r10 + r14 * 8], r11;
+        lea r10, [rip + _elevate_client_cap_scope_map];
+        mov [r10 + r14 * 8], r11;
+        lea r10, [rip + _elevate_client_cap_budget_map];
+        mov [r10 + r14 * 8], r11;
+        lea r10, [rip + _elevate_client_cap_parent_map];
+        mov [r10 + r14 * 8], r11;
+        mov rdi, r14;                    // child row_id to revoke
+        call elevate_channel_cap_revoke;
+        mov rax, r15;                    // propagate the FIRST non-OK
         add rsp, 8;
         pop rbp;
         pop r15;

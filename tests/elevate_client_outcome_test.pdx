@@ -83,8 +83,8 @@ module ElevateClientOutcomeTest = structure {
 
   pub let mut _ecow_stage : u64 = 0
 
-  pub let ecow_ok   : [u8; 43] = "LIBPDX-ELEVATE R90-XREPO.011.M1-006 OK\n\0\0\0\0\0"
-  pub let ecow_fail : [u8; 45] = "LIBPDX-ELEVATE R90-XREPO.011.M1-006 FAIL\n\0\0\0\0\0"
+  pub let ecow_ok   : [u8; 42] = "LIBPDX-ELEVATE R90-XREPO.011.M1-006 OK\0\0\0\0\0"
+  pub let ecow_fail : [u8; 44] = "LIBPDX-ELEVATE R90-XREPO.011.M1-006 FAIL\0\0\0\0\0"
 
   pub let elevate_client_outcome_witness : () -> u64 !{sysreg, mem} @{boot} =
     fn () -> unsafe {
