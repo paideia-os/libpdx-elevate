@@ -2,13 +2,57 @@
 
 **Wave:** R49 shared library
 **Current milestone:** M5 (signed 1.0 release) — complete; M6
-(enhancement wave, v1.1.0) — complete, unreleased (no signed tag cut yet)
-**Version:** 1.0.0 (2026-08-22) tagged; v1.1.0 hardening landed on
-`main`, tag/signing pending a release pass
+(enhancement wave, v1.1.0) — complete, unreleased (no signed tag cut yet);
+LE.M1-M3 (multilevel-chain foundations, v1.1.0 continuation) —
+complete on main (see per-ticket table in `CHANGELOG.md`), unreleased;
+v1.1.1 PATCH (LE.M3-001 real-mint-args pass) — complete on `main`,
+supersedes the v1.1.0 label (which is retired without a signed tag)
+**Version:** 1.0.0 (2026-08-22) tagged; v1.1.1 (v1.1.0-wave +
+LE.M3-001 real-mint-args fix) landed on `main`, tag/signing pending a
+release pass
 
 See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full
-M1–M5 breakdown, and `.plans/enhancement-plan.md` for the M6
-(post-1.0.0) rationale.
+M1–M5 breakdown, `.plans/enhancement-plan.md` for the M6 (post-1.0.0)
+rationale, and the CHANGELOG's v1.1.0 entry for the LE.M1-M3 landings +
+what's explicitly deferred to the LE.M4-M7 follow-up wave.
+
+## LE.M1-M3 — multilevel-chain foundations (this pass, 2026-09-02)
+
+Filed under milestones `LE.M1-polish`, `LE.M2-hardening`,
+`LE.M3-multilevel` (issues #19-#28 + #37-#38).  M3 landed in full —
+`elevate_client_cap_derive` + parent-row shadow map + depth-bounded
+delegation.  M1/M2 landed selectively; see the per-ticket table in
+`CHANGELOG.md`.
+
+The narrow-slice landed here is the client-side primitive that lets a
+consumer (a `shell` or `pkg`-style tool) derive a scoped, bounded
+child cap from an already-held parent cap and shadow the delegation
+chain in the library for a subsequent LE.M7 revoke-cascade to walk.
+Kernel-side blocker (a real `elevate_channel_cap_derive_inner`
+primitive that mints against a parent row's ep slot rather than a
+caller-supplied broker cap) is tracked as a companion paideia-os
+issue; the current implementation mints via `elevate_client_cap_mint`
+using the caller's OWN broker-endpoint cap slot, which the caller
+supplies via the v1.1.1 `mint_ctx_ptr` argument (a 3-word buffer:
+parent_ep_slot, request_id, requester_pid — layout-compatible with
+the first three words of `elevate_client_acquire`'s `mint_ctx_buf`).
+This is functionally correct for shadow bookkeeping but consumes an
+extra kernel-table row per derive.  The rewrite to the eventual real
+derive primitive remains a plug-in replacement of one CALL site.
+
+**v1.1.1 note (2026-09-02):** the v1.1.0 landing of LE.M3-001 was
+documented as "mints via caller's own broker cap slot" but actually
+hardcoded `parent_ep_slot`/`request_id`/`requester_pid` to zero at
+the mint call, making the entire derive path return
+`ELCC_ERR_MINT_FAIL` end-to-end for any real caller.  v1.1.1 wires
+the caller-owned `mint_ctx_ptr` through — see the derive header in
+`src/elevate_client_cap.pdx` and the LE.M3-001 row in `CHANGELOG.md`.
+Source-breaking to a 3-arg caller of `_derive`; there are no working
+3-arg callers because the 3-arg form was non-functional.
+
+LE.M4-M7 (issues #29-#36) — reap, attestation, audit sink,
+revoke-cascade — all DEFERRED to the follow-up wave; comment posted
+on each issue.
 
 ## M6 — enhancement wave (complete)
 

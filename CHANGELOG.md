@@ -8,19 +8,102 @@ covers.
 
 ---
 
-## Unreleased — v1.1.0 (M6 hardening wave complete, no signed tag yet)
+## Unreleased — v1.1.1 (LE.M3-001 real-mint-args pass on top of the v1.1.0 wave, no signed tag yet)
 
-Post-1.0.0 enhancement wave (`.plans/enhancement-plan.md`), issues
-#11–#17, all LANDED on `main`.  The 1.0.0 client half was complete
-but advisory-only: nothing forced a consumer to present a grant
-before performing the privileged operation it gated, and its one
-real entry point never dispatched.  v1.1.0 adds a credential-shaped
-surface alongside the status-shaped one and retires the ambiguous
-stub name.  See `STATUS.md`'s M6 close-out for the full table and
-what remains explicitly deferred (kernel broker daemon body, full
-singleton retirement, libpdx-cap.M2 / libpdx-audit.M2 swaps).  Cutting
-the v1.1.0 tag + signed manifest is a separate release step
-(`.plans/mirror-push.md`), not part of this wave.
+v1.1.1 is a PATCH over the v1.1.0-unreleased state on `main`.  It
+carries one narrow behavioural fix — `elevate_client_cap_derive` now
+accepts a caller-owned `mint_ctx_ptr` and mints under the caller's
+real broker cap slot, instead of the v1.1.0 xor-zero placeholders that
+made the LE.M3-001 landing non-functional end-to-end (kernel-side
+`kind_elevate_channel.pdx` indexes the passed slot straight into the
+flat 256-slot cap_table with only a `KIND_IPC_ENDPOINT` check, so any
+caller whose broker cap did not accidentally live at slot 0 got
+`ELCC_ERR_MINT_FAIL`).  Source-breaking to any consumer that called
+the 3-arg derive form — but the v1.1.0 3-arg form was documented but
+non-functional, so no working consumer of it can exist.  See the
+LE.M3-001 row below and the derive header in
+`src/elevate_client_cap.pdx` for the full mint_ctx_ptr layout.
+
+Everything from the v1.1.0-unreleased wave carries forward unchanged.
+The v1.1.0 label is retired without a signed tag; v1.1.1 supersedes
+it on `main` and the release step (`.plans/mirror-push.md`) will
+tag/sign v1.1.1 directly.
+
+Two waves rolled into a single v1.1.x minor bump — none source-breaking,
+all additive over the v1.0.0 API (with the v1.1.1 exception noted
+above for the `_derive` signature only):
+
+* **M6 (enhancement wave):** issues #11–#17, all LANDED on `main`.
+  Credential-shaped surface (`elevate_client_acquire` → `_require`),
+  scope + budget binding, per-op audit record, retirement of the
+  fail-open `ELVC_STUB`-means-proceed sentinel, and the initial
+  explicit-context (`_ex_ctx`) variant.
+* **LE.M1-M3 (multilevel-chain foundations):** issues #19–#28 + #37–#38,
+  landed selectively (see per-ticket table below).  M3 is the
+  substantive core — `elevate_client_cap_derive`, parent-row shadow map,
+  depth-bounded delegation.  M1/M2 landed partially with the remainder
+  documented as deferred to the follow-up wave.
+
+See `STATUS.md`'s M6 close-out and the LE.M1-M3 table below for the
+complete state.  Cutting the v1.1.0 tag + signed manifest is a
+separate release step (`.plans/mirror-push.md`), not part of this
+wave.
+
+### LE.M1-M3 landings (this pass, 2026-09-02)
+
+Follow-up enhancement wave filed under milestones LE.M1-polish,
+LE.M2-hardening, LE.M3-multilevel.  Scope was narrowed to the
+multilevel-chain foundations that other consumers depend on; M4-M7
+(reap, attestation, audit sink, revoke-cascade) explicitly deferred
+to a future wave.  Full per-ticket state:
+
+| ID       | #  | State     | Notes                                                                                                                                     |
+|----------|----|-----------|-------------------------------------------------------------------------------------------------------------------------------------------|
+| M1-001   | 19 | DEFERRED  | Unit-test coverage for send/acquire/journal/retry — 4 new witnesses; carved out to keep this landing tight.                              |
+| M1-002   | 20 | DEFERRED  | Explicit-context variants for `_ex_j` / `_ex_r` / `_acquire` — deferred until a concurrent consumer surfaces (see .plans/enhancement-plan.md §4 rationale). |
+| M1-003   | 21 | DEFERRED  | Cut v1.1.0 signed release tag — a separate release step per `.plans/mirror-push.md`.                                                     |
+| M1-004   | 22 | DEFERRED  | README/STATUS Callers list re-verification — needs external repo (rm, pkg) audit pass; scheduled with the release tag.                   |
+| M1-005   | 37 | DEFERRED  | Result-band collision defence witness — carved out to keep the landing tight; the encoder already refuses duplicate `pub let` bindings.  |
+| M2-001   | 23 | BLOCKED   | Swap `elevate_client_cap_narrow_stub` to real `libpdx-cap.cap_narrow_rights` — libpdx-cap.M2 has NOT landed; entry still stubbed as documented in `deps.list`. |
+| M2-002   | 38 | BLOCKED   | Swap `journal_req/_apr/_op` bodies to libpdx-audit — `libpdx-audit` HEAD carries `!{mem, sysreg} @{cap, sched}` on its trio, which would force a v2.0 cap-manifest ripple on every downstream tool. Filed cross-repo request for a thin `!{mem}` wrapper on the libpdx-audit side; swap unblocks the moment that lands. |
+| M2-003   | 24 | BLOCKED   | End-to-end broker witness against paideia-os live daemon — needs the broker dispatch body upstream (paideia-os#2122).                    |
+| M2-004   | 25 | DEFERRED  | Fail-closed audit-first invariant regression witness — carved out; the invariant is enforced today at every REQ-journal call site by the audit-first sequence in `elevate_client_request_ex_j`. |
+| M3-001   | 26 | **LANDED (v1.1.1 fix)** | `elevate_client_cap_derive(parent_row, child_caps, child_dur_ns, mint_ctx_ptr) -> child_row_id`. `mint_ctx_ptr` (v1.1.1) points at a caller-owned 3-word / 24-byte buffer — `[+0]=parent_ep_slot`, `[+8]=request_id`, `[+16]=requester_pid` — layout-compatible with the FIRST three words of `elevate_client_acquire`'s `mint_ctx_buf` so a consumer holding an acquire ctx may pass its same address here. The mint now actually uses the caller's broker-endpoint cap slot; v1.1.0's xor-zero placeholders made the feature return `ELCC_ERR_MINT_FAIL` end-to-end. Populates the child's shadow deadline (clamped `min(now+dur, parent_expire)`), grant map (subset-checked against parent, else `ELCC_ERR_CHILD_CAPS_ESCALATION 0xFFFFEA3B`), and parent-edge. Refuses on `ELCC_ERR_BAD_CTX 0xFFFFEA72` (null ctx), `ELCC_ERR_PARENT_EXPIRED 0xFFFFEA3C`, `ELCC_ERR_NO_GRANT 0xFFFFEA38`, `ELCC_ERR_DELEGATION_TOO_DEEP 0xFFFFEA3F`. Bumps `ELCC_ST_DERIVES = 5`. |
+| M3-002   | 27 | **LANDED** | Parent-row shadow map (`_elevate_client_cap_parent_map`, 16 slots) + `elevate_client_cap_bind_parent`, `_get_parent`, `_get_depth`. `bind_parent` refuses `ELCC_ERR_PARENT_SELF_LOOP 0xFFFFEA3D` (r,r) and `ELCC_ERR_PARENT_ALREADY_BOUND 0xFFFFEA3E` (rebind attempt). `_get_depth` is a bounded walk returning `ELCC_ERR_CYCLE_DETECTED 0xFFFFEA71` (extension band) if the map is corrupted past MAX_DELEGATION_DEPTH hops. |
+| M3-003   | 28 | **LANDED** | `ELCC_MAX_DELEGATION_DEPTH = 4` (root + up to 3 derived hops). Enforced in `elevate_client_cap_derive` before mint via `_get_depth(parent) < MAX - 1`. Widening later is backward-compatible; narrowing is not. |
+
+Deferred M4-M7 tickets (#29-#36) are commented on their respective
+GitHub issues with a pointer to this v1.1.0 release; they will be
+picked up in the follow-up Phase 2 wave when other consumers surface
+a need.  See:
+
+- #29 LE.M4-001 per-cap-mask duration ceilings on validator
+- #30 LE.M4-002 `elevate_client_cap_reap_expired` — idle-time sweep
+- #31 LE.M5-001 delegation-with-attestation record (`ELVJ_EVT_ATTEST`)
+- #32 LE.M5-002 attestation-required rows (`bind_attestation_required` flag)
+- #33 LE.M6-001 signed audit sink to `/system/audit/elevate.log`
+- #34 LE.M6-002 per-handle `last_audit_seq` + `last_audit_kind` attribution surface
+- #35 LE.M7-001 `elevate_client_cap_revoke_cascade` over child chain
+- #36 LE.M7-002 broker-triggered revoke propagation via `drain_broker_exp`
+
+### Error-band footprint added by this pass
+
+- `0xFFFFEA3B..0xFFFFEA3F` fill out the last five slots of the
+  `ElevateClientCap` band with LE.M3 codes (see per-code table in
+  `src/elevate_client_cap.pdx` header).
+- `0xFFFFEA70..0xFFFFEA7F` opens an EXTENSION band; the v1.1.1
+  patch adds `0xFFFFEA72 ELCC_ERR_BAD_CTX` (null `mint_ctx_ptr`)
+  alongside `0xFFFFEA71 ELCC_ERR_CYCLE_DETECTED`.  Remainder reserved
+  for the eventual M7 revoke-cascade codes.
+
+### Dependency deltas
+
+- `libpdx-cap` — status unchanged (PENDING, blocking M2-001).
+- `libpdx-audit` — status unchanged (PENDING, blocking M2-002).  This
+  pass adds a rationale note in `src/elevate_client_journal.pdx`
+  header explaining the cap-manifest ripple that keeps the swap
+  deferred; a companion issue on libpdx-audit will request a thin
+  `!{mem}`-only wrapper.
 
 - **ENH-005 (#12)** — `elevate_client_request` **renamed** to
   `elevate_client_request_norealize` (`elevate_client.pdx`); the old

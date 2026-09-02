@@ -88,6 +88,51 @@
 //                                     -- ENH-003 (#15): consume_budget
 //                                        called on a row whose bound
 //                                        budget has already reached 0.
+//   0xFFFFEA3B  ELCC_ERR_CHILD_CAPS_ESCALATION
+//                                     -- LE.M3-001 (#26): derive attempted
+//                                        with a child mask that includes
+//                                        bits not in the parent's granted
+//                                        mask.  Refused before mint.
+//   0xFFFFEA3C  ELCC_ERR_PARENT_EXPIRED
+//                                     -- LE.M3-001 (#26): derive attempted
+//                                        against a parent row whose
+//                                        shadow deadline is already past.
+//   0xFFFFEA3D  ELCC_ERR_PARENT_SELF_LOOP
+//                                     -- LE.M3-002 (#27): bind_parent(r,r)
+//                                        refused; a row cannot be its own
+//                                        parent (would create a 1-cycle
+//                                        that get_depth would loop on).
+//   0xFFFFEA3E  ELCC_ERR_PARENT_ALREADY_BOUND
+//                                     -- LE.M3-002 (#27): bind_parent
+//                                        called on a row whose parent
+//                                        slot is already non-zero.
+//                                        Rebinding is a client-side bug.
+//   0xFFFFEA3F  ELCC_ERR_DELEGATION_TOO_DEEP
+//                                     -- LE.M3-003 (#28): derive would push
+//                                        the chain past
+//                                        ELCC_MAX_DELEGATION_DEPTH.
+//
+// =============================================================================
+// EXTENSION BAND 0xFFFFEA70..0xFFFFEA7F (LE.M3)
+// =============================================================================
+//
+//   0xFFFFEA71  ELCC_ERR_CYCLE_DETECTED
+//                                       -- LE.M3-002 (#27): get_depth
+//                                          walked ELCC_MAX_DELEGATION_DEPTH
+//                                          hops without reaching a root.
+//                                          Sentinel for a corrupted map;
+//                                          bind_parent's SELF_LOOP and
+//                                          ALREADY_BOUND gates make the
+//                                          happy-path unreachable.
+//   0xFFFFEA72  ELCC_ERR_BAD_CTX
+//                                       -- LE.M3-001 (#26) v1.1.1 fix:
+//                                          elevate_client_cap_derive called
+//                                          with a NULL mint_ctx_ptr (the 4th
+//                                          argument added in v1.1.1 -- see
+//                                          the derive function header for
+//                                          the buffer layout).  Refused
+//                                          before any nested call so no
+//                                          shadow map has been touched.
 
 module ElevateClientCap = structure {
 
@@ -121,6 +166,21 @@ module ElevateClientCap = structure {
   pub let ELCC_ERR_NO_GRANT      : u64 = 0xFFFFEA38
   pub let ELCC_ERR_BAD_BUDGET    : u64 = 0xFFFFEA39
   pub let ELCC_ERR_BUDGET_EXHAUSTED : u64 = 0xFFFFEA3A
+  pub let ELCC_ERR_CHILD_CAPS_ESCALATION : u64 = 0xFFFFEA3B
+  pub let ELCC_ERR_PARENT_EXPIRED        : u64 = 0xFFFFEA3C
+  pub let ELCC_ERR_PARENT_SELF_LOOP      : u64 = 0xFFFFEA3D
+  pub let ELCC_ERR_PARENT_ALREADY_BOUND  : u64 = 0xFFFFEA3E
+  pub let ELCC_ERR_DELEGATION_TOO_DEEP   : u64 = 0xFFFFEA3F
+
+  // Extension band -- collides with nothing (see file header).
+  pub let ELCC_ERR_CYCLE_DETECTED        : u64 = 0xFFFFEA71
+  pub let ELCC_ERR_BAD_CTX               : u64 = 0xFFFFEA72
+
+  // LE.M3-003 (#28) delegation depth cap.  Root grant (depth 0) + up
+  // to 3 derived-child hops covers every currently-imagined consumer
+  // pattern (shell -> job -> child-tool -> helper).  Widening later is
+  // backward-compatible; narrowing later is not.  See #28.
+  pub let ELCC_MAX_DELEGATION_DEPTH      : u64 = 4
 
   // ---- Client-side shadow deadline map ----
   //
@@ -172,6 +232,19 @@ module ElevateClientCap = structure {
   pub let mut _elevate_client_cap_scope_map  : [u64; 16] = uninit @align(64)
   pub let mut _elevate_client_cap_budget_map : [u64; 16] = uninit @align(64)
 
+  // ---- LE.M3-002 (#27) shadow parent-row map ----
+  //
+  // Slot i records the parent row_id for row i, or 0 for a root row
+  // (a grant obtained directly from the broker rather than derived
+  // from a parent).  0 as "root" is unambiguous because bind_parent
+  // refuses self-loops with ELCC_ERR_PARENT_SELF_LOOP, and get_depth
+  // discriminates a derived child of row 0 from a root by the depth
+  // walk itself (root rows have _get_depth == 0).
+  //
+  // Populated only through elevate_client_cap_bind_parent; a row
+  // minted directly (bypassing _derive) always has slot == 0.
+  pub let mut _elevate_client_cap_parent_map : [u64; 16] = uninit @align(64)
+
   // ---- Client-side counters ----
   //
   //   0 mints        successful cap mints (rax < ELCC_MAX_ROWS)
@@ -188,6 +261,7 @@ module ElevateClientCap = structure {
   pub let ELCC_ST_CHECKS_LIVE  : u64 = 2
   pub let ELCC_ST_MINT_FAILS   : u64 = 3
   pub let ELCC_ST_REVOKE_FAILS : u64 = 4
+  pub let ELCC_ST_DERIVES      : u64 = 5   // LE.M3-001 (#26)
   pub let ELCC_ST_MAX          : u64 = 8
 
   // ==========================================================================
@@ -201,7 +275,7 @@ module ElevateClientCap = structure {
   pub let elevate_client_cap_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M2-003 (#5), extended at ENH-001 (#11) and ENH-003 (#15): scrub the deadline map, the grant map, the scope map, the budget map, and the stats. Boot / teardown only. Five independent loops so the arrays' lengths do not have to be composed in code. Leaf. Labels prefixed elcc_rs_.",
+      justification: "libpdx-elevate.M2-003 (#5), extended at ENH-001 (#11), ENH-003 (#15), and LE.M3-002 (#27): scrub every 16-slot shadow map (deadline, grant, scope, budget, parent) and the stats. Boot / teardown only. Six independent loops so the arrays' lengths do not have to be composed in code; adding a new map is a paste-and-rename of one loop. Leaf. Labels prefixed elcc_rs_.",
       block: {
         lea r10, [rip + _elevate_client_cap_expire_map];
         xor rax, rax;
@@ -235,6 +309,14 @@ module ElevateClientCap = structure {
         add rcx, 1;
         cmp rcx, 16;
         jb  elcc_rs_budget;
+
+        lea r10, [rip + _elevate_client_cap_parent_map];
+        xor rcx, rcx;
+      elcc_rs_parent:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  elcc_rs_parent;
 
         lea r10, [rip + _elevate_client_cap_stats];
         xor rcx, rcx;
@@ -938,6 +1020,401 @@ module ElevateClientCap = structure {
         add rsp, 8;
         pop r13;
         pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_cap_bind_parent(child, parent) -> ELCC_OK | ELCC_ERR_*
+  // elevate_client_cap_get_parent(row)            -> parent_row_id | 0
+  // elevate_client_cap_get_depth(row)             -> depth | ELCC_ERR_CYCLE_DETECTED
+  //
+  // LE.M3-002 (#27).  Parent-row shadow map.  bind_parent is called
+  // internally by elevate_client_cap_derive to record the parent -> child
+  // edge.  A row's parent slot is 0 iff the row is a root (grant obtained
+  // directly from the broker); get_depth walks the map iteratively,
+  // bounded at ELCC_MAX_DELEGATION_DEPTH so a corrupted map cannot
+  // wedge the walker.
+  //
+  // Refusals:
+  //   ELCC_ERR_PARENT_SELF_LOOP     -- bind_parent(r, r)
+  //   ELCC_ERR_PARENT_ALREADY_BOUND -- bind_parent on a row whose slot
+  //                                    is already non-zero (rebinding
+  //                                    is a client-side bug -- a child
+  //                                    can only have one parent)
+  //   ELCC_ERR_BAD_ROW              -- either row_id >= 16
+  // ==========================================================================
+
+  pub let elevate_client_cap_bind_parent : (u64, u64) -> u64 !{mem} @{} =
+    fn (child_row_id: u64) (parent_row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.LE.M3-002 (#27): record child->parent edge for the delegation-chain walker (get_depth) and future LE.M7 revoke-cascade. Two callee-save pushes (r12=child, r13=parent); no nested call so no alignment pad. Gates in order: child<16, parent<16, child!=parent (SELF_LOOP), existing slot==0 (ALREADY_BOUND). Frame prologue implicit. Labels prefixed elcc_bp_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rdi;                    // child
+        mov r13, rsi;                    // parent
+
+        cmp r12, 16;
+        jae elcc_bp_bad_row;
+        cmp r13, 16;
+        jae elcc_bp_bad_row;
+        cmp r12, r13;
+        je  elcc_bp_self_loop;
+
+        lea r10, [rip + _elevate_client_cap_parent_map];
+        mov rax, [r10 + r12 * 8];
+        cmp rax, 0;
+        jne elcc_bp_already;
+
+        mov [r10 + r12 * 8], r13;
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_bp_self_loop:
+        mov rax, 0xFFFFEA3D;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_bp_already:
+        mov rax, 0xFFFFEA3E;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcc_bp_bad_row:
+        mov rax, 0xFFFFEA30;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  pub let elevate_client_cap_get_parent : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.LE.M3-002 (#27): bounded read of the parent-row shadow map. Out-of-range returns 0 (same convention as _get_expire). Leaf. Labels prefixed elcc_gp_.",
+      block: {
+        cmp rdi, 16;
+        jae elcc_gp_zero;
+        lea r10, [rip + _elevate_client_cap_parent_map];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      elcc_gp_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let elevate_client_cap_get_depth : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.LE.M3-002 (#27) + LE.M3-003 (#28): iterative walk of the parent-row shadow map, incrementing depth until a slot value of 0 (root) is reached OR ELCC_MAX_DELEGATION_DEPTH iterations elapse without one (cycle detected -- treat as corruption sentinel, return ELCC_ERR_CYCLE_DETECTED). Bounded loop is what keeps this leaf-safe against a corrupted map. Register plan: r10=map base, r11=current row_id, rax=depth. Out-of-range row returns 0 (a caller cannot meaningfully depth-walk from an invalid slot; consistent with the other _get_* accessors). Labels prefixed elcc_gd_.",
+      block: {
+        cmp rdi, 16;
+        jae elcc_gd_zero;
+
+        lea r10, [rip + _elevate_client_cap_parent_map];
+        mov r11, rdi;                    // current row
+        xor rax, rax;                    // depth accumulator
+
+      elcc_gd_loop:
+        mov rcx, [r10 + r11 * 8];        // parent of current
+        cmp rcx, 0;
+        je  elcc_gd_out;                 // root reached
+        add rax, 1;
+        // Cycle guard: never walk past ELCC_MAX_DELEGATION_DEPTH.
+        cmp rax, 4;                      // ELCC_MAX_DELEGATION_DEPTH
+        ja  elcc_gd_cycle;
+        // Defensive: an out-of-range parent is treated as cycle.
+        cmp rcx, 16;
+        jae elcc_gd_cycle;
+        mov r11, rcx;
+        jmp elcc_gd_loop;
+
+      elcc_gd_out:
+        ret;
+
+      elcc_gd_cycle:
+        mov rax, 0xFFFFEA71;             // ELCC_ERR_CYCLE_DETECTED
+        ret;
+
+      elcc_gd_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_cap_derive(parent_row, child_caps, child_dur_ns,
+  //                           mint_ctx_ptr)
+  //   -> child_row_id | ELCC_ERR_*
+  //
+  // LE.M3-001 (#26).  Client-side cap derivation.  Mints a fresh
+  // KIND_ELEVATE_CHANNEL row via elevate_client_cap_mint using the
+  // caller-supplied broker cap slot, then shadow-binds the narrowed
+  // grant + clamped child deadline + parent edge in one call.
+  //
+  // -------------------------------------------------------------------------
+  // v1.1.1 mint_ctx_ptr LAYOUT -- 24 BYTES, THREE u64 WORDS
+  // -------------------------------------------------------------------------
+  //
+  // In v1.1.0 this function hardcoded parent_ep_slot / request_id /
+  // requester_pid to 0.  The kernel-side gate
+  // (paideia-os src/kernel/core/cap/kind_elevate_channel.pdx :229/:821)
+  // indexes the passed slot directly into the flat 256-slot cap_table
+  // with only a `kind == KIND_IPC_ENDPOINT` check -- there is no
+  // "slot 0 is the broker" convention.  Any real caller whose broker
+  // cap does not happen to sit at slot 0 therefore got
+  // ELCC_ERR_MINT_FAIL, making the entire client-side derive feature
+  // non-functional end-to-end.
+  //
+  // The fix is a caller-owned scratch buffer, layout-compatible with
+  // the FIRST THREE WORDS of elevate_client_acquire's mint_ctx_buf
+  // (see elevate_client_acquire.pdx §"mint_ctx_buf LAYOUT") so a
+  // consumer that already holds an acquire ctx buffer may pass its
+  // SAME address here:
+  //
+  //   [+0]   parent_ep_slot  -- cap-table slot of the caller's
+  //                              KIND_IPC_ENDPOINT cap over the broker
+  //                              (NOT the bare endpoint_id;
+  //                              elevate_client_lookup_broker returns
+  //                              the endpoint_id, which must have been
+  //                              wrapped in a Cap<KIND_IPC_ENDPOINT>
+  //                              installed at some slot in the caller's
+  //                              cap table).
+  //   [+8]   request_id      -- caller-chosen identifier stored in the
+  //                              minted row (elevate_channel_row_req).
+  //   [+16]  requester_pid   -- caller's own pid
+  //                              (elevate_channel_row_pid); this library
+  //                              has no process-context primitive of its
+  //                              own, so the caller supplies it exactly
+  //                              as a direct elevate_client_cap_mint
+  //                              call already requires.
+  //
+  // target_cap_kind is fixed at ELCC_KIND_ELEVATE_CHANNEL (0x191) and
+  // target_cap_rights is derived from child_caps -- both are settled
+  // by derive's semantics, not the caller, and are NOT read from this
+  // buffer.  The elevate channel's OWN rights are ELCC_RIGHTS_ALL
+  // (0x418) as elsewhere, pending libpdx-cap.M2 narrowing.
+  //
+  // A NULL mint_ctx_ptr is refused before any nested call with
+  // ELCC_ERR_BAD_CTX 0xFFFFEA72 -- so no shadow map is touched on the
+  // refusal path.
+  //
+  // -------------------------------------------------------------------------
+  // Rules:
+  //   * parent must be live (shadow deadline still in the future,
+  //     and not 0 = "no deadline bound" which we conservatively treat
+  //     as PARENT_EXPIRED for derivation because a derived child needs
+  //     a bounded lifetime for LE.M4 reap to close it out).
+  //   * child_caps must be a subset of parent's granted_caps
+  //     (bit-wise (child_caps & ~granted) == 0) -- else CHILD_CAPS_
+  //     ESCALATION.
+  //   * child_expire = min(now + child_dur_ns, parent.shadow_expire).
+  //     A clamp is the enforcement site for "child can never outlive
+  //     the parent".
+  //   * chain depth check: get_depth(parent) < ELCC_MAX_DELEGATION_
+  //     DEPTH - 1 -- else DELEGATION_TOO_DEEP.
+  //
+  // Kernel-side note: a hypothetical elevate_channel_cap_derive_inner
+  // primitive that mints a row using an EXISTING parent row's cap slot
+  // (rather than indexing the caller's cap table) would let this
+  // function drop the mint_ctx_ptr argument.  Until that primitive
+  // lands, the mint hop is the caller's responsibility to authorize
+  // via an owned broker-endpoint cap; rewriting to the eventual real
+  // derive primitive remains a plug-in replacement of the
+  // elevate_client_cap_mint CALL site here.
+  // ==========================================================================
+
+  pub let elevate_client_cap_derive : (u64, u64, u64, u64) -> u64 !{mem} @{cap, boot} =
+    fn (parent_row_id: u64) (child_caps: u64) (child_dur_ns: u64) (mint_ctx_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap, boot},
+      justification: "libpdx-elevate.LE.M3-001 (#26) v1.1.1 real-mint-args pass: the v1.1.0 shape hardcoded parent_ep_slot=0, request_id=0, requester_pid=0 and was therefore non-functional against any caller whose broker cap did not accidentally live at slot 0 (kernel-side gate in kind_elevate_channel.pdx :229/:821 indexes the slot straight into the flat cap_table with only a kind==KIND_IPC_ENDPOINT check). Fix: a 4th argument mint_ctx_ptr points at a caller-owned 3-word (24-byte) scratch buffer -- [+0]=parent_ep_slot, [+8]=request_id, [+16]=requester_pid -- layout-compatible with the FIRST three words of elevate_client_acquire's mint_ctx_buf so a consumer holding an acquire ctx may pass its same address here. target_cap_kind stays fixed at ELCC_KIND_ELEVATE_CHANNEL (0x191) and target_cap_rights stays derived from child_caps (both are settled by derive's semantics, not the caller). Register plan: rbx=parent_row, r12=child_caps, r13=child_dur -> reused as clamped deadline post-clamp, r14=parent_grant -> reused as child_row_id post-mint, r15=parent_expire (dead after the clamp step), rbp=mint_ctx_ptr (live from entry through the mint CALL; kept in rbp because it must survive every nested CALL up to the mint and rbp is the last SysV callee-save not already in service). Six callee-save pushes + one 8-byte alignment pad = 56 bytes; entry rsp%16==8 -> (8-56) mod 16 == 0 across every nested call (get_expire, get_grant, get_depth, hpet_now_ns, elevate_client_cap_mint, bind_expire_abs, bind_grant, bind_parent, cap_note), matching the frame shape elevate_client_acquire (ENH-001) already runs. Order of gates unchanged from v1.1.0: BAD_CTX (mint_ctx_ptr==0), BAD_ROW (parent>=16), PARENT_EXPIRED (expire slot 0 or past), CHILD_CAPS_ESCALATION (bit-wise subset check via `mov r10, parent_grant; not r10; and r10, child_caps`), DELEGATION_TOO_DEEP (depth >= MAX-1). Deadline clamping is min(now + child_dur, parent_expire) -- child never outlives the parent. rbx (parent_row) is preserved through the whole function so bind_parent sources it directly as rsi at the end; r14 (parent_grant) is dead after the subset check so it is reused for child_row_id post-mint. rbp itself is never overwritten between prologue and mint, so [rbp+0]/[rbp+8]/[rbp+16] are read directly into rdi/rdx/rcx immediately before the elevate_client_cap_mint CALL. capabilities {cap, boot} propagate from elevate_client_cap_mint + hpet_now_ns. Frame prologue implicit. Labels prefixed elcc_dv_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;                      // alignment pad (see justification)
+
+        mov rbx, rdi;                    // parent_row
+        mov r12, rsi;                    // child_caps
+        mov r13, rdx;                    // child_dur
+        mov rbp, rcx;                    // mint_ctx_ptr
+
+        cmp rbp, 0;
+        je  elcc_dv_bad_ctx;
+
+        cmp rbx, 16;
+        jae elcc_dv_bad_row;
+
+        // ---- Parent expire lookup + past-deadline check ----
+        mov rdi, rbx;
+        call elevate_client_cap_get_expire;
+        mov r15, rax;                    // parent_expire
+        cmp r15, 0;
+        je  elcc_dv_parent_expired;
+        // Compare against now.
+        call hpet_now_ns;
+        cmp rax, r15;
+        jae elcc_dv_parent_expired;
+        // Compute child_expire_candidate = now + child_dur.
+        add rax, r13;
+        // Clamp: child_expire = min(candidate, parent_expire).
+        cmp rax, r15;
+        jbe elcc_dv_dl_ok;
+        mov rax, r15;
+      elcc_dv_dl_ok:
+        // r13 no longer needed as dur; reuse to hold clamped deadline.
+        mov r13, rax;
+
+        // ---- Parent grant lookup + subset check ----
+        mov rdi, rbx;
+        call elevate_client_cap_get_grant;
+        cmp rax, 0;
+        je  elcc_dv_no_grant;
+        mov r14, rax;                    // parent_grant
+        // (child_caps & ~parent_grant) == 0 iff child <= parent.
+        mov r10, r14;
+        not r10;
+        and r10, r12;
+        cmp r10, 0;
+        jne elcc_dv_escalation;
+
+        // ---- Depth check ----
+        mov rdi, rbx;
+        call elevate_client_cap_get_depth;
+        // Cycle-detect passthrough is > MAX; treat as too deep.
+        cmp rax, 3;                      // ELCC_MAX_DELEGATION_DEPTH - 1
+        jae elcc_dv_too_deep;
+
+        // ---- Mint the child row via caller-supplied broker context ----
+        // v1.1.1: parent_ep_slot / request_id / requester_pid are now
+        // read from the caller-owned mint_ctx buffer (rbp) instead of
+        // being xor-zeroed.  Rights and kind remain derive-settled.
+        mov rdi, [rbp + 0];              // parent_ep_slot
+        mov rsi, 0x418;                  // ELCC_RIGHTS_ALL (caller narrows via shadow)
+        mov rdx, [rbp + 8];              // request_id
+        mov rcx, [rbp + 16];             // requester_pid
+        mov r8,  0x191;                  // ELCC_KIND_ELEVATE_CHANNEL
+        mov r9,  r12;                    // target_cap_rights = child_caps
+        call elevate_client_cap_mint;
+        cmp rax, 16;
+        jae elcc_dv_mint_fail;
+        mov r14, rax;                    // r14 = child_row_id (parent_grant no longer needed)
+
+        // Note the derive.
+        mov rdi, 5;                      // ELCC_ST_DERIVES
+        call elevate_client_cap_note;
+
+        // ---- Bind child deadline (clamped absolute) ----
+        mov rdi, r14;
+        mov rsi, r13;                    // clamped deadline
+        call elevate_client_cap_bind_expire_abs;
+        // (Ignore return: BAD_ROW impossible after mint returned r14<16.)
+
+        // ---- Bind child grant ----
+        mov rdi, r14;
+        mov rsi, r12;                    // child_caps
+        call elevate_client_cap_bind_grant;
+
+        // ---- Bind parent edge ----
+        mov rdi, r14;                    // child
+        mov rsi, rbx;                    // parent (preserved through the whole function)
+        call elevate_client_cap_bind_parent;
+
+        mov rax, r14;                    // child_row_id
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcc_dv_bad_ctx:
+        mov rax, 0xFFFFEA72;             // ELCC_ERR_BAD_CTX
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcc_dv_bad_row:
+        mov rax, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcc_dv_parent_expired:
+        mov rax, 0xFFFFEA3C;             // ELCC_ERR_PARENT_EXPIRED
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcc_dv_no_grant:
+        mov rax, 0xFFFFEA38;             // ELCC_ERR_NO_GRANT
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcc_dv_escalation:
+        mov rax, 0xFFFFEA3B;             // ELCC_ERR_CHILD_CAPS_ESCALATION
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcc_dv_too_deep:
+        mov rax, 0xFFFFEA3F;             // ELCC_ERR_DELEGATION_TOO_DEEP
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcc_dv_mint_fail:
+        mov rax, 0xFFFFEA31;             // ELCC_ERR_MINT_FAIL
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
         ret
       }
     }

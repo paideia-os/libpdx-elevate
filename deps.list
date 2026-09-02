@@ -21,13 +21,26 @@ libpdx-cap        >=0.2.0   PENDING   elevate_client_cap_narrow_stub swap
                                      the ELCC_NOTE_NO_NARROW status code
                                      retires.
 
-libpdx-audit      >=0.3.0   PENDING   elevate_client_journal_req/_apr
+libpdx-audit      >=0.3.0   PENDING   elevate_client_journal_req/_apr/_op
                                      bodies swap from raw uej_append(5, ...)
                                      to audit_begin / audit_record_output /
                                      audit_commit when libpdx-audit.M2
                                      ships.  Signatures unchanged;
                                      UEJ_KIND_ELEVATE = 5 stays the wire
                                      ordinal in both paths.
+                                     LE.M2-002 (libpdx-elevate#38): the
+                                     swap is BLOCKED beyond the version
+                                     bump: libpdx-audit HEAD (2026-09-02)
+                                     exports the trio with
+                                     !{mem, sysreg} @{cap, sched}, which
+                                     would propagate sysreg/sched up
+                                     through _ex_j / _ex_r / _acquire /
+                                     _require_j and force a v2.0
+                                     cap-manifest ripple on every
+                                     downstream tool.  Cross-repo
+                                     request pending on libpdx-audit
+                                     for a thin !{mem}-only leaf
+                                     (audit_append_leaf).
 
 # Kernel primitives consumed directly (KERNEL — not shared libraries):
 #
