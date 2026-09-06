@@ -113,7 +113,7 @@
 //                                        ELCC_MAX_DELEGATION_DEPTH.
 //
 // =============================================================================
-// EXTENSION BAND 0xFFFFEA70..0xFFFFEA7F (LE.M3)
+// EXTENSION BAND 0xFFFFEA70..0xFFFFEA7F (LE.M3, LE.M7-001)
 // =============================================================================
 //
 //   0xFFFFEA71  ELCC_ERR_CYCLE_DETECTED
@@ -146,6 +146,21 @@
 //                                          this code has a programming defect
 //                                          on the client side, not a runtime
 //                                          protocol failure.
+//   0xFFFFEA74  ELCC_ERR_CASCADE_FAIL
+//                                       -- LE.M7-001 (#35): elevate_client_cap_
+//                                          revoke_cascade's kernel revoke of a
+//                                          descendant (or the root row itself)
+//                                          refused with something other than
+//                                          ELVC_OK / ELVC_REVOKE_ALREADY (e.g.
+//                                          BAD_SLOT).  The cascade aborts
+//                                          IMMEDIATELY on the first such
+//                                          refusal: rows already revoked in
+//                                          this call stay revoked (and
+//                                          audited); the row that refused and
+//                                          every row still queued behind it in
+//                                          the deepest-first walk are left
+//                                          untouched.  The journal is the
+//                                          record of exactly which is which.
 
 module ElevateClientCap = structure {
 
@@ -189,6 +204,7 @@ module ElevateClientCap = structure {
   pub let ELCC_ERR_CYCLE_DETECTED        : u64 = 0xFFFFEA71
   pub let ELCC_ERR_BAD_CTX               : u64 = 0xFFFFEA72
   pub let ELCC_ERR_ZERO_GRANT            : u64 = 0xFFFFEA73  // LE.M1-polish (#47)
+  pub let ELCC_ERR_CASCADE_FAIL          : u64 = 0xFFFFEA74  // LE.M7-001 (#35)
 
   // LE.M3-003 (#28) delegation depth cap.  Root grant (depth 0) + up
   // to 3 derived-child hops covers every currently-imagined consumer
@@ -299,6 +315,36 @@ module ElevateClientCap = structure {
   // require-attest at every depth -- a child cannot launder away its
   // parent's attestation obligation by being derived.
   pub let mut _elevate_client_cap_attest_required_map : [u64; 16] = uninit @align(64)
+
+  // ---- LE.M7-001 (#35) revoke-cascade scratch ----
+  //
+  // elevate_client_cap_revoke_cascade needs two transient 16-slot
+  // arrays to compute "every row whose _get_parent chain transitively
+  // reaches row_id" and to order the walk deepest-first.  Unlike the
+  // maps above, this pair carries NO state between calls -- every
+  // invocation of revoke_cascade zeroes both arrays as its first act
+  // (see elcc_rc_zero_member below), so they are NOT included in
+  // elevate_client_cap_reset's per-map scrub list; there is nothing to
+  // reset because nothing survives past one call. They are process-
+  // global (rather than stack-allocated) purely because this dialect
+  // has no dynamic stack array; a single in-flight cascade at a time
+  // is the only usage pattern any caller in this library exercises.
+  //
+  // _elcc_cascade_member_scratch[i]  -- 1 iff row i is row_id itself or
+  //                                      a transitive descendant of it
+  //                                      (the set to revoke this call).
+  // _elcc_cascade_depth_scratch[i]   -- elevate_client_cap_get_depth(i)
+  //                                      for a member row, clamped to
+  //                                      [0, ELCC_MAX_DELEGATION_DEPTH-1]
+  //                                      so a corrupted-map cycle
+  //                                      sentinel (ELCC_ERR_CYCLE_
+  //                                      DETECTED) still lands in the
+  //                                      deepest bucket rather than
+  //                                      escaping the four-level walk
+  //                                      entirely.  Undefined for a
+  //                                      non-member row (never read).
+  pub let mut _elcc_cascade_member_scratch : [u64; 16] = uninit @align(64)
+  pub let mut _elcc_cascade_depth_scratch  : [u64; 16] = uninit @align(64)
 
   // ---- Client-side counters ----
   //
@@ -1803,6 +1849,361 @@ module ElevateClientCap = structure {
 
       elcc_dv_mint_fail:
         mov rax, 0xFFFFEA31;             // ELCC_ERR_MINT_FAIL
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_cap_scrub_row(row_id) -> ()
+  //
+  // LE.M7-001 (#35).  Factor of the eight-map shadow scrub that
+  // elevate_client_cap_check_and_revoke's elcc_cr_revoked branch and
+  // elevate_client_cap_derive's elcc_dv_bind_fail cleanup path each
+  // already inline verbatim -- a THIRD inline copy inside revoke_
+  // cascade's per-row loop below would mean three places to keep in
+  // sync every time a new shadow map is added.  This is that third
+  // call site, factored instead of copied.  The two EXISTING inline
+  // copies are left as-is (out of scope for this change; they already
+  // work and are covered by other witnesses) -- only revoke_cascade
+  // calls this function.
+  //
+  // Out-of-range row_id is a silent no-op (nothing to scrub); the
+  // return type is unit so there is no error code to report, matching
+  // this file's convention for helpers whose only failure mode is
+  // "caller passed a bad index" (contrast with the bind_* functions,
+  // which return ELCC_ERR_BAD_ROW because they have a return value to
+  // carry it).
+  //
+  // Leaf: rdi (row_id) is read repeatedly as the index for eight
+  // stores with no intervening CALL, so no push is required -- same
+  // shape as elevate_client_cap_bind_last_audit.
+  // ==========================================================================
+
+  pub let elevate_client_cap_scrub_row : (u64) -> () !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.LE.M7-001 (#35): factor of the eight-map shadow scrub already inlined at elevate_client_cap_check_and_revoke's elcc_cr_revoked branch and elevate_client_cap_derive's elcc_dv_bind_fail cleanup -- this is the third call site (revoke_cascade), factored rather than copied a third time. Leaf: rdi is read eight times as the store index with no intervening CALL, so no callee-save push is needed, matching elevate_client_cap_bind_last_audit's shape. Out-of-range row_id silently no-ops (unit return, nothing to report). Labels prefixed elcc_sr_.",
+      block: {
+        cmp rdi, 16;
+        jae elcc_sr_out;
+
+        xor r11, r11;
+        lea r10, [rip + _elevate_client_cap_expire_map];
+        mov [r10 + rdi * 8], r11;
+        lea r10, [rip + _elevate_client_cap_grant_map];
+        mov [r10 + rdi * 8], r11;
+        lea r10, [rip + _elevate_client_cap_scope_map];
+        mov [r10 + rdi * 8], r11;
+        lea r10, [rip + _elevate_client_cap_budget_map];
+        mov [r10 + rdi * 8], r11;
+        lea r10, [rip + _elevate_client_cap_parent_map];
+        mov [r10 + rdi * 8], r11;
+        lea r10, [rip + _elevate_client_cap_audit_seq_map];
+        mov [r10 + rdi * 8], r11;
+        lea r10, [rip + _elevate_client_cap_audit_kind_map];
+        mov [r10 + rdi * 8], r11;
+        lea r10, [rip + _elevate_client_cap_attest_required_map];
+        mov [r10 + rdi * 8], r11;
+
+      elcc_sr_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_cap_revoke_cascade(row_id)
+  //   -> revoked_count | ELCC_ERR_BAD_ROW | ELCC_ERR_CASCADE_FAIL
+  //
+  // LE.M7-001 (#35).  Force-revoke row_id and every transitive
+  // descendant recorded in the LE.M3-002 parent-row shadow map,
+  // deepest generation first, then row_id itself last.
+  //
+  // -------------------------------------------------------------------------
+  // WHY NO CHILD-INDEX EXISTS -- AND WHY THAT'S FINE AT 16 ROWS
+  // -------------------------------------------------------------------------
+  //
+  // _elevate_client_cap_parent_map only records child -> parent; there
+  // is no reverse (parent -> children) index anywhere in this library.
+  // Building the descendant set is therefore an O(rows) scan of the
+  // WHOLE 16-slot table per growth pass rather than an O(children)
+  // walk of a real adjacency list. At ELCC_MAX_ROWS == 16 this is a
+  // few dozen instructions worst case -- not worth a new persistent
+  // index whose own upkeep (every bind_parent / scrub_row site would
+  // need to maintain it) would outweigh the O(16) scan it replaces.
+  //
+  // -------------------------------------------------------------------------
+  // ALGORITHM
+  // -------------------------------------------------------------------------
+  //
+  //   (1) BFS closure: seed the member set with {row_id}; repeatedly
+  //       scan all 16 rows and add any row j whose recorded parent is
+  //       already a member, until a full pass adds nothing (bounded at
+  //       16 passes as a corrupted-map safety net -- the real chain
+  //       depth is capped at ELCC_MAX_DELEGATION_DEPTH by bind_parent's
+  //       own callers, so this converges in at most 4 passes in
+  //       practice).
+  //   (2) Depth cache: for every member, call elevate_client_cap_
+  //       get_depth once and cache it. A row's depth strictly
+  //       increases by exactly 1 per generation (bind_parent forbids
+  //       cycles and self-loops), so DEEPEST-FIRST ordering reduces to
+  //       "process members in descending cached-depth order" -- no
+  //       leaf-detection pass is needed. A cycle-detected sentinel
+  //       (corrupted map) clamps to the deepest bucket (3) so a
+  //       corrupted member is swept as aggressively as possible rather
+  //       than silently skipped.
+  //   (3) Revoke deepest-first: for depth_level = 3 downto 0, revoke
+  //       every member whose cached depth equals depth_level.
+  //       row_id's own depth is, by construction, the SHALLOWEST among
+  //       every member (every descendant's depth is strictly greater),
+  //       so it is always the last row processed -- no separate final
+  //       step is needed.
+  //
+  //       Per row: elevate_channel_cap_revoke(j) ->
+  //         ELVC_OK (0)             -- scrub row j's shadow state,
+  //                                     bump the count, best-effort
+  //                                     journal (ELVJ_EVT_REVOKE_
+  //                                     CASCADE), continue.
+  //         ELVC_REVOKE_ALREADY     -- scrub (idempotent no-op if
+  //           (0xFFFFEC06)             already scrubbed), do NOT bump
+  //                                     the count and do NOT journal --
+  //                                     this is what makes a second
+  //                                     call to revoke_cascade on the
+  //                                     same chain return 0.
+  //         anything else           -- ELCC_ERR_CASCADE_FAIL, RIGHT
+  //                                     NOW: stop the walk. Every row
+  //                                     processed before this one stays
+  //                                     revoked + audited; this row and
+  //                                     every row still queued behind
+  //                                     it (including row_id itself, if
+  //                                     it had not yet been reached)
+  //                                     are left untouched.
+  //
+  // -------------------------------------------------------------------------
+  // AUDIT + ACTOR
+  // -------------------------------------------------------------------------
+  //
+  // revoke_cascade takes only row_id (matching #35's signature exactly)
+  // -- there is no actor_fp_lo parameter to thread through. The actor
+  // for the per-row ELVJ_EVT_REVOKE_CASCADE record is read ONCE from
+  // the process-global _elevate_client_target_fp_lo (elevate_client_
+  // send.pdx) via elevate_client_get_target_fp_lo, the same source
+  // elevate_client_request_ex already reads for its own policy
+  // consult. The journal call's return is DELIBERATELY ignored (best-
+  // effort, exactly like elevate_client_cap_attest's row-stamp and
+  // derive's own bind-fail kernel-revoke cleanup): the audit-first
+  // discipline elsewhere in this library (elevate_client_request_ex_j
+  // aborting on a failed APR journal) applies to GRANTING authority,
+  // where an unaudited grant is a live security gap; here we are
+  // REMOVING authority, so a failed audit write means the row is
+  // (correctly) gone either way -- the worst outcome is a thinner
+  // audit trail, not a live over-grant.
+  //
+  // -------------------------------------------------------------------------
+  // Register plan: r15=row_id (root, alive whole function), r12=
+  // "changed" flag during the BFS closure then repurposed as the
+  // revoked_count accumulator from step 3 on (the two phases never
+  // overlap), r13=actor_fp_lo (fetched once, used per-row), r14=j (the
+  // loop index, live across every nested CALL in every phase), rbp=
+  // BFS pass counter then repurposed as depth_level, rbx=free scratch
+  // (the OK/ALREADY classifier in step 3). Six callee-save pushes + one
+  // 8-byte alignment pad = 56 bytes; entry rsp%16==8 -> (8-56) mod 16
+  // == 0, matching elevate_client_cap_derive's own frame shape.
+  // ==========================================================================
+
+  pub let elevate_client_cap_revoke_cascade : (u64) -> u64 !{mem} @{cap} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "libpdx-elevate.LE.M7-001 (#35): force-revoke row_id and every transitive shadow-map descendant, deepest-first. Six callee-save pushes (rbx, r12, r13, r14, r15, rbp) + one 8-byte alignment pad = 56 bytes; entry rsp%16==8 -> (8-56) mod 16 == 0 across every nested call (get_parent, get_depth, get_target_fp_lo, elevate_channel_cap_revoke, scrub_row, journal_revoke_cascade), matching elevate_client_cap_derive's frame shape exactly. r15 holds row_id for the entire function (never reused). r12 doubles as the BFS 'changed' flag during closure-building and the revoked_count accumulator afterward -- the two uses are temporally disjoint (closure-building fully completes, including the depth-cache pass, before any row is revoked), so no value ever needs to survive across the repurposing. r14 holds the loop index j across every phase and every nested CALL within a phase. rbp doubles as the BFS pass counter then the depth_level counter for the same disjoint-phases reason as r12. rbx is free scratch from the closure phase onward, used in step 3 to classify a kernel revoke's return (0 = revoked-now, 1 = already). capability {cap} propagates from elevate_channel_cap_revoke (get_parent, get_depth, get_target_fp_lo, scrub_row, and journal_revoke_cascade all declare capabilities {}). A cascade-fail abort happens INSIDE the depth_level/j double loop, so the shared epilogue at elcc_rc_out is reached from every exit (success, bad_row, cascade_fail) with a uniform pop sequence. Labels prefixed elcc_rc_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;                      // alignment
+
+        mov r15, rdi;                     // row_id (root), alive whole function
+        cmp r15, 16;
+        jae elcc_rc_bad_row;
+
+        // ---- Step 0: zero the member scratch (16 slots), then seed
+        // member[row_id] = 1.  The depth scratch does not need zeroing
+        // up front -- step 2 below writes every slot it will later
+        // read (non-member slots are never read).
+        lea r10, [rip + _elcc_cascade_member_scratch];
+        xor rax, rax;
+        xor rcx, rcx;
+      elcc_rc_zero_member:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  elcc_rc_zero_member;
+
+        mov rax, 1;
+        mov [r10 + r15 * 8], rax;         // member[row_id] = 1
+
+        // ---- Step 1: BFS closure over the parent map, bounded at 16
+        // passes (corrupted-map safety net; real chains converge in
+        // <= ELCC_MAX_DELEGATION_DEPTH passes).
+        xor rbp, rbp;                     // pass counter
+      elcc_rc_bfs_pass:
+        xor r12, r12;                     // changed = 0 this pass
+        xor r14, r14;                     // j = 0
+      elcc_rc_bfs_inner:
+        lea r10, [rip + _elcc_cascade_member_scratch];
+        mov rax, [r10 + r14 * 8];
+        cmp rax, 0;
+        jne elcc_rc_bfs_next;             // j already a member
+
+        mov rdi, r14;
+        call elevate_client_cap_get_parent;
+        cmp rax, 0;
+        je  elcc_rc_bfs_next;             // root / unbound -- not our path
+
+        lea r10, [rip + _elcc_cascade_member_scratch];
+        mov r11, rax;                     // parent row id
+        mov rax, [r10 + r11 * 8];
+        cmp rax, 0;
+        je  elcc_rc_bfs_next;             // parent not (yet) a member
+
+        lea r10, [rip + _elcc_cascade_member_scratch];
+        mov rax, 1;
+        mov [r10 + r14 * 8], rax;         // j joins the member set
+        mov r12, 1;                       // changed = 1
+
+      elcc_rc_bfs_next:
+        add r14, 1;
+        cmp r14, 16;
+        jb  elcc_rc_bfs_inner;
+
+        cmp r12, 0;
+        je  elcc_rc_bfs_done;             // no growth this pass -- stable
+        add rbp, 1;
+        cmp rbp, 16;
+        jb  elcc_rc_bfs_pass;
+
+      elcc_rc_bfs_done:
+
+        // ---- Step 2: cache elevate_client_cap_get_depth for every
+        // member, clamped to [0,3] so a cycle-detected sentinel lands
+        // in the deepest bucket rather than escaping the walk below.
+        xor r14, r14;                     // j = 0
+      elcc_rc_depth_loop:
+        lea r10, [rip + _elcc_cascade_member_scratch];
+        mov rax, [r10 + r14 * 8];
+        cmp rax, 0;
+        je  elcc_rc_depth_next;           // not a member
+
+        mov rdi, r14;
+        call elevate_client_cap_get_depth;
+        mov r10, 0xFFFFEA71;              // ELCC_ERR_CYCLE_DETECTED
+        cmp rax, r10;
+        jne elcc_rc_depth_clamp;
+        mov rax, 3;                       // corrupted map -- deepest bucket
+      elcc_rc_depth_clamp:
+        cmp rax, 3;
+        jbe elcc_rc_depth_store;
+        mov rax, 3;                       // defensive clamp
+      elcc_rc_depth_store:
+        lea r10, [rip + _elcc_cascade_depth_scratch];
+        mov [r10 + r14 * 8], rax;
+
+      elcc_rc_depth_next:
+        add r14, 1;
+        cmp r14, 16;
+        jb  elcc_rc_depth_loop;
+
+        // ---- Step 3: fetch actor_fp_lo once for best-effort journaling.
+        call elevate_client_get_target_fp_lo;
+        mov r13, rax;                     // actor_fp_lo (may be 0)
+
+        // ---- Step 4: revoke deepest-first. ----
+        xor r12, r12;                     // revoked_count = 0
+        mov rbp, 3;                       // depth_level = 3 (deepest first)
+
+      elcc_rc_level_loop:
+        xor r14, r14;                     // j = 0
+      elcc_rc_level_inner:
+        lea r10, [rip + _elcc_cascade_member_scratch];
+        mov rax, [r10 + r14 * 8];
+        cmp rax, 0;
+        je  elcc_rc_level_next;           // not a member
+
+        lea r10, [rip + _elcc_cascade_depth_scratch];
+        mov rax, [r10 + r14 * 8];
+        cmp rax, rbp;
+        jne elcc_rc_level_next;           // different depth bucket this pass
+
+        mov rdi, r14;                     // row j
+        call elevate_channel_cap_revoke;
+        xor rbx, rbx;                     // classify: 0 = revoked now
+        cmp rax, 0;
+        je  elcc_rc_classified;
+        mov r10, 0xFFFFEC06;              // ELVC_REVOKE_ALREADY
+        cmp rax, r10;
+        jne elcc_rc_cascade_fail;         // any other refusal -- abort now
+        mov rbx, 1;                       // classify: 1 = already gone
+      elcc_rc_classified:
+
+        // Scrub j's shadow state regardless of classify (idempotent
+        // zero-write on the ALREADY path).
+        mov rdi, r14;
+        call elevate_client_cap_scrub_row;
+
+        cmp rbx, 0;
+        jne elcc_rc_level_next;           // ALREADY -- no count, no journal
+
+        add r12, 1;                       // revoked_count++
+
+        // Best-effort audit -- return value deliberately ignored (see
+        // the AUDIT + ACTOR section above).
+        mov rdi, r13;                     // actor_fp_lo
+        mov rsi, r14;                     // row just revoked
+        mov rdx, r15;                     // cascade root (row_id argument)
+        call elevate_client_journal_revoke_cascade;
+
+      elcc_rc_level_next:
+        add r14, 1;
+        cmp r14, 16;
+        jb  elcc_rc_level_inner;
+
+        cmp rbp, 0;
+        je  elcc_rc_done;
+        sub rbp, 1;
+        jmp elcc_rc_level_loop;
+
+      elcc_rc_done:
+        mov rax, r12;                     // revoked_count
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcc_rc_cascade_fail:
+        mov rax, 0xFFFFEA74;              // ELCC_ERR_CASCADE_FAIL
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcc_rc_bad_row:
+        mov rax, 0xFFFFEA30;              // ELCC_ERR_BAD_ROW
         add rsp, 8;
         pop rbp;
         pop r15;

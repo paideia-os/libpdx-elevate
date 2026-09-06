@@ -92,6 +92,7 @@ validation, and the M2 full-flow entry point.
 | `elevate_client_check_grant(reply_buf, requested_caps) -> u64 !{mem} @{}` | `(granted & requested) == granted`; mirror of kernel `elv_check_grant`. |
 | `elevate_client_request_ex(caps, dur, req_buf, reply_ep_id, reply_buf, timeout_ns) -> u64 !{mem} @{boot}` | Full M2 flow: policy consult → REQ assemble → broker lookup → send → recv → grant-subset check. `timeout_ns == 0` selects fast/human by policy classification. |
 | `elevate_client_request_ex_ctx(caps, dur, req_buf, reply_ep_id, reply_buf, ctx_buf) -> u64 !{mem} @{boot}` | ENH-006: explicit-context twin of `elevate_client_request_ex` — reads `target_fp_lo` / fast / human / explicit-timeout from a caller-owned 32-byte `ctx_buf` instead of the process-global singletons, so concurrent flows in one process (e.g. a shell brokering several jobs) do not race each other. `ELVC_ERR_BAD_CTX` if `ctx_buf == 0`. |
+| `elevate_client_cap_drain_broker_exp(reply_ep_id) -> u64 !{mem} @{cap}` | LE.M7-002 (#36): non-blocking single-sweep drain of `reply_ep_id` for pending `ELV_OP_EXP` frames, forwarding each to `elevate_client_cap_revoke_cascade` by row_id and summing the returns. Kernel does not emit `ELV_OP_EXP` today (client-side scaffolding; see the file header). Reuses `ELVC_ERR_BAD_REPLY_EP` for the `[1..127]` gate. |
 
 ### `src/elevate_client_acquire.pdx` — module `ElevateClientAcquire`
 
@@ -142,6 +143,8 @@ self-invalidation.
 | `elevate_client_cap_check_and_revoke(row_id) -> u64 !{mem} @{cap, boot}` | Self-invalidation: live → `ELCC_STATE_LIVE`; expired → kernel revoke → `ELCC_STATE_REVOKED` (idempotent; `REVOKE_ALREADY` collapses in). |
 | `elevate_client_cap_bind_last_audit(row_id, seq, kind) -> u64 !{mem} @{}` / `elevate_client_cap_get_last_audit_seq(row_id) -> u64 !{mem} @{}` / `elevate_client_cap_get_last_audit_kind(row_id) -> u64 !{mem} @{}` | LE.M5-001 (#31): shadow the seq/kind of the most recent audit event stamped against `row_id`, written by `elevate_client_cap_attest`. `0` in the kind map means "never attested" (no real `ELVJ_EVT_*` kind is 0). |
 | `elevate_client_cap_bind_attestation_required(row_id) -> u64 !{mem} @{}` / `elevate_client_cap_get_attestation_required(row_id) -> u64 !{mem} @{}` | LE.M5-002 (#32): set (no clear path by design) / read the per-row flag that makes `elevate_client_cap_derive` refuse `ELCA_ERR_UNATTESTED` unless the row's `last_audit_kind == ELVJ_EVT_ATTEST`. Inherited by derived children. |
+| `elevate_client_cap_scrub_row(row_id) -> () !{mem} @{}` | LE.M7-001 (#35): zero all eight per-row shadow maps for `row_id`. Factored out of `_check_and_revoke` / `_derive`'s own inline scrubs as the third call site (`revoke_cascade`, below). Out-of-range `row_id` is a silent no-op. |
+| `elevate_client_cap_revoke_cascade(row_id) -> u64 !{mem} @{cap}` | LE.M7-001 (#35): force-revokes `row_id` and every transitive parent-map descendant (LE.M3-002), deepest generation first. Returns the revoked count (self + descendants); a kernel refusal other than "already revoked" aborts immediately with `ELCC_ERR_CASCADE_FAIL = 0xFFFFEA74`. Idempotent — a second call on an already-swept chain returns `0`. Best-effort journals each revoke via `elevate_client_journal_revoke_cascade`. |
 
 ### `src/elevate_client_journal.pdx` — module `ElevateClientJournal`
 
@@ -156,6 +159,7 @@ Audit-first REQ/APR journaling through the kernel user-events journal.
 | `elevate_client_request_ex_j(caps, dur, req_buf, reply_ep_id, reply_buf, timeout_ns) -> u64 !{mem} @{boot}` | Audit-wrapped flow: journal REQ (failure aborts *before* the wire hop) → `request_ex` → journal APR. An APR-journal failure after a grant surfaces so the caller can revoke. |
 | `elevate_client_journal_op(actor_fp_lo, row_id, needed_caps) -> u64 !{mem} @{}` | ENH-004 (#16): append a per-op record (`ELVJ_EVT_OP = 3`) for one authorized use of an acquired handle; returns the seq or `ELVJ_ERR_BAD_ACTOR` / `_OP_JOURNAL_FAIL`. This is the grant-amplification signal: N of these against one REQ/APR pair. |
 | `elevate_client_cap_attest(row_id, actor_fp_lo, reason_fp_lo) -> u64 !{mem} @{}` | LE.M5-001 (#31): append an `ELVJ_EVT_ATTEST = 4` record (`body1 = actor_fp_lo`, `body2 = reason_fp_lo`) and stamp `row_id`'s shadow `last_audit_seq` / `last_audit_kind` (`elevate_client_cap.pdx`) so `elevate_client_cap_derive` can gate on it (LE.M5-002, #32). Returns the seq or `ELVJ_ERR_BAD_ACTOR` / `_ATTEST_JOURNAL_FAIL`. |
+| `elevate_client_journal_revoke_cascade(actor_fp_lo, row_id, cascade_root_row_id) -> u64 !{mem} @{}` | LE.M7-001 (#35): append an `ELVJ_EVT_REVOKE_CASCADE = 5` record per row `elevate_client_cap_revoke_cascade` revokes (`body1 = row_id` just revoked, `body2 = cascade_root_row_id`). Returns the seq or `ELVJ_ERR_BAD_ACTOR` / `_REVOKE_CASCADE_JOURNAL_FAIL`; the caller treats this as best-effort. |
 
 ### `src/elevate_client_retry.pdx` — module `ElevateClientRetry`
 
@@ -249,18 +253,20 @@ says which layer refused: `ELV_ERR_*` `0xFFFFE5E0..EF` (request could not
 be built), `ELVC_*` `0xFFFFEA00..0F` (transport), `ELCP_ERR_*`
 `0xFFFFEA10..1F` (client policy), `ELVR_ERR_*` `0xFFFFEA20..2F` (retry),
 `ELCC_*` `0xFFFFEA30..3F` (cap lifecycle), `ELVJ_ERR_*` `0xFFFFEA40..4F`
-(journal — now 5 members with `ELVJ_ERR_ATTEST_JOURNAL_FAIL`, LE.M5-001
-#31), `ELCA_*` `0xFFFFEA50..5F` (acquire, ENH-001), `ELCA_ERR_*`
+(journal — now 6 members with `ELVJ_ERR_ATTEST_JOURNAL_FAIL`, LE.M5-001
+#31, and `ELVJ_ERR_REVOKE_CASCADE_JOURNAL_FAIL`, LE.M7-001 #35),
+`ELCA_*` `0xFFFFEA50..5F` (acquire, ENH-001), `ELCA_ERR_*`
 require-side `0xFFFFEA60..6F` (per-op re-assert, ENH-002/003 — now 4
 members with `ELCA_ERR_UNATTESTED`, LE.M5-002 #32, which is actually
 *raised* by `elevate_client_cap_derive` in `elevate_client_cap.pdx`,
 not by any entry point in `elevate_client_require.pdx` — it shares
 this band because the issue that named it treats it as the same
 per-op-refusal family as `ELCA_ERR_EXPIRED` / `_CAPS_INSUFFICIENT`),
-and an `ELCC_*` extension band `0xFFFFEA70..7F` (LE.M3: `ERR_CYCLE_DETECTED`,
-`ERR_BAD_CTX`, `ERR_ZERO_GRANT` — see the "EXTENSION BAND" header in
-`src/elevate_client_cap.pdx` for why these three sit outside the base
-`0x30..3F` band). `0` is success in every band. The boot witness
+and an `ELCC_*` extension band `0xFFFFEA70..7F` (LE.M3 + LE.M7-001:
+`ERR_CYCLE_DETECTED`, `ERR_BAD_CTX`, `ERR_ZERO_GRANT`, `ERR_CASCADE_FAIL`
+— see the "EXTENSION BAND" header in `src/elevate_client_cap.pdx` for
+why these four sit outside the base `0x30..3F` band). `0` is success
+in every band. The boot witness
 `tests/elevate_client_bands_test.pdx` (LE.M1-005, #37) asserts these
 nine ranges never overlap and that every currently-defined status
 constant falls inside its own band.

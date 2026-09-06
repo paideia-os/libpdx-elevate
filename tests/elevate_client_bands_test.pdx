@@ -97,13 +97,14 @@
 //   6.  B4 members (2): EXHAUSTED, BAD_ARG, membership + ordering.
 //   7.  B5 members (16, the band is fully packed): BAD_ROW..
 //       DELEGATION_TOO_DEEP, membership + ordering.
-//   8.  B6 members (5): BAD_ACTOR..OP_JOURNAL_FAIL, ATTEST_JOURNAL_FAIL
-//       (LE.M5-001, #31), membership + ordering.
+//   8.  B6 members (6): BAD_ACTOR..OP_JOURNAL_FAIL, ATTEST_JOURNAL_FAIL
+//       (LE.M5-001, #31), REVOKE_CASCADE_JOURNAL_FAIL (LE.M7-001, #35),
+//       membership + ordering.
 //   9.  B7 members (2): BAD_BUF, BAD_REPLY_BUF, membership + ordering.
 //   10. B8 members (4): EXPIRED, CAPS_INSUFFICIENT, SCOPE_MISMATCH,
 //       UNATTESTED (LE.M5-002, #32), membership + ordering.
-//   11. B9 members (3): CYCLE_DETECTED, BAD_CTX, ZERO_GRANT,
-//       membership + ordering.
+//   11. B9 members (4): CYCLE_DETECTED, BAD_CTX, ZERO_GRANT,
+//       CASCADE_FAIL (LE.M7-001, #35), membership + ordering.
 //   12. ELVR_RETRIABLE_* alias equality against their B2 counterparts.
 //   13. ELVC_OUTCOME_* (0/1/2) stay ordered and strictly below B1's
 //       lower bound.
@@ -492,8 +493,9 @@ module ElevateClientBandsTest = structure {
         ja  ecbw_fail_stage;
 
         // ==============================================================
-        // Stage 8: B6 (ELVJ_ERR_*, elevate_client_journal.pdx) -- 5
-        // members (LE.M5-001, #31, added ATTEST_JOURNAL_FAIL).
+        // Stage 8: B6 (ELVJ_ERR_*, elevate_client_journal.pdx) -- 6
+        // members (LE.M5-001, #31, added ATTEST_JOURNAL_FAIL; LE.M7-001,
+        // #35, added REVOKE_CASCADE_JOURNAL_FAIL).
         // ==============================================================
         mov rax, 8;
         lea rcx, [rip + _ecbw_stage];
@@ -521,6 +523,11 @@ module ElevateClientBandsTest = structure {
         mov r9, r10;
 
         mov r10, 0xFFFFEA44;             // ELVJ_ERR_ATTEST_JOURNAL_FAIL
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA45;             // ELVJ_ERR_REVOKE_CASCADE_JOURNAL_FAIL
         cmp r10, r9;
         jbe ecbw_fail_stage;
 
@@ -589,8 +596,8 @@ module ElevateClientBandsTest = structure {
 
         // ==============================================================
         // Stage 11: B9 (ELCC_* extension band, elevate_client_cap.pdx,
-        // LE.M3) -- 3 members. Same ELCC_ prefix as B5 but a DISTINCT
-        // band (0x70s vs 0x30s).
+        // LE.M3 + LE.M7-001) -- 4 members. Same ELCC_ prefix as B5 but a
+        // DISTINCT band (0x70s vs 0x30s).
         // ==============================================================
         mov rax, 11;
         lea rcx, [rip + _ecbw_stage];
@@ -608,6 +615,11 @@ module ElevateClientBandsTest = structure {
         mov r9, r10;
 
         mov r10, 0xFFFFEA73;             // ELCC_ERR_ZERO_GRANT
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA74;             // ELCC_ERR_CASCADE_FAIL (LE.M7-001, #35)
         cmp r10, r9;
         jbe ecbw_fail_stage;
 

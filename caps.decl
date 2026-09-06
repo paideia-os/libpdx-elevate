@@ -54,6 +54,24 @@
   # 0x191, derived over KIND_IPC_ENDPOINT (base 5).  Rights narrowed to the
   # specific row_id the caller obtained from the broker's APR reply.
 
++entry elevate_client_cap_revoke_cascade
+  KIND_ELEVATE_CHANNEL(revoke, row_id)
+  # LE.M7-001 (#35): force-revokes row_id and every transitive shadow-map
+  # descendant. Same single cap as _check_and_revoke above -- every row it
+  # touches is one this process already held a KIND_ELEVATE_CHANNEL revoke
+  # right over (its own row_id, or a row derived from one via
+  # elevate_client_cap_derive, which mints each child under the SAME
+  # caller-supplied broker context). No union with elevate_client_cap_mint's
+  # entry: this function never mints.
+
++entry elevate_client_cap_drain_broker_exp
+  KIND_IPC_ENDPOINT(read, reply_ep_id)
+  KIND_ELEVATE_CHANNEL(revoke, row_id)
+  # LE.M7-002 (#36): union of elevate_client_recv_reply's read-own-reply-
+  # endpoint cap (drain_broker_exp polls the SAME kind of endpoint, just
+  # non-blockingly) and elevate_client_cap_revoke_cascade's cap above,
+  # which it calls once per drained ELV_OP_EXP frame.
+
 +entry elevate_client_request_ex
 +entry elevate_client_request_ex_j
 +entry elevate_client_request_ex_r

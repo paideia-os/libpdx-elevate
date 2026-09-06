@@ -1,0 +1,463 @@
+// tests/elevate_client_revoke_cascade_test.pdx -- libpdx-elevate.LE.M7-001/002
+// (paideia-os/libpdx-elevate#35, #36)
+//
+// Revoke cascade over the child chain + broker-triggered propagation.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Two boot witnesses, one per issue, bundled in one file because #36's
+// drain_broker_exp is a thin forwarder onto #35's revoke_cascade:
+//
+//   elevate_client_revoke_cascade_witness()
+//     -- LE.M7-001 (#35): src/elevate_client_cap.pdx's
+//        elevate_client_cap_revoke_cascade + its scrub_row helper, and
+//        src/elevate_client_journal.pdx's elevate_client_journal_
+//        revoke_cascade.
+//
+//   elevate_client_drain_broker_exp_witness()
+//     -- LE.M7-002 (#36): src/elevate_client_send.pdx's
+//        elevate_client_cap_drain_broker_exp.
+//
+// -----------------------------------------------------------------------------
+// WHY THE KERNEL-REVOKE HAPPY PATH IS NOT ASSERTED HERE
+// -----------------------------------------------------------------------------
+//
+// Exactly the constraint tests/elevate_client_cap_test.pdx (stage 12),
+// tests/elevate_client_cap_m3_test.pdx (stage 12), and tests/
+// elevate_client_attest_test.pdx (the #32 witness's stages 4-6) each
+// document for their own kernel-touching branch: a boot witness has no
+// live broker, so no row_id used here was ever really minted, and
+// elevate_channel_cap_revoke's real-world response to a never-minted
+// row is environment-dependent (typically BAD_SLOT, which this
+// library's revoke_cascade surfaces as ELCC_ERR_CASCADE_FAIL -- see
+// that function's doc for why ANY non-ALREADY kernel refusal aborts
+// the whole walk immediately). Stage 7/8 below therefore accept EITHER
+// a genuine small count OR ELCC_ERR_CASCADE_FAIL, the same tolerant
+// pattern those three precedents already establish, and stage 8's
+// idempotency check only compares the two counts when BOTH calls
+// happened to produce one (see that stage's comment).
+//
+// What IS fully deterministic in this environment, and asserted
+// without qualification: the BAD_ROW gate (no kernel call at all), the
+// scrub_row helper (a pure shadow-map operation), and elevate_client_
+// journal_revoke_cascade (a real, unconditional uej_append -- no
+// cap-table dependency, same reasoning tests/elevate_client_attest_
+// test.pdx's file header gives for why ITS uej_append call is safe to
+// assert on directly in a boot witness).
+//
+// -----------------------------------------------------------------------------
+// WHY THE EXP-FRAME-TRIGGERS-CASCADE PATH IS NOT EXERCISED HERE
+// -----------------------------------------------------------------------------
+//
+// elevate_client_cap_drain_broker_exp's own doc (src/elevate_client_
+// send.pdx) already records that the kernel does not emit ELV_OP_EXP
+// frames today (no reaper exists; paideia-os #2122). Proving the
+// parse-and-forward half of #36 end-to-end would require either a live
+// broker or this witness pushing a synthetic frame onto its own
+// reply endpoint via endpoint_write_pending before draining it --
+// something NO witness anywhere in this library's test suite attempts
+// (tests/elevate_client_outcome_test.pdx explicitly names the same
+// "would require a live broker" limitation for its own untried send
+// path). Absent an established, verified pattern for a self-produced
+// endpoint round trip, and given the specific downside of getting
+// unverified endpoint-ownership semantics wrong in a BOOT witness (a
+// hang or panic there, unlike a merely-incomplete assertion, could
+// break the whole boot smoke run for every OTHER witness in the same
+// image), this witness sticks to what's independently verifiable: the
+// reply_ep_id range gate and the "nothing pending -> 0, no side
+// effects" empty-queue path. The EXP-frame parse/forward path is
+// deferred to an end-to-end broker witness, the same deferral M3's and
+// M5's post-mint state already got.
+//
+// =============================================================================
+// FINGERPRINTS
+// =============================================================================
+//
+//   LIBPDX-ELEVATE LE.M7 CASCADE OK      (#35, elevate_client_revoke_cascade_witness)
+//   LIBPDX-ELEVATE LE.M7 EXP-DRAIN OK    (#36, elevate_client_drain_broker_exp_witness)
+//
+// Labels prefixed ercw_ (#35 witness) and edbw_ (#36 witness) --
+// disjoint from every other elc*_ / ecc*_ / ecp*_ / ecq*_ / ecb*_ /
+// em3w_ / eatw_ / eaqw_ prefix in this library.
+
+module ElevateClientRevokeCascadeTest = structure {
+
+  pub let mut _ercw_stage        : u64 = 0
+  pub let mut _ercw_first_result : u64 = 0
+
+  pub let ercw_ok   : [u8; 32] = "LIBPDX-ELEVATE LE.M7 CASCADE OK\0"
+  pub let ercw_fail : [u8; 34] = "LIBPDX-ELEVATE LE.M7 CASCADE FAIL\0"
+
+  pub let mut _edbw_stage : u64 = 0
+
+  pub let edbw_ok   : [u8; 34] = "LIBPDX-ELEVATE LE.M7 EXP-DRAIN OK\0"
+  pub let edbw_fail : [u8; 36] = "LIBPDX-ELEVATE LE.M7 EXP-DRAIN FAIL\0"
+
+  // ==========================================================================
+  // elevate_client_revoke_cascade_witness() -- LE.M7-001 (#35)
+  //
+  // Stages:
+  //   1. reset -- cap shadow state + journal stats scrubbed to zero.
+  //   2. elevate_client_cap_scrub_row(9): poke all eight shadow maps at
+  //      row 9 with non-zero values, scrub, assert every map reads 0.
+  //   3. elevate_client_cap_revoke_cascade(17) [out of range] ->
+  //      ELCC_ERR_BAD_ROW. Fully deterministic -- no kernel call.
+  //   4. elevate_client_journal_revoke_cascade(actor=0xABCD, row=2,
+  //      cascade_root=1) -> seq < 256; ELVJ_ST_REVOKE_CASCADE_WRITES
+  //      bumped to 1. A real, unconditional uej_append -- safe to
+  //      assert directly (see file header).
+  //   5. elevate_client_journal_revoke_cascade(actor=0, ...) ->
+  //      ELVJ_ERR_BAD_ACTOR; ELVJ_ST_BAD_ACTOR bumped to 1.
+  //   6. Build a 3-generation chain via bind_parent: 6's parent = 5,
+  //      7's parent = 6. Sanity: get_depth(7) == 2.
+  //   7. revoke_cascade(5) [the chain's root]. Accept a count in [0,3]
+  //      OR ELCC_ERR_CASCADE_FAIL (see file header); stash the result.
+  //   8. revoke_cascade(5) again. Accept the same set; when BOTH calls
+  //      produced a genuine count, the second must not exceed the
+  //      first (idempotency: no repeat call may find MORE work than an
+  //      earlier one already accounted for).
+  // ==========================================================================
+
+  pub let elevate_client_revoke_cascade_witness : () -> u64 !{sysreg, mem} @{cap} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {cap},
+      justification: "libpdx-elevate.LE.M7-001 (#35): boot witness for elevate_client_cap_revoke_cascade, its elevate_client_cap_scrub_row helper, and elevate_client_journal_revoke_cascade. Every stage reloads its rdi/rsi/rdx arguments as fresh immediates; the one value that must survive across CALLs (stage 7's revoke_cascade result, read back by stage 8) is stashed to memory (_ercw_first_result) rather than a register, same idiom as the stage counter itself, so no callee-save push is required -- only alignment. A bare `sub rsp, 24` reserves the same byte count the two-push-plus-pad idiom elsewhere in this library uses; entry rsp%16==8 -> (8-24) mod 16 == 0, so every nested call sees aligned rsp. capabilities {cap} propagate from elevate_client_cap_revoke_cascade's own {cap} annotation (stages 7-8); every other call in this witness declares capabilities {}. Labels prefixed ercw_.",
+      block: {
+        sub rsp, 24;                     // alignment only -- no live data spans a CALL
+
+        // ------------------------------------------------------------
+        // Stage 1: reset.
+        // ------------------------------------------------------------
+        mov rax, 1;
+        lea rcx, [rip + _ercw_stage];
+        mov [rcx], rax;
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+
+        // ------------------------------------------------------------
+        // Stage 2: scrub_row(9) -- poke all eight maps, scrub, assert
+        // every map reads back 0. Slot 9 * 8 bytes = +72.
+        // ------------------------------------------------------------
+        mov rax, 2;
+        lea rcx, [rip + _ercw_stage];
+        mov [rcx], rax;
+
+        lea r10, [rip + _elevate_client_cap_expire_map];
+        mov r11, 111;
+        mov [r10 + 72], r11;
+        lea r10, [rip + _elevate_client_cap_grant_map];
+        mov r11, 0x03;
+        mov [r10 + 72], r11;
+        lea r10, [rip + _elevate_client_cap_scope_map];
+        mov r11, 222;
+        mov [r10 + 72], r11;
+        lea r10, [rip + _elevate_client_cap_budget_map];
+        mov r11, 5;
+        mov [r10 + 72], r11;
+        lea r10, [rip + _elevate_client_cap_parent_map];
+        mov r11, 1;
+        mov [r10 + 72], r11;
+        lea r10, [rip + _elevate_client_cap_audit_seq_map];
+        mov r11, 3;
+        mov [r10 + 72], r11;
+        lea r10, [rip + _elevate_client_cap_audit_kind_map];
+        mov r11, 4;
+        mov [r10 + 72], r11;
+        lea r10, [rip + _elevate_client_cap_attest_required_map];
+        mov r11, 1;
+        mov [r10 + 72], r11;
+
+        mov rdi, 9;
+        call elevate_client_cap_scrub_row;
+
+        lea r10, [rip + _elevate_client_cap_expire_map];
+        mov rax, [r10 + 72];
+        cmp rax, 0;
+        jne ercw_fail_stage;
+        lea r10, [rip + _elevate_client_cap_grant_map];
+        mov rax, [r10 + 72];
+        cmp rax, 0;
+        jne ercw_fail_stage;
+        lea r10, [rip + _elevate_client_cap_scope_map];
+        mov rax, [r10 + 72];
+        cmp rax, 0;
+        jne ercw_fail_stage;
+        lea r10, [rip + _elevate_client_cap_budget_map];
+        mov rax, [r10 + 72];
+        cmp rax, 0;
+        jne ercw_fail_stage;
+        lea r10, [rip + _elevate_client_cap_parent_map];
+        mov rax, [r10 + 72];
+        cmp rax, 0;
+        jne ercw_fail_stage;
+        lea r10, [rip + _elevate_client_cap_audit_seq_map];
+        mov rax, [r10 + 72];
+        cmp rax, 0;
+        jne ercw_fail_stage;
+        lea r10, [rip + _elevate_client_cap_audit_kind_map];
+        mov rax, [r10 + 72];
+        cmp rax, 0;
+        jne ercw_fail_stage;
+        lea r10, [rip + _elevate_client_cap_attest_required_map];
+        mov rax, [r10 + 72];
+        cmp rax, 0;
+        jne ercw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 3: revoke_cascade(17) -> ELCC_ERR_BAD_ROW. No kernel
+        // call happens on this path -- fully deterministic.
+        // ------------------------------------------------------------
+        mov rax, 3;
+        lea rcx, [rip + _ercw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 17;
+        call elevate_client_cap_revoke_cascade;
+        mov r10, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
+        cmp rax, r10;
+        jne ercw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 4: journal_revoke_cascade(actor=0xABCD, row=2, root=1)
+        // -> valid seq. A real uej_append -- deterministic.
+        // ------------------------------------------------------------
+        mov rax, 4;
+        lea rcx, [rip + _ercw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0xABCD;                 // actor_fp_lo
+        mov rsi, 2;                      // row_id (just revoked, synthetic)
+        mov rdx, 1;                      // cascade_root_row_id (synthetic)
+        call elevate_client_journal_revoke_cascade;
+        cmp rax, 256;                    // ELVJ_UEJ_SEQ_MAX
+        jae ercw_fail_stage;
+
+        mov rdi, 9;                      // ELVJ_ST_REVOKE_CASCADE_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 1;
+        jne ercw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 5: journal_revoke_cascade(actor=0, ...) ->
+        // ELVJ_ERR_BAD_ACTOR.
+        // ------------------------------------------------------------
+        mov rax, 5;
+        lea rcx, [rip + _ercw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;                    // actor_fp_lo = 0 <-- gate
+        mov rsi, 2;
+        mov rdx, 1;
+        call elevate_client_journal_revoke_cascade;
+        mov r10, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR
+        cmp rax, r10;
+        jne ercw_fail_stage;
+
+        mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
+        call elevate_client_journal_stat;
+        cmp rax, 1;
+        jne ercw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 6: build a 3-generation chain 5 -> 6 -> 7. Sanity:
+        // get_depth(7) == 2.
+        // ------------------------------------------------------------
+        mov rax, 6;
+        lea rcx, [rip + _ercw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 6;                      // child = 6
+        mov rsi, 5;                      // parent = 5
+        call elevate_client_cap_bind_parent;
+        cmp rax, 0;
+        jne ercw_fail_stage;
+
+        mov rdi, 7;                      // child = 7
+        mov rsi, 6;                      // parent = 6
+        call elevate_client_cap_bind_parent;
+        cmp rax, 0;
+        jne ercw_fail_stage;
+
+        mov rdi, 7;
+        call elevate_client_cap_get_depth;
+        cmp rax, 2;
+        jne ercw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 7: revoke_cascade(5) -- the chain's root. Accept a
+        // count in [0,3] OR ELCC_ERR_CASCADE_FAIL (see file header).
+        // Stash the result for stage 8's idempotency check.
+        // ------------------------------------------------------------
+        mov rax, 7;
+        lea rcx, [rip + _ercw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 5;
+        call elevate_client_cap_revoke_cascade;
+
+        lea rcx, [rip + _ercw_first_result];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA74;             // ELCC_ERR_CASCADE_FAIL
+        cmp rax, r10;
+        je  ercw_stage7_ok;              // no live broker -- accepted outcome
+        cmp rax, 3;                      // max plausible count (3-row chain)
+        ja  ercw_fail_stage;
+      ercw_stage7_ok:
+
+        // ------------------------------------------------------------
+        // Stage 8: revoke_cascade(5) again. Same acceptable set; when
+        // BOTH calls produced a genuine count, the second must not
+        // exceed the first.
+        // ------------------------------------------------------------
+        mov rax, 8;
+        lea rcx, [rip + _ercw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 5;
+        call elevate_client_cap_revoke_cascade;
+
+        mov r10, 0xFFFFEA74;             // ELCC_ERR_CASCADE_FAIL
+        cmp rax, r10;
+        je  ercw_stage8_class_ok;
+        cmp rax, 3;
+        ja  ercw_fail_stage;
+      ercw_stage8_class_ok:
+
+        lea rcx, [rip + _ercw_first_result];
+        mov r11, [rcx];                  // first call's result
+        mov r10, 0xFFFFEA74;             // ELCC_ERR_CASCADE_FAIL
+        cmp r11, r10;
+        je  ercw_stage8_done;            // first was CASCADE_FAIL -- no compare
+        cmp rax, r10;
+        je  ercw_stage8_done;            // second was CASCADE_FAIL -- no compare
+        cmp rax, r11;
+        ja  ercw_fail_stage;             // idempotency violated
+      ercw_stage8_done:
+
+        // ------------------------------------------------------------
+        // Success. Log OK, scrub state, return 0.
+        // ------------------------------------------------------------
+        mov rdi, 3;                      // KLOG_LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ercw_ok];
+        call klog_s1;
+
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+        xor rax, rax;
+        jmp ercw_out;
+
+      ercw_fail_stage:
+        lea rax, [rip + _ercw_stage];
+        mov r8, [rax];                   // value1 -- failing stage id
+        mov rdi, 1;                      // KLOG_LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ercw_fail];
+        lea rcx, [rip + k_line];         // key1 = "line"
+        call klog_s1_d1;
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+        mov rax, 1;
+
+      ercw_out:
+        add rsp, 24;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_drain_broker_exp_witness() -- LE.M7-002 (#36)
+  //
+  // Stages:
+  //   1. reset.
+  //   2. drain(0) [out of range low] -> ELVC_ERR_BAD_REPLY_EP.
+  //   3. drain(200) [out of range high] -> ELVC_ERR_BAD_REPLY_EP.
+  //   4. drain(1), nothing pending -> 0. See file header for why the
+  //      EXP-frame parse/forward path itself is not exercised here.
+  // ==========================================================================
+
+  pub let elevate_client_drain_broker_exp_witness : () -> u64 !{sysreg, mem} @{cap} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {cap},
+      justification: "libpdx-elevate.LE.M7-002 (#36): boot witness for elevate_client_cap_drain_broker_exp's endpoint-id gate and empty-queue path -- see the file header for why the EXP-frame parse/forward path itself is deferred. Every stage reloads its rdi argument as a fresh immediate and records the stage id to memory, so no callee-save push is required -- only alignment via `sub rsp, 24`, matching elevate_client_revoke_cascade_witness's own shape. capability {cap} propagates from elevate_client_cap_drain_broker_exp's own {cap} annotation. Labels prefixed edbw_.",
+      block: {
+        sub rsp, 24;                     // alignment only -- no live data spans a CALL
+
+        // ------------------------------------------------------------
+        // Stage 1: reset.
+        // ------------------------------------------------------------
+        mov rax, 1;
+        lea rcx, [rip + _edbw_stage];
+        mov [rcx], rax;
+        call elevate_client_cap_reset;
+
+        // ------------------------------------------------------------
+        // Stage 2: drain(0) -> ELVC_ERR_BAD_REPLY_EP (below [1..127]).
+        // ------------------------------------------------------------
+        mov rax, 2;
+        lea rcx, [rip + _edbw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;                    // reply_ep_id = 0
+        call elevate_client_cap_drain_broker_exp;
+        mov r10, 0xFFFFEA05;             // ELVC_ERR_BAD_REPLY_EP
+        cmp rax, r10;
+        jne edbw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 3: drain(200) -> ELVC_ERR_BAD_REPLY_EP (above [1..127]).
+        // ------------------------------------------------------------
+        mov rax, 3;
+        lea rcx, [rip + _edbw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 200;                    // reply_ep_id = 200
+        call elevate_client_cap_drain_broker_exp;
+        mov r10, 0xFFFFEA05;             // ELVC_ERR_BAD_REPLY_EP
+        cmp rax, r10;
+        jne edbw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 4: drain(1), nothing pending -> 0, no side effects.
+        // ------------------------------------------------------------
+        mov rax, 4;
+        lea rcx, [rip + _edbw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 1;                      // reply_ep_id = 1
+        call elevate_client_cap_drain_broker_exp;
+        cmp rax, 0;
+        jne edbw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Success. Log OK, scrub state, return 0.
+        // ------------------------------------------------------------
+        mov rdi, 3;                      // KLOG_LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + edbw_ok];
+        call klog_s1;
+
+        call elevate_client_cap_reset;
+        xor rax, rax;
+        jmp edbw_out;
+
+      edbw_fail_stage:
+        lea rax, [rip + _edbw_stage];
+        mov r8, [rax];                   // value1 -- failing stage id
+        mov rdi, 1;                      // KLOG_LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + edbw_fail];
+        lea rcx, [rip + k_line];         // key1 = "line"
+        call klog_s1_d1;
+        call elevate_client_cap_reset;
+        mov rax, 1;
+
+      edbw_out:
+        add rsp, 24;
+        ret
+      }
+    }
+}

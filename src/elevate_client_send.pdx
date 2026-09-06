@@ -78,6 +78,70 @@
 //                                          (kept as M1-reserved alias for parity)
 //   0xFFFFEA0D  ELVC_ERR_SEND_FAIL     -- endpoint_write_pending refused
 //                                          (kept as M1-reserved alias for parity)
+//
+// LE.M7-002 (#36) reuses ELVC_ERR_BAD_REPLY_EP (0xFFFFEA05, above) for
+// elevate_client_cap_drain_broker_exp's own endpoint-id gate rather
+// than minting a new code -- both functions apply the identical
+// [1..127] range check to a reply_ep_id argument.
+//
+// =============================================================================
+// LE.M7-002 (#36): elevate_client_cap_drain_broker_exp
+// =============================================================================
+//
+// A NEW entry point, not a new error band. Non-blocking drain of a
+// client's reply endpoint for broker-pushed ELV_OP_EXP frames; each
+// one found is forwarded to elevate_client_cap_revoke_cascade
+// (elevate_client_cap.pdx, LE.M7-001, #35) by row_id.
+//
+// -----------------------------------------------------------------------------
+// KERNEL-SIDE STATUS: SCAFFOLDING AHEAD OF THE EMITTER
+// -----------------------------------------------------------------------------
+//
+// As of this landing the paideia-os kernel does NOT emit ELV_OP_EXP
+// frames -- src/kernel/core/ipc/elevate_channel.pdx documents the wire
+// shape as a comment (op=0x03, "internal broadcast on expiry (kernel
+// timer)") but no packer/sender for it exists, and the reaper that
+// would be the natural emitter is tracked as a separate, unlanded
+// kernel issue (paideia-os #2122; see src/kernel/core/cap/kind_
+// elevate_channel.pdx's own note on the same gap). This function is
+// client-side scaffolding for when that emitter lands -- the SAME
+// posture elevate_client_cap_derive already takes toward a not-yet-
+// real elevate_channel_cap_derive_inner primitive (see that function's
+// header in elevate_client_cap.pdx).
+//
+// -----------------------------------------------------------------------------
+// NAMING GAP: request_id vs. row_id
+// -----------------------------------------------------------------------------
+//
+// The ONLY documented EXP body layout (elevate_channel.pdx's comment)
+// names body word 0 as `request_id` (a broker-assigned value stored at
+// kernel row offset +8, per kind_elevate_channel.pdx), NOT `row_id`
+// (this library's client-side shadow-map index / kernel cap-table
+// slot). Issue #36's acceptance criteria call for extracting "the
+// row_id" from an EXP frame's body word 0; this implementation follows
+// that literally -- there is today no request_id -> row_id shadow
+// lookup in this library, nor a kernel-side accessor for one.
+// Reconciling the two names (change the eventual emitter to carry
+// row_id directly, OR add a client-side reverse index) is deferred to
+// whoever lands the kernel-side reaper (paideia-os #2122) or a
+// follow-on to #30 (elevate_client_cap_reap_expired, also deferred).
+// A malformed/garbage value read from this offset is harmless either
+// way: revoke_cascade's own row_id >= 16 gate refuses it cleanly.
+//
+// -----------------------------------------------------------------------------
+// PRECONDITION: A DEDICATED ENDPOINT
+// -----------------------------------------------------------------------------
+//
+// reply_ep_id MUST be an endpoint reserved for broker-pushed broadcasts
+// -- NOT the same per-request reply endpoint a concurrent elevate_
+// client_request_ex / _recv_reply call is blocked awaiting an APR on.
+// drain_broker_exp destructively consumes (endpoint_take_pending) every
+// pending frame regardless of shape until the endpoint is empty; a
+// non-EXP frame it happens to take (e.g. a stray APR) is silently
+// skipped rather than misinterpreted, but it is still GONE from the
+// endpoint's queue, which would corrupt whichever concurrent request
+// was awaiting it. This mirrors _reap_expired's own suggested wire-up
+// in issue #36: a housekeeping call site, not a per-request one.
 
 module ElevateClientSend = structure {
 
@@ -152,6 +216,7 @@ module ElevateClientSend = structure {
 
   pub let ELVS_OP_REQ : u64 = 0x01
   pub let ELVS_OP_APR : u64 = 0x02
+  pub let ELVS_OP_EXP : u64 = 0x03        // LE.M7-002 (#36); see file header
 
   // Frame header ver -- matches the R20b.M2-001 convention: ver >= 1
   // is required for a valid packed hdr (see src/kernel/core/ipc/
@@ -161,6 +226,7 @@ module ElevateClientSend = structure {
   // Payload sizes.
   pub let ELVS_REQ_PAYLOAD_BYTES : u64 = 32       // matches ELEVATE_REQ_FRAME_BYTES
   pub let ELVS_APR_PAYLOAD_BYTES : u64 = 32       // approver frame is same shape
+  pub let ELVS_EXP_PAYLOAD_BYTES : u64 = 32       // LE.M7-002 (#36); same 32-byte shape
 
   // Endpoint id range: 1..127 is a valid reply endpoint per
   // src/kernel/core/ipc/endpoint_table.pdx (128 slots, 0 = "reply on
@@ -172,6 +238,16 @@ module ElevateClientSend = structure {
   // endpoint_take_pending.  8 bytes; single-instance because a REQ
   // never overlaps with itself on a per-process client.
   pub let mut _elevate_client_recv_hdr_scratch : [u64; 1] = uninit @align(8)
+
+  // LE.M7-002 (#36): scratch for elevate_client_cap_drain_broker_exp's
+  // own endpoint_take_pending calls. Separate from the recv-path
+  // scratch above -- drain runs opportunistically alongside a possible
+  // concurrent in-flight elevate_client_recv_reply poll on a DIFFERENT
+  // endpoint (see the PRECONDITION note in the file header), and
+  // sharing one scratch buffer between the two would let one call
+  // clobber the other's in-progress read.
+  pub let mut _elevate_client_drain_hdr_scratch     : [u64; 1] = uninit @align(8)
+  pub let mut _elevate_client_drain_payload_scratch : [u64; 4] = uninit @align(32)
 
   // ==========================================================================
   // elevate_client_set_human_timeout(ns) -> ()
@@ -948,6 +1024,123 @@ module ElevateClientSend = structure {
         pop r15;
         pop r14;
         pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_cap_drain_broker_exp(reply_ep_id)
+  //   -> propagated_count | ELVC_ERR_BAD_REPLY_EP | ELCC_ERR_*
+  //
+  // LE.M7-002 (#36).  Non-blocking drain of reply_ep_id for pending
+  // ELV_OP_EXP frames; each one found is forwarded to elevate_client_
+  // cap_revoke_cascade (elevate_client_cap.pdx, LE.M7-001, #35) by
+  // row_id. See the file header for: the reply_ep_id gate reusing
+  // ELVC_ERR_BAD_REPLY_EP, the kernel-side scaffolding-ahead-of-emitter
+  // posture, the request_id/row_id naming gap, and the dedicated-
+  // endpoint precondition.
+  //
+  // Sequence, single bounded sweep (no timeout / no hpet -- "non-
+  // blocking poll" per #36, unlike elevate_client_recv_reply's
+  // deadline-bounded wait):
+  //
+  //   loop:
+  //     endpoint_take_pending(reply_ep_id, drain_hdr, drain_payload)
+  //       PENDING_TAKE_EMPTY -> done; return propagated_count.
+  //       payload_len < 32   -> too short to be any known frame; skip,
+  //                             keep draining (the endpoint is still
+  //                             owed a full drain regardless).
+  //     op byte (payload[+0] & 0xFF) != ELV_OP_EXP -> not our frame;
+  //       skip, keep draining (see PRECONDITION: a non-EXP frame here
+  //       means a caller violated the dedicated-endpoint contract, not
+  //       a reason to abort the sweep).
+  //     row_id = payload[+8] (body word 0 -- see NAMING GAP note).
+  //     rc = elevate_client_cap_revoke_cascade(row_id)
+  //       rc <= ELCC_MAX_ROWS (16) -> it is a real count; add to
+  //         propagated_count, keep draining.
+  //       rc >  16                 -> it is an ELCC_ERR_* code (every
+  //         status constant in this library is >= 0xFFFFEA00, so the
+  //         two ranges never overlap); STOP the sweep and propagate it
+  //         as-is -- a caller sees exactly which cascade failed and
+  //         where, same "abort on the first hard failure, do not
+  //         silently swallow it into an aggregate" discipline
+  //         elevate_client_recv_reply / elevate_client_cap_derive use.
+  //
+  // The loop is naturally bounded: every iteration either consumes one
+  // message (shrinking the endpoint's pending queue, which the kernel
+  // itself caps) or returns immediately, so no artificial pass-count
+  // limit is needed the way revoke_cascade's own BFS closure needs one.
+  //
+  // Register plan: rbx=reply_ep_id (alive across every loop
+  // iteration's calls), r12=propagated_count (accumulator). Neither
+  // the op-word/row_id scratch nor the payload_len check needs to
+  // survive a nested CALL, so no other callee-save register is
+  // required. Two callee-save pushes + one 8-byte alignment pad = 24
+  // bytes; entry rsp%16==8 -> (8-24) mod 16 == 0.
+  // ==========================================================================
+
+  pub let elevate_client_cap_drain_broker_exp : (u64) -> u64 !{mem} @{cap} =
+    fn (reply_ep_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "libpdx-elevate.LE.M7-002 (#36): non-blocking drain of reply_ep_id for pending ELV_OP_EXP frames, forwarding each to elevate_client_cap_revoke_cascade by row_id. Two callee-save pushes (rbx=reply_ep_id, r12=propagated_count) + one 8-byte alignment pad = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0 so every nested call (endpoint_take_pending, elevate_client_cap_revoke_cascade) sees aligned rsp. The reply_ep_id range gate ([1..127]) is identical to elevate_client_recv_reply's own -- reuses ELVC_ERR_BAD_REPLY_EP rather than minting a new code. A count vs. ELCC_ERR_* discrimination uses `cmp rax, 16; ja ...` (unsigned): every real revoke_cascade count is bounded by ELCC_MAX_ROWS (16) and every ELCC_ERR_* status constant in this library is >= 0xFFFFEA00, so the two ranges can never be confused regardless of how many rows a future wider cap table might allow -- the constant 16 here is ELCC_MAX_ROWS specifically, not a coincidence. capability {cap} propagates from elevate_client_cap_revoke_cascade (endpoint_take_pending declares capabilities {}, matching elevate_client_recv_reply's own use of it). Unlike recv_reply this function has no hpet_now_ns call and therefore no {boot} capability -- there is no deadline, only a single bounded sweep of whatever is pending right now. Labels prefixed elcs_de_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;                      // alignment
+
+        mov rbx, rdi;                    // reply_ep_id
+
+        cmp rbx, 1;
+        jb  elcs_de_bad_ep;
+        cmp rbx, 127;
+        ja  elcs_de_bad_ep;
+
+        xor r12, r12;                    // propagated_count = 0
+
+      elcs_de_loop:
+        mov rdi, rbx;
+        lea rsi, [rip + _elevate_client_drain_hdr_scratch];
+        lea rdx, [rip + _elevate_client_drain_payload_scratch];
+        call endpoint_take_pending;
+        mov r10, 0xFFFFFFFFFFFFFFFF;     // PENDING_TAKE_EMPTY
+        cmp rax, r10;
+        je  elcs_de_done;                // endpoint drained
+
+        cmp rax, 32;                     // ELVS_EXP_PAYLOAD_BYTES
+        jb  elcs_de_loop;                // too short -- skip, keep draining
+
+        lea r10, [rip + _elevate_client_drain_payload_scratch];
+        mov r9, [r10 + 0];               // op_word
+        and r9, 0xFF;
+        cmp r9, 3;                       // ELVS_OP_EXP
+        jne elcs_de_loop;                // not EXP -- skip, keep draining
+
+        mov rdi, [r10 + 8];              // body word 0 -- row_id (see NAMING GAP)
+        call elevate_client_cap_revoke_cascade;
+        cmp rax, 16;                     // ELCC_MAX_ROWS
+        ja  elcs_de_cascade_fail;        // ELCC_ERR_* -- abort, propagate as-is
+        add r12, rax;
+        jmp elcs_de_loop;
+
+      elcs_de_done:
+        mov rax, r12;                    // propagated_count
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcs_de_cascade_fail:
+        // rax already holds the ELCC_ERR_* code from revoke_cascade.
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcs_de_bad_ep:
+        mov rax, 0xFFFFEA05;             // ELVC_ERR_BAD_REPLY_EP
+        add rsp, 8;
         pop r12;
         pop rbx;
         ret

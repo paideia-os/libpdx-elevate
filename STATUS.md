@@ -6,7 +6,9 @@
 LE.M1-M3 (multilevel-chain foundations, v1.1.0 continuation) —
 complete on main (see per-ticket table in `CHANGELOG.md`), unreleased;
 v1.1.1 PATCH (LE.M3-001 real-mint-args pass) — complete on `main`,
-supersedes the v1.1.0 label (which is retired without a signed tag)
+supersedes the v1.1.0 label (which is retired without a signed tag);
+LE.M5 (#31, #32, attestation) and LE.M7-001/002 (#35, #36, revoke
+cascade + broker propagation) — complete on `main`, unreleased
 **Version:** 1.0.0 (2026-08-22) tagged; v1.1.1 (v1.1.0-wave +
 LE.M3-001 real-mint-args fix) landed on `main`, tag/signing pending a
 release pass
@@ -52,8 +54,11 @@ Source-breaking to a 3-arg caller of `_derive`; there are no working
 
 LE.M4, M6, M7 (issues #29-#30, #33-#36) — reap, audit sink,
 revoke-cascade — all DEFERRED to the follow-up wave; comment posted
-on each issue. LE.M5 (#31, #32, attestation) has since landed — see
-below.
+on each issue. LE.M5 (#31, #32, attestation) and LE.M7-001/002 (#35,
+#36, revoke cascade) have since landed — see below. LE.M4-002 (#30,
+`elevate_client_cap_reap_expired`) and LE.M6 (#33, #34, audit sink)
+remain deferred; #30 stays open by the reporter's own request even
+though revoke_cascade's landing removes its stated blocker.
 
 ## LE.M5 — attestation (M5-001/002 landed; M5-003+ not filed)
 
@@ -67,6 +72,44 @@ same as LE.M3's own post-mint state): `elevate_client_cap_derive`'s
 mint SUCCESS path when an attestation-required parent is correctly
 attested, and the child-inherits-the-flag assertion, since neither is
 reachable deterministically without a live broker in a boot witness.
+
+## LE.M7-001/002 — revoke cascade + broker propagation (landed)
+
+`elevate_client_cap_revoke_cascade(row_id)` (`src/elevate_client_cap.pdx`,
+#35) force-revokes row_id and every transitive LE.M3-002 parent-map
+descendant, deepest generation first, then row_id itself. No reverse
+child-index exists (or is warranted at `ELCC_MAX_ROWS` = 16) — the walk
+scans the flat 16-slot table per BFS growth pass instead. A kernel
+revoke refusal other than "already revoked" aborts the whole walk
+immediately (`ELCC_ERR_CASCADE_FAIL = 0xFFFFEA74`, new B9 extension
+member); rows revoked before the refusal stay revoked and audited.
+Second call on an already-swept chain returns 0 (idempotent). New
+factored helper `elevate_client_cap_scrub_row` replaces what would have
+been a third inline copy of the eight-map shadow scrub. New journal
+event `ELVJ_EVT_REVOKE_CASCADE = 5` and entry point
+`elevate_client_journal_revoke_cascade` (`src/elevate_client_journal.pdx`,
+new B6 member `ELVJ_ERR_REVOKE_CASCADE_JOURNAL_FAIL = 0xFFFFEA45`,
+journal stats widened 10→11 slots) — called best-effort per revoked row
+(a failed revoke-audit does not block the revoke, unlike a failed
+grant-audit elsewhere in this library).
+
+`elevate_client_cap_drain_broker_exp(reply_ep_id)`
+(`src/elevate_client_send.pdx`, #36) non-blockingly drains an
+endpoint for pending `ELV_OP_EXP` frames and forwards each by row_id
+to revoke_cascade. **Kernel-side note:** paideia-os does not emit
+`ELV_OP_EXP` frames today (no reaper exists; tracked as paideia-os
+#2122) — this is client-side scaffolding for when it does, the same
+posture `elevate_client_cap_derive` already takes toward a not-yet-real
+kernel mint primitive. The only documented EXP body layout names its
+row-identifying field `request_id`, not `row_id`; this implementation
+reads it as row_id per #36's literal acceptance criteria and documents
+the naming gap for whoever lands the real emitter.
+
+Tests: `tests/elevate_client_revoke_cascade_test.pdx`
+(`LIBPDX-ELEVATE LE.M7 CASCADE OK` / `... EXP-DRAIN OK`). Per the same
+no-live-broker constraint LE.M3's and LE.M5's own witnesses document,
+the kernel-revoke happy path and the EXP-frame-triggers-cascade path
+are not exercised end-to-end here — deferred alongside those.
 
 ## M6 — enhancement wave (complete)
 

@@ -112,6 +112,21 @@
 //                                          ATTEST record (LE.M5-001,
 //                                          #31).  No row shadow state
 //                                          is stamped when this fires.
+//   0xFFFFEA45  ELVJ_ERR_REVOKE_CASCADE_JOURNAL_FAIL
+//                                       -- uej_append refused the
+//                                          REVOKE_CASCADE record
+//                                          (LE.M7-001, #35).  The
+//                                          caller (elevate_client_cap_
+//                                          revoke_cascade) deliberately
+//                                          IGNORES this return -- see
+//                                          that function's AUDIT +
+//                                          ACTOR section for why a
+//                                          failed revoke-audit does not
+//                                          block the revoke itself.
+//                                          Declared for completeness /
+//                                          band coverage even though no
+//                                          call site currently branches
+//                                          on it.
 
 module ElevateClientJournal = structure {
 
@@ -149,6 +164,24 @@ module ElevateClientJournal = structure {
   // every handle goes through.
   pub let ELVJ_EVT_ATTEST : u64 = 4
 
+  // LE.M7-001 (#35): per-row revoke-cascade discriminator.  Fires from
+  // elevate_client_cap_revoke_cascade (elevate_client_cap.pdx), once
+  // per row it successfully revokes at the kernel -- see that
+  // function's AUDIT + ACTOR section.  Chosen as 5, immediately after
+  // ATTEST, continuing the same chronological-family numbering the
+  // three siblings above already establish.
+  //
+  // Issue #35's own acceptance-criteria text names this constant as
+  // "= 6" -- an apparent slip (likely conflated with the unrelated
+  // ELVJ_UEJ_KIND_ELEVATE = 5 wire-kind constant just above, a
+  // different namespace entirely). 5 is the value actually landed:
+  // it is the correct next-contiguous body0 discriminator (no
+  // ELVJ_EVT_* value is currently assigned to 5), and leaving a
+  // permanent gap at 5 to match the issue's literal text would cost
+  // real clarity for zero benefit -- nothing anywhere in this library
+  // or its consumers reserves 5 for anything else.
+  pub let ELVJ_EVT_REVOKE_CASCADE : u64 = 5
+
   // ---- Result codes / error band 0xFFFFEA40..0xFFFFEA4F ----
 
   pub let ELVJ_OK                      : u64 = 0
@@ -157,6 +190,7 @@ module ElevateClientJournal = structure {
   pub let ELVJ_ERR_APR_JOURNAL_FAIL    : u64 = 0xFFFFEA42
   pub let ELVJ_ERR_OP_JOURNAL_FAIL     : u64 = 0xFFFFEA43
   pub let ELVJ_ERR_ATTEST_JOURNAL_FAIL : u64 = 0xFFFFEA44
+  pub let ELVJ_ERR_REVOKE_CASCADE_JOURNAL_FAIL : u64 = 0xFFFFEA45
 
   // Threshold used to discriminate uej_append return (seq | UEJ_ERR_*)
   // from a valid seq.  UEJ_MAX_RECORDS = 256 per user_events_journal.
@@ -182,9 +216,14 @@ module ElevateClientJournal = structure {
   //                   #31) -- was "reserved" pre-M5; the slot was never
   //                   read or written before this wave.
   //   8 attest_fails  uej_append refused an ATTEST record
-  //   9 reserved
+  //   9 revoke_cascade_writes
+  //                   successful REVOKE_CASCADE journal appends
+  //                   (LE.M7-001, #35) -- was "reserved" pre-M7; the
+  //                   slot was never read or written before this wave.
+  //   10 revoke_cascade_fails
+  //                   uej_append refused a REVOKE_CASCADE record
 
-  pub let mut _elevate_client_journal_stats : [u64; 10] = uninit @align(64)
+  pub let mut _elevate_client_journal_stats : [u64; 11] = uninit @align(64)
 
   pub let ELVJ_ST_REQ_WRITES    : u64 = 0
   pub let ELVJ_ST_APR_WRITES    : u64 = 1
@@ -195,7 +234,9 @@ module ElevateClientJournal = structure {
   pub let ELVJ_ST_OP_FAILS      : u64 = 6
   pub let ELVJ_ST_ATTEST_WRITES : u64 = 7
   pub let ELVJ_ST_ATTEST_FAILS  : u64 = 8
-  pub let ELVJ_ST_MAX           : u64 = 10
+  pub let ELVJ_ST_REVOKE_CASCADE_WRITES : u64 = 9   // LE.M7-001 (#35)
+  pub let ELVJ_ST_REVOKE_CASCADE_FAILS  : u64 = 10  // LE.M7-001 (#35)
+  pub let ELVJ_ST_MAX           : u64 = 11
 
   // ==========================================================================
   // elevate_client_journal_reset() -> ()
@@ -207,7 +248,7 @@ module ElevateClientJournal = structure {
   pub let elevate_client_journal_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M3-001 (#6), extended to 10 slots at LE.M5-001 (#31) for the ATTEST write/fail counters: clear the journal stats table. Boot / teardown discipline; a live counter reset would race any concurrent journal_req / journal_apr call. Leaf; single loop. Labels prefixed elcj_rs_.",
+      justification: "libpdx-elevate.M3-001 (#6), extended to 10 slots at LE.M5-001 (#31) for the ATTEST write/fail counters, extended again to 11 at LE.M7-001 (#35) for the REVOKE_CASCADE write counter: clear the journal stats table. Boot / teardown discipline; a live counter reset would race any concurrent journal_req / journal_apr call. Leaf; single loop. Labels prefixed elcj_rs_.",
       block: {
         lea r10, [rip + _elevate_client_journal_stats];
         xor rax, rax;
@@ -215,7 +256,7 @@ module ElevateClientJournal = structure {
       elcj_rs_loop:
         mov [r10 + rcx * 8], rax;
         add rcx, 1;
-        cmp rcx, 10;
+        cmp rcx, 11;
         jb  elcj_rs_loop;
         ret
       }
@@ -224,9 +265,9 @@ module ElevateClientJournal = structure {
   pub let elevate_client_journal_note : (u64) -> () !{mem} @{} =
     fn (which: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M3-001 (#6), bound widened 8->10 at LE.M5-001 (#31): bounded increment; out-of-range which is a no-op. Same shape as elevate_client_note (elevate_client.pdx L127). Labels prefixed elcj_nt_.",
+      justification: "libpdx-elevate.M3-001 (#6), bound widened 8->10 at LE.M5-001 (#31), widened again 10->11 at LE.M7-001 (#35): bounded increment; out-of-range which is a no-op. Same shape as elevate_client_note (elevate_client.pdx L127). Labels prefixed elcj_nt_.",
       block: {
-        cmp rdi, 10;
+        cmp rdi, 11;
         jae elcj_nt_out;
         lea r10, [rip + _elevate_client_journal_stats];
         mov rax, [r10 + rdi * 8];
@@ -240,9 +281,9 @@ module ElevateClientJournal = structure {
   pub let elevate_client_journal_stat : (u64) -> u64 !{mem} @{} =
     fn (which: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M3-001 (#6), bound widened 8->10 at LE.M5-001 (#31): bounded read; out-of-range which returns 0 (0 is the correct answer for both 'never touched' and 'out of range' -- same convention as elevate_client_stat). Labels prefixed elcj_st_.",
+      justification: "libpdx-elevate.M3-001 (#6), bound widened 8->10 at LE.M5-001 (#31), widened again 10->11 at LE.M7-001 (#35): bounded read; out-of-range which returns 0 (0 is the correct answer for both 'never touched' and 'out of range' -- same convention as elevate_client_stat). Labels prefixed elcj_st_.",
       block: {
-        cmp rdi, 10;
+        cmp rdi, 11;
         jae elcj_st_zero;
         lea r10, [rip + _elevate_client_journal_stats];
         mov rax, [r10 + rdi * 8];
@@ -616,6 +657,92 @@ module ElevateClientJournal = structure {
         ret;
 
       elcj_at_bad_actor:
+        mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
+        call elevate_client_journal_note;
+        mov rax, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_journal_revoke_cascade(actor_fp_lo, row_id,
+  //                                       cascade_root_row_id)
+  //   -> seq | ELVJ_ERR_*
+  //
+  // LE.M7-001 (#35).  Append a per-row REVOKE_CASCADE audit record: one
+  // call per row elevate_client_cap_revoke_cascade (elevate_client_
+  // cap.pdx) successfully revokes at the kernel. Shape mirrors journal_
+  // op exactly -- see that function's doc for the alignment / gate
+  // reasoning; the only differences are body0 = ELVJ_EVT_REVOKE_CASCADE
+  // (5) and body1/body2 = (row_id, cascade_root_row_id) rather than
+  // (row_id, needed_caps). row_id is the row just revoked; cascade_
+  // root_row_id is the argument originally passed to revoke_cascade,
+  // so an auditor reading the journal alone can join "this row was
+  // revoked" to "because a cascade rooted at that row_id swept it up"
+  // without needing the caller's own state.
+  //
+  // The caller (revoke_cascade) treats this call as best-effort and
+  // ignores the return -- see that function's AUDIT + ACTOR section
+  // for why a revoke's audit trail does not gate the revoke itself the
+  // way a grant's does.
+  //
+  // Register plan / alignment: identical shape to journal_op -- three
+  // callee-save pushes (r12=actor, r13=row_id, r14=cascade_root) = 24
+  // bytes; entry rsp%16==8 -> (8-24) mod 16 == 0, no pad needed.
+  // ==========================================================================
+
+  pub let elevate_client_journal_revoke_cascade : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (actor_fp_lo: u64) (row_id: u64) (cascade_root_row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.LE.M7-001 (#35): append a per-row revoke-cascade audit record. Shape mirrors elevate_client_journal_op -- see that function's justification for the alignment / gate reasoning; the only differences are body0 = ELVJ_EVT_REVOKE_CASCADE (5) and body1/body2 = (row_id, cascade_root_row_id) rather than (row_id, needed_caps). Failure normalises to ELVJ_ERR_REVOKE_CASCADE_JOURNAL_FAIL and bumps ELVJ_ST_REVOKE_CASCADE_FAILS; success bumps ELVJ_ST_REVOKE_CASCADE_WRITES. Labels prefixed elcj_rc_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                    // actor_fp_lo
+        mov r13, rsi;                    // row_id (just revoked)
+        mov r14, rdx;                    // cascade_root_row_id
+
+        cmp r12, 0;
+        je  elcj_rc_bad_actor;
+
+        mov rdi, 5;                      // ELVJ_UEJ_KIND_ELEVATE
+        mov rsi, r12;                    // actor_fp_lo
+        xor rdx, rdx;                    // subject_fp_lo = 0
+        mov rcx, 5;                      // ELVJ_EVT_REVOKE_CASCADE
+        mov r8,  r13;                    // row_id
+        mov r9,  r14;                    // cascade_root_row_id
+        call uej_append;
+
+        cmp rax, 256;                    // ELVJ_UEJ_SEQ_MAX
+        jae elcj_rc_fail;
+
+        push rax;
+        sub rsp, 8;
+        mov rdi, 9;                      // ELVJ_ST_REVOKE_CASCADE_WRITES
+        call elevate_client_journal_note;
+        add rsp, 8;
+        pop rax;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcj_rc_fail:
+        mov rdi, 10;                     // ELVJ_ST_REVOKE_CASCADE_FAILS
+        call elevate_client_journal_note;
+        mov rax, 0xFFFFEA45;             // ELVJ_ERR_REVOKE_CASCADE_JOURNAL_FAIL
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcj_rc_bad_actor:
         mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
         call elevate_client_journal_note;
         mov rax, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR

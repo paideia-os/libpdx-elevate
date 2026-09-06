@@ -10,6 +10,85 @@ covers.
 
 ## Unreleased
 
+### LE.M7-001/002 (#35, #36) — revoke cascade over the child chain + broker-triggered propagation
+
+- **#35 LE.M7-001** — `elevate_client_cap_revoke_cascade(row_id) -> u64`
+  (`src/elevate_client_cap.pdx`): force-revokes row_id and every
+  transitive LE.M3-002 parent-map descendant, deepest generation first,
+  then row_id itself last. No reverse child-index exists in this
+  library; the walk builds the descendant set via a bounded (≤16-pass)
+  BFS scan of the flat 16-slot parent map, then orders the revoke by
+  each member's cached `elevate_client_cap_get_depth` (strictly
+  increasing per generation, so no separate leaf-detection pass is
+  needed). A kernel revoke of `ELVC_REVOKE_ALREADY` is treated as
+  idempotent (scrubbed, not counted, not journaled); any OTHER kernel
+  refusal aborts the whole walk immediately with new extension-band
+  code `ELCC_ERR_CASCADE_FAIL = 0xFFFFEA74` — rows revoked before the
+  refusal stay revoked and audited, everything queued behind it
+  (including row_id itself, if not yet reached) is left untouched. A
+  second call on an already-swept chain returns 0. New helper
+  `elevate_client_cap_scrub_row(row_id) -> ()` factors the eight-map
+  shadow scrub already inlined at `_check_and_revoke` and `_derive`'s
+  bind-fail cleanup — this is the third call site, factored rather
+  than copied again. New journal discriminator
+  `ELVJ_EVT_REVOKE_CASCADE = 5` and entry point
+  `elevate_client_journal_revoke_cascade(actor_fp_lo, row_id,
+  cascade_root_row_id) -> u64` (`src/elevate_client_journal.pdx`) —
+  body1 = the row just revoked, body2 = the cascade's root row_id, so
+  an auditor can join "this row was revoked" to "because this
+  cascade". New error `ELVJ_ERR_REVOKE_CASCADE_JOURNAL_FAIL =
+  0xFFFFEA45`; journal stats table widened 10→11 slots
+  (`ELVJ_ST_REVOKE_CASCADE_WRITES = 9`,
+  `ELVJ_ST_REVOKE_CASCADE_FAILS = 10`). Actor for the journal call is
+  read once from the process-global `_elevate_client_target_fp_lo`
+  (revoke_cascade's own signature takes only row_id); the journal call
+  is best-effort and its return is ignored — a failed revoke-audit does
+  not gate the revoke the way a failed grant-audit gates a grant
+  elsewhere in this library. `caps.decl` gained an
+  `elevate_client_cap_revoke_cascade` entry (same
+  `KIND_ELEVATE_CHANNEL(revoke, row_id)` cap as `_check_and_revoke`).
+- **#36 LE.M7-002** —
+  `elevate_client_cap_drain_broker_exp(reply_ep_id) -> u64`
+  (`src/elevate_client_send.pdx`): non-blocking single-sweep drain of
+  reply_ep_id for pending `ELV_OP_EXP` (0x03) frames; each one found is
+  forwarded to `elevate_client_cap_revoke_cascade` by row_id, and the
+  returns are summed into `propagated_count`. Reuses
+  `ELVC_ERR_BAD_REPLY_EP` for the `[1..127]` endpoint-id gate rather
+  than minting a new code; any `ELCC_ERR_*` from a forwarded cascade
+  aborts the sweep and is propagated as-is. **Kernel-side note:**
+  paideia-os does not emit `ELV_OP_EXP` frames today — no reaper exists
+  yet (tracked as paideia-os #2122); this is client-side scaffolding
+  for when it does, the same posture `elevate_client_cap_derive`
+  already takes toward a not-yet-real kernel mint primitive. The only
+  documented EXP body layout (`elevate_channel.pdx`'s wire-shape
+  comment) names its row-identifying field `request_id`, not `row_id`;
+  this implementation reads body word 0 as row_id per #36's literal
+  acceptance criteria and documents the naming gap for whoever lands
+  the real emitter. `caps.decl` gained an
+  `elevate_client_cap_drain_broker_exp` entry (union of
+  `_recv_reply`'s read-reply-endpoint cap and `_revoke_cascade`'s
+  cap above).
+- Both new extension-band / B6 members added to
+  `tests/elevate_client_bands_test.pdx`'s collision-defense witness
+  (B6 now 6 members, B9 now 4).
+- New tests: `tests/elevate_client_revoke_cascade_test.pdx`
+  (`LIBPDX-ELEVATE LE.M7 CASCADE OK` / `... EXP-DRAIN OK`). Per the
+  same no-live-broker constraint LE.M3's / LE.M5's own witnesses
+  document, the kernel-revoke happy path (no row in this library is
+  ever really minted in a boot witness) and the EXP-frame-triggers-
+  cascade path (no established self-produced endpoint round-trip
+  pattern exists in this test suite) are not exercised end-to-end
+  here — deferred to an end-to-end broker witness alongside those.
+- **Note on `ELVJ_EVT_REVOKE_CASCADE`'s value:** #35's own
+  acceptance-criteria text names this constant as "= 6"; the value
+  actually landed is 5 (the correct next-contiguous body0
+  discriminator after `ELVJ_EVT_ATTEST = 4` — no `ELVJ_EVT_*` value was
+  reserved at 5, and the "6" appears to conflate it with the unrelated
+  `ELVJ_UEJ_KIND_ELEVATE = 5` wire-kind constant declared nearby).
+- `#30` (`elevate_client_cap_reap_expired`, LE.M4-002) stays open per
+  the reporter's own deferral comment, even though this landing removes
+  its stated dependency on revoke_cascade.
+
 ### LE.M5-001/002 (#31, #32) — delegation-with-attestation record + attestation-required gate
 
 - **#31 LE.M5-001** — `ELVJ_EVT_ATTEST = 4` (`src/elevate_client_journal.pdx`)
