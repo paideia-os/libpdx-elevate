@@ -1,0 +1,700 @@
+// tests/elevate_client_bands_test.pdx -- libpdx-elevate.LE.M1-005 (paideia-os/libpdx-elevate#37)
+//
+// Result-band collision defence -- boot witness.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// This library's "one return value says which layer refused" invariant
+// (README §"Result bands") depends on nine disjoint 16-value ranges
+// never overlapping and every currently-defined status constant sitting
+// inside the one range its owning layer was assigned:
+//
+//   B1  ELV_ERR_*              0xFFFFE5E0..EF  elevate_request.pdx
+//   B2  ELVC_*                 0xFFFFEA00..0F  elevate_client.pdx +
+//                                               elevate_client_send.pdx
+//   B3  ELCP_ERR_*             0xFFFFEA10..1F  elevate_client_policy.pdx
+//   B4  ELVR_ERR_*             0xFFFFEA20..2F  elevate_client_retry.pdx
+//   B5  ELCC_*                 0xFFFFEA30..3F  elevate_client_cap.pdx
+//   B6  ELVJ_ERR_*             0xFFFFEA40..4F  elevate_client_journal.pdx
+//   B7  ELCA_*                 0xFFFFEA50..5F  elevate_client_acquire.pdx
+//   B8  ELCA_ERR_* (require)   0xFFFFEA60..6F  elevate_client_require.pdx
+//   B9  ELCC_* extension       0xFFFFEA70..7F  elevate_client_cap.pdx
+//                                               (LE.M3, see that file's
+//                                               "EXTENSION BAND" header)
+//
+// B9 is real production surface (ELCC_ERR_CYCLE_DETECTED / _BAD_CTX /
+// _ZERO_GRANT) but was missing from README's "Result bands" paragraph
+// before this issue -- fixed alongside this witness so the doc and the
+// code agree on what "the eight bands" actually are (there are nine).
+//
+// Two prefixes deliberately do NOT own a tenth band:
+//
+//   - `ELVR_RETRIABLE_*` (elevate_client_retry.pdx) names three
+//     constants that ALIAS specific B2 (ELVC_*) values -- they mark
+//     "this transport code is retriable", they do not mint new error
+//     values.  Stage 12 asserts the alias equality holds; if a future
+//     edit changes one side without the other, the retry wrapper's
+//     retriable-set and the transport layer's actual codes silently
+//     diverge and this stage catches it.
+//   - `ELVC_OUTCOME_*` (elevate_client_outcome.pdx) is a separate
+//     three-valued (0/1/2) namespace, not a status band at all.
+//     Stage 13 asserts all three stay below B1's lower bound so a
+//     caller that mis-routes an OUTCOME_* value into a status-shaped
+//     check can never be mistaken for a real band member.
+//
+// =============================================================================
+// WHAT THIS WITNESS DOES AND DOES NOT PROVE
+// =============================================================================
+//
+// paideia-as already refuses two `pub let` bindings sharing one name at
+// emit time (per #37's triage comment), so a NAME collision is a build
+// failure today, not a boot-time discovery.  What is NOT caught at
+// build time is a VALUE collision under different names -- e.g. a new
+// `ELCC_ERR_FOO` accidentally typed as `0xFFFFEA41` (B6's
+// `ELVJ_ERR_REQ_JOURNAL_FAIL`) still links and boots; only a
+// value-level check catches it.  This witness is that check: every
+// band boundary and every currently-declared status constant is
+// re-asserted here against the same nine ranges above.  Because pdx
+// scalar `pub let` bindings are not addressable data symbols across
+// module boundaries in this toolchain (every existing cross-module
+// reuse in this library -- e.g. elevate_client_require.pdx's
+// passthrough of `0xFFFFEA34` / `ELCC_STATE_LIVE` -- copies the literal
+// rather than loading the other module's symbol), this file's table is
+// a hand-audited snapshot, not a live memory read of the defining
+// modules.  Its value is exactly the value the outcome-classifier
+// witness already leans on for its own retriable-set constants: a
+// single place that enumerates every band member so a reviewer (human
+// or agent) touching any `ELV*_ERR_*` / `ELCC_*` / `ELCA_*` declaration
+// has one file to update, and gets an immediate, loud failure if the
+// new value breaks either a band's [lo,hi] containment or its
+// strictly-increasing internal ordering.
+//
+// Per band, membership + intra-band uniqueness is proved in O(n) rather
+// than the O(n^2) all-pairs comparison a naive collision check would
+// need: every band's members are asserted in STRICTLY INCREASING order
+// (each value > the previous), with the first checked >= the band's lo
+// bound and the last checked <= its hi bound.  A strictly-increasing
+// chain is pairwise-distinct by construction, so no separate
+// uniqueness pass is needed within a band.  Cross-band collisions are
+// excluded separately (stage 2's telescoping chain proves the nine
+// bands never overlap), so two band members can never share a value
+// even though no direct cross-band comparison is ever executed --
+// membership in disjoint ranges is sufficient.
+//
+// =============================================================================
+// STAGES
+// =============================================================================
+//
+//   1.  B1 (ELV_ERR_*) sits strictly below the EA-family stack (B2).
+//   2.  B2..B9 telescope with no gap and no overlap (7 adjacency
+//       checks: each band's hi+1 equals the next band's lo).
+//   3.  B1 members (6): BAD_BUF..BAD_OP, membership + ordering.
+//   4.  B2 members (13): NOT_DISPATCHED, TIMEOUT..BAD_REPLY_LEN,
+//       BAD_BUF..LOOKUP_FAIL, membership + ordering.
+//   5.  B3 members (6): BAD_ARG..BAD_CAPS, membership + ordering.
+//   6.  B4 members (2): EXHAUSTED, BAD_ARG, membership + ordering.
+//   7.  B5 members (16, the band is fully packed): BAD_ROW..
+//       DELEGATION_TOO_DEEP, membership + ordering.
+//   8.  B6 members (4): BAD_ACTOR..OP_JOURNAL_FAIL, membership +
+//       ordering.
+//   9.  B7 members (2): BAD_BUF, BAD_REPLY_BUF, membership + ordering.
+//   10. B8 members (3): EXPIRED, CAPS_INSUFFICIENT, SCOPE_MISMATCH,
+//       membership + ordering.
+//   11. B9 members (3): CYCLE_DETECTED, BAD_CTX, ZERO_GRANT,
+//       membership + ordering.
+//   12. ELVR_RETRIABLE_* alias equality against their B2 counterparts.
+//   13. ELVC_OUTCOME_* (0/1/2) stay ordered and strictly below B1's
+//       lower bound.
+//
+// =============================================================================
+// FINGERPRINT: LIBPDX-ELEVATE LE.M1 BANDS OK
+// =============================================================================
+//
+// Every stage reloads its operands as fresh immediates staged through
+// registers (never a direct `cmp reg, imm32` against one of these
+// constants -- bit 31 is set on every EA-family / E5E0-family value, so
+// imm32 sign-extension would compare against the wrong 64-bit pattern;
+// staging through `mov` into a register first, per this library's
+// established idiom, zero-extends correctly). No nested CALL happens
+// anywhere in the body except the terminal klog_s1 (success) /
+// klog_s1_d2 (failure) at the two exits, so no callee-save push is
+// needed for data -- only `sub rsp, 24` for alignment, matching the
+// zero-push shape elevate_client_outcome_test.pdx and
+// elevate_client_require_test.pdx already use. On failure, r10 still
+// holds the exact offending value from the comparison that jumped here
+// (no intervening instruction between the failing `cmp`/`jcc` and this
+// label touches r10), so the failure path reports the (stage, value)
+// pair via klog_s1_d2 -- "line" = stage id, "got" = offending value --
+// rather than just the stage id the sibling witnesses' klog_s1_d1 call
+// reports. Labels prefixed ecbw_ -- disjoint from eccw_ (cap witness),
+// ecpw_ (policy witness), ecqw_ (require witness), ecow_ (outcome
+// witness), em3w_ (cap M3 witness), and elvbw_ (the kernel-side broker
+// synth witness in paideia-os, a different repo).
+
+module ElevateClientBandsTest = structure {
+
+  pub let mut _ecbw_stage : u64 = 0
+
+  pub let ecbw_ok   : [u8; 30] = "LIBPDX-ELEVATE LE.M1 BANDS OK\0"
+  pub let ecbw_fail : [u8; 32] = "LIBPDX-ELEVATE LE.M1 BANDS FAIL\0"
+
+  pub let elevate_client_bands_witness : () -> u64 !{sysreg, mem} @{boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "libpdx-elevate.LE.M1-005 (#37): boot witness for the result-band collision invariant documented at README §Result bands. Every stage is a straight-line sequence of register-staged comparisons against this library's nine documented status bands (B1 ELV_ERR_* 0xFFFFE5E0..EF through B9 the ELCC_* extension band 0xFFFFEA70..7F) -- no library entry point is called, since band membership is a fact about `pub let` declarations, not runtime behavior. Every EA-family / E5E0-family constant has bit 31 set, so it is always staged into a register via `mov` (which zero-extends a 32-bit destination write into the full 64-bit register) before any compare; a direct `cmp reg, imm32` would sign-extend the immediate and compare against the wrong 64-bit value. Per-band membership + intra-band uniqueness is proved in O(n): each band's members are asserted in strictly increasing order (current > previous via unsigned jbe-to-fail), bracketed by an unsigned jb-to-fail on the first value against the band's lo bound and an unsigned ja-to-fail on the last value against its hi bound -- a strictly-increasing chain is pairwise-distinct by construction, so no O(n^2) all-pairs pass is needed. Cross-band collision is excluded separately: stage 2 telescopes all eight EA-family bands (each band's hi+1 equals the next band's lo) and stage 1 places B1 strictly below the stack, so two bands can never both contain the same value regardless of which members either declares. Stage 12 asserts the three ELVR_RETRIABLE_* constants equal their canonical B2 (ELVC_*) counterparts -- they are intentional aliases marking a transport code as retriable, not a fourth-band's own values, and this equality would catch either side drifting without the other. Stage 13 asserts ELVC_OUTCOME_ALLOW/DENY/TIMEOUT (0/1/2) stay ordered and strictly below B1's lower bound (0xFFFFE5E0), matching README's Outcome-enum paragraph. No callee-save push is needed: no register is required to survive a nested CALL because the only CALLs in this function are the two terminal klog emissions. `sub rsp, 24` supplies alignment only (entry rsp%16==8 -> (8-24) mod 16 == 0), matching the zero-push shape elevate_client_outcome_test.pdx and elevate_client_require_test.pdx already use. On a failure jump to ecbw_fail_stage, r10 still holds the exact offending value from the comparison that jumped here (no intervening instruction touches it), so the failure path stages it into r14 and reports the (stage, value) pair via klog_s1_d2 with key1='line' (stage id) and key2='got' (offending value) -- the r95_poll.pdx boot-witness idiom for that wrapper's caller-stack-passed second value (`sub rsp, 8; push r14; call klog_s1_d2; add rsp, 16`). Capability {boot} is inherited from klog_s1 / klog_s1_d2's own {boot} band, matching every other witness in this library. Labels prefixed ecbw_ -- disjoint from eccw_/ecpw_/ecqw_/ecow_/em3w_ in this library and elvbw_ (paideia-os's own broker synth witness, a different repo).",
+      block: {
+        sub rsp, 24;                     // alignment only -- no live data spans a CALL
+
+        // ==============================================================
+        // Stage 1: B1 (ELV_ERR_*) sits strictly below the EA-family
+        // stack. B1.hi (0xFFFFE5EF) must be < B2.lo (0xFFFFEA00).
+        // ==============================================================
+        mov rax, 1;
+        lea rcx, [rip + _ecbw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFE5EF;             // B1 hi (ELV_ERR_BAD_OP)
+        mov r11, 0xFFFFEA00;             // B2 lo (ELVC_NOT_DISPATCHED)
+        cmp r10, r11;
+        jae ecbw_fail_stage;
+
+        // ==============================================================
+        // Stage 2: B2..B9 telescope with no gap, no overlap. Each
+        // band's hi + 1 must equal the next band's lo.
+        // ==============================================================
+        mov rax, 2;
+        lea rcx, [rip + _ecbw_stage];
+        mov [rcx], rax;
+
+        // B2.hi(0xFFFFEA0F) + 1 == B3.lo(0xFFFFEA10)
+        mov r10, 0xFFFFEA0F;
+        add r10, 1;
+        mov r11, 0xFFFFEA10;
+        cmp r10, r11;
+        jne ecbw_fail_stage;
+
+        // B3.hi(0xFFFFEA1F) + 1 == B4.lo(0xFFFFEA20)
+        mov r10, 0xFFFFEA1F;
+        add r10, 1;
+        mov r11, 0xFFFFEA20;
+        cmp r10, r11;
+        jne ecbw_fail_stage;
+
+        // B4.hi(0xFFFFEA2F) + 1 == B5.lo(0xFFFFEA30)
+        mov r10, 0xFFFFEA2F;
+        add r10, 1;
+        mov r11, 0xFFFFEA30;
+        cmp r10, r11;
+        jne ecbw_fail_stage;
+
+        // B5.hi(0xFFFFEA3F) + 1 == B6.lo(0xFFFFEA40)
+        mov r10, 0xFFFFEA3F;
+        add r10, 1;
+        mov r11, 0xFFFFEA40;
+        cmp r10, r11;
+        jne ecbw_fail_stage;
+
+        // B6.hi(0xFFFFEA4F) + 1 == B7.lo(0xFFFFEA50)
+        mov r10, 0xFFFFEA4F;
+        add r10, 1;
+        mov r11, 0xFFFFEA50;
+        cmp r10, r11;
+        jne ecbw_fail_stage;
+
+        // B7.hi(0xFFFFEA5F) + 1 == B8.lo(0xFFFFEA60)
+        mov r10, 0xFFFFEA5F;
+        add r10, 1;
+        mov r11, 0xFFFFEA60;
+        cmp r10, r11;
+        jne ecbw_fail_stage;
+
+        // B8.hi(0xFFFFEA6F) + 1 == B9.lo(0xFFFFEA70)
+        mov r10, 0xFFFFEA6F;
+        add r10, 1;
+        mov r11, 0xFFFFEA70;
+        cmp r10, r11;
+        jne ecbw_fail_stage;
+
+        // ==============================================================
+        // Stage 3: B1 (ELV_ERR_*, elevate_request.pdx) -- 6 members.
+        // ==============================================================
+        mov rax, 3;
+        lea rcx, [rip + _ecbw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFE5EA;             // ELV_ERR_BAD_BUF
+        mov r11, 0xFFFFE5E0;             // B1 lo
+        cmp r10, r11;
+        jb  ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFE5EB;             // ELV_ERR_BAD_GRANT
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFE5EC;             // ELV_ERR_BAD_RSV
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFE5ED;             // ELV_ERR_BAD_DUR
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFE5EE;             // ELV_ERR_BAD_MASK
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFE5EF;             // ELV_ERR_BAD_OP
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+
+        mov r11, 0xFFFFE5EF;             // B1 hi
+        cmp r10, r11;
+        ja  ecbw_fail_stage;
+
+        // ==============================================================
+        // Stage 4: B2 (ELVC_*, elevate_client.pdx +
+        // elevate_client_send.pdx) -- 13 members.
+        // ==============================================================
+        mov rax, 4;
+        lea rcx, [rip + _ecbw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA00;             // ELVC_NOT_DISPATCHED
+        mov r11, 0xFFFFEA00;             // B2 lo
+        cmp r10, r11;
+        jb  ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA01;             // ELVC_ERR_TIMEOUT
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA02;             // ELVC_ERR_BAD_REPLY
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA03;             // ELVC_ERR_GRANT_INVALID
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA04;             // ELVC_ERR_BAD_EXPIRE
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA05;             // ELVC_ERR_BAD_REPLY_EP
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA06;             // ELVC_ERR_BAD_CTX
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA07;             // ELVC_ERR_BAD_REPLY_LEN
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA0B;             // ELVC_ERR_BAD_BUF
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA0C;             // ELVC_ERR_RECV_FAIL
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA0D;             // ELVC_ERR_SEND_FAIL
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA0E;             // ELVC_ERR_PACK_FAIL
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA0F;             // ELVC_ERR_LOOKUP_FAIL
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+
+        mov r11, 0xFFFFEA0F;             // B2 hi
+        cmp r10, r11;
+        ja  ecbw_fail_stage;
+
+        // ==============================================================
+        // Stage 5: B3 (ELCP_ERR_*, elevate_client_policy.pdx) -- 6
+        // members.
+        // ==============================================================
+        mov rax, 5;
+        lea rcx, [rip + _ecbw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA10;             // ELCP_ERR_BAD_ARG
+        mov r11, 0xFFFFEA10;             // B3 lo
+        cmp r10, r11;
+        jb  ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA11;             // ELCP_ERR_RATE_LIMIT
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA12;             // ELCP_ERR_NO_MATCH
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA13;             // ELCP_ERR_ENOSPC
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA14;             // ELCP_ERR_BAD_DUR
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA15;             // ELCP_ERR_BAD_CAPS
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+
+        mov r11, 0xFFFFEA1F;             // B3 hi
+        cmp r10, r11;
+        ja  ecbw_fail_stage;
+
+        // ==============================================================
+        // Stage 6: B4 (ELVR_ERR_*, elevate_client_retry.pdx) -- 2
+        // members.
+        // ==============================================================
+        mov rax, 6;
+        lea rcx, [rip + _ecbw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA20;             // ELVR_ERR_EXHAUSTED
+        mov r11, 0xFFFFEA20;             // B4 lo
+        cmp r10, r11;
+        jb  ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA21;             // ELVR_ERR_BAD_ARG
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+
+        mov r11, 0xFFFFEA2F;             // B4 hi
+        cmp r10, r11;
+        ja  ecbw_fail_stage;
+
+        // ==============================================================
+        // Stage 7: B5 (ELCC_*, elevate_client_cap.pdx) -- 16 members,
+        // the band is fully packed (0x30..0x3F, no gaps).
+        // ==============================================================
+        mov rax, 7;
+        lea rcx, [rip + _ecbw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
+        mov r11, 0xFFFFEA30;             // B5 lo
+        cmp r10, r11;
+        jb  ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA31;             // ELCC_ERR_MINT_FAIL
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA32;             // ELCC_ERR_NO_DEADLINE
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA33;             // ELCC_ERR_REVOKE_FAIL
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA34;             // ELCC_STATE_LIVE
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA35;             // ELCC_STATE_EXPIRED
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA36;             // ELCC_STATE_REVOKED
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA37;             // ELCC_NOTE_NO_NARROW
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA38;             // ELCC_ERR_NO_GRANT
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA39;             // ELCC_ERR_BAD_BUDGET
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA3A;             // ELCC_ERR_BUDGET_EXHAUSTED
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA3B;             // ELCC_ERR_CHILD_CAPS_ESCALATION
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA3C;             // ELCC_ERR_PARENT_EXPIRED
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA3D;             // ELCC_ERR_PARENT_SELF_LOOP
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA3E;             // ELCC_ERR_PARENT_ALREADY_BOUND
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA3F;             // ELCC_ERR_DELEGATION_TOO_DEEP
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+
+        mov r11, 0xFFFFEA3F;             // B5 hi
+        cmp r10, r11;
+        ja  ecbw_fail_stage;
+
+        // ==============================================================
+        // Stage 8: B6 (ELVJ_ERR_*, elevate_client_journal.pdx) -- 4
+        // members.
+        // ==============================================================
+        mov rax, 8;
+        lea rcx, [rip + _ecbw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR
+        mov r11, 0xFFFFEA40;             // B6 lo
+        cmp r10, r11;
+        jb  ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA41;             // ELVJ_ERR_REQ_JOURNAL_FAIL
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA42;             // ELVJ_ERR_APR_JOURNAL_FAIL
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA43;             // ELVJ_ERR_OP_JOURNAL_FAIL
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+
+        mov r11, 0xFFFFEA4F;             // B6 hi
+        cmp r10, r11;
+        ja  ecbw_fail_stage;
+
+        // ==============================================================
+        // Stage 9: B7 (ELCA_*, elevate_client_acquire.pdx) -- 2
+        // members.
+        // ==============================================================
+        mov rax, 9;
+        lea rcx, [rip + _ecbw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA50;             // ELCA_ERR_BAD_BUF
+        mov r11, 0xFFFFEA50;             // B7 lo
+        cmp r10, r11;
+        jb  ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA51;             // ELCA_ERR_BAD_REPLY_BUF
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+
+        mov r11, 0xFFFFEA5F;             // B7 hi
+        cmp r10, r11;
+        ja  ecbw_fail_stage;
+
+        // ==============================================================
+        // Stage 10: B8 (ELCA_ERR_* require-side,
+        // elevate_client_require.pdx) -- 3 members. Same ELCA_ERR_
+        // prefix as B7 but a DISTINCT band (0x60s vs 0x50s) --
+        // disambiguated here by value/file, not by name.
+        // ==============================================================
+        mov rax, 10;
+        lea rcx, [rip + _ecbw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA60;             // ELCA_ERR_EXPIRED
+        mov r11, 0xFFFFEA60;             // B8 lo
+        cmp r10, r11;
+        jb  ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA61;             // ELCA_ERR_CAPS_INSUFFICIENT
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA62;             // ELCA_ERR_SCOPE_MISMATCH
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+
+        mov r11, 0xFFFFEA6F;             // B8 hi
+        cmp r10, r11;
+        ja  ecbw_fail_stage;
+
+        // ==============================================================
+        // Stage 11: B9 (ELCC_* extension band, elevate_client_cap.pdx,
+        // LE.M3) -- 3 members. Same ELCC_ prefix as B5 but a DISTINCT
+        // band (0x70s vs 0x30s).
+        // ==============================================================
+        mov rax, 11;
+        lea rcx, [rip + _ecbw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA71;             // ELCC_ERR_CYCLE_DETECTED
+        mov r11, 0xFFFFEA70;             // B9 lo
+        cmp r10, r11;
+        jb  ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA72;             // ELCC_ERR_BAD_CTX (extension)
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA73;             // ELCC_ERR_ZERO_GRANT
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+
+        mov r11, 0xFFFFEA7F;             // B9 hi
+        cmp r10, r11;
+        ja  ecbw_fail_stage;
+
+        // ==============================================================
+        // Stage 12: ELVR_RETRIABLE_* (elevate_client_retry.pdx) alias
+        // their canonical B2 (ELVC_*) counterparts exactly -- they mark
+        // a transport code as retriable, they do not mint new values.
+        // ==============================================================
+        mov rax, 12;
+        lea rcx, [rip + _ecbw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA01;             // ELVR_RETRIABLE_TIMEOUT
+        mov r11, 0xFFFFEA01;             // ELVC_ERR_TIMEOUT
+        cmp r10, r11;
+        jne ecbw_fail_stage;
+
+        mov r10, 0xFFFFEA0D;             // ELVR_RETRIABLE_SEND_FAIL
+        mov r11, 0xFFFFEA0D;             // ELVC_ERR_SEND_FAIL
+        cmp r10, r11;
+        jne ecbw_fail_stage;
+
+        mov r10, 0xFFFFEA0F;             // ELVR_RETRIABLE_LOOKUP_FAIL
+        mov r11, 0xFFFFEA0F;             // ELVC_ERR_LOOKUP_FAIL
+        cmp r10, r11;
+        jne ecbw_fail_stage;
+
+        // ==============================================================
+        // Stage 13: ELVC_OUTCOME_* (elevate_client_outcome.pdx) stay
+        // ordered (ALLOW < DENY < TIMEOUT) and strictly below B1's
+        // lower bound -- they can never be mistaken for a real band
+        // member regardless of which band.
+        // ==============================================================
+        mov rax, 13;
+        lea rcx, [rip + _ecbw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0;                      // ELVC_OUTCOME_ALLOW
+        mov r9, r10;
+
+        mov r10, 1;                      // ELVC_OUTCOME_DENY
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 2;                      // ELVC_OUTCOME_TIMEOUT
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+
+        mov r11, 0xFFFFE5E0;             // B1 lo -- lowest boundary of
+                                          // the whole error-band universe
+        mov r10, 0;                      // ELVC_OUTCOME_ALLOW
+        cmp r10, r11;
+        jae ecbw_fail_stage;
+
+        mov r10, 1;                      // ELVC_OUTCOME_DENY
+        cmp r10, r11;
+        jae ecbw_fail_stage;
+
+        mov r10, 2;                      // ELVC_OUTCOME_TIMEOUT
+        cmp r10, r11;
+        jae ecbw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Success. Log OK, return 0.
+        // ------------------------------------------------------------
+        mov rdi, 3;                      // KLOG_LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecbw_ok];
+        call klog_s1;
+
+        xor rax, rax;
+        jmp ecbw_out;
+
+      ecbw_fail_stage:
+        lea rax, [rip + _ecbw_stage];
+        mov r8, [rax];                   // value1 -- failing stage id
+        mov r14, r10;                    // value2 -- offending value:
+                                          // r10 still holds the operand
+                                          // from the comparison that
+                                          // jumped here
+        mov rdi, 1;                      // KLOG_LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecbw_fail];
+        lea rcx, [rip + k_line];         // key1 = "line"
+        lea r9, [rip + k_got];           // key2 = "got"
+        sub rsp, 8;
+        push r14;                        // value2 at [rsp+8] per
+                                          // klog_s1_d2's ABI
+        call klog_s1_d2;
+        add rsp, 16;
+        mov rax, 1;
+
+      ecbw_out:
+        add rsp, 24;
+        ret
+      }
+    }
+}

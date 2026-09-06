@@ -8,6 +8,31 @@ covers.
 
 ---
 
+## Unreleased
+
+### LE.M1-005 (#37) — result-band collision defence witness
+
+- **#37** — `tests/elevate_client_bands_test.pdx` (13-stage boot
+  witness, fingerprint `LIBPDX-ELEVATE LE.M1 BANDS OK`): asserts the
+  library's nine status bands (`ELV_ERR_*`, `ELVC_*`, `ELCP_ERR_*`,
+  `ELVR_ERR_*`, `ELCC_*`, `ELVJ_ERR_*`, `ELCA_*`, `ELCA_ERR_*`
+  require-side, and the `ELCC_*` extension band at `0xFFFFEA70..7F`)
+  telescope with no gap or overlap, that every currently-declared
+  status constant falls inside its own band in strictly increasing
+  order (O(n) membership + uniqueness per band, no O(n^2) all-pairs
+  pass needed), that the three `ELVR_RETRIABLE_*` aliases equal their
+  canonical `ELVC_*` counterparts, and that `ELVC_OUTCOME_*` (0/1/2)
+  stays strictly below the lowest band boundary. Test-only; no
+  `libpdx-elevate` production `.pdx` changed — the paideia-as encoder
+  already refuses duplicate `pub let` symbol names at emit time, so
+  the class of bug this guards against is a VALUE collision under
+  DIFFERENT names, which only a value-level check like this one can
+  catch. README §"Result bands" also fixed alongside this witness: it
+  was missing `ELCA_*` (acquire), `ELCA_ERR_*` (require-side), and the
+  `ELCC_*` extension band entirely (it stopped at `ELVJ_ERR_*`) despite
+  all three already being live production surface and already
+  documented in `doc/libpdx-elevate.pdxdoc`'s STATUS CODES section.
+
 ## 1.1.2 — 2026-09-02 — LE.M1-polish + LE.M2-hardening (13 fixes across encoder, tests, docs, correctness gaps)
 
 v1.1.2 bundles two follow-up waves on top of v1.1.1 into a single

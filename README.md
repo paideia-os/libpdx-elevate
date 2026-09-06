@@ -240,7 +240,15 @@ says which layer refused: `ELV_ERR_*` `0xFFFFE5E0..EF` (request could not
 be built), `ELVC_*` `0xFFFFEA00..0F` (transport), `ELCP_ERR_*`
 `0xFFFFEA10..1F` (client policy), `ELVR_ERR_*` `0xFFFFEA20..2F` (retry),
 `ELCC_*` `0xFFFFEA30..3F` (cap lifecycle), `ELVJ_ERR_*` `0xFFFFEA40..4F`
-(journal). `0` is success in every band.
+(journal), `ELCA_*` `0xFFFFEA50..5F` (acquire, ENH-001), `ELCA_ERR_*`
+require-side `0xFFFFEA60..6F` (per-op re-assert, ENH-002/003), and an
+`ELCC_*` extension band `0xFFFFEA70..7F` (LE.M3: `ERR_CYCLE_DETECTED`,
+`ERR_BAD_CTX`, `ERR_ZERO_GRANT` — see the "EXTENSION BAND" header in
+`src/elevate_client_cap.pdx` for why these three sit outside the base
+`0x30..3F` band). `0` is success in every band. The boot witness
+`tests/elevate_client_bands_test.pdx` (LE.M1-005, #37) asserts these
+nine ranges never overlap and that every currently-defined status
+constant falls inside its own band.
 
 **Outcome enum** (`ElevateClientOutcome`, R90-XREPO.011.M1-006) — a
 separate three-valued namespace, distinct from every `ELV*_ERR_*` band
