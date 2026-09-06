@@ -40,6 +40,13 @@
   # M3-001 wires directly to the kernel primitive; when libpdx-audit.M2
   # lands the caller may substitute a libpdx-audit cap for this line.
 
++entry elevate_client_cap_attest
+  KIND_IPC_ENDPOINT(write, uej)
+  # LE.M5-001 (#31): uej_append (UEJ_KIND_ELEVATE=5, body0=ELVJ_EVT_ATTEST=4)
+  # records a delegation-with-attestation event. Same audit-fanout cap as
+  # journal_req/_apr/_op above -- no additional cap for the row-stamp half
+  # (elevate_client_cap_bind_last_audit is a pure shadow-map write).
+
 +entry elevate_client_cap_mint
 +entry elevate_client_cap_check_and_revoke
   KIND_ELEVATE_CHANNEL(mint,   row_id)   # M2-003

@@ -10,6 +10,48 @@ covers.
 
 ## Unreleased
 
+### LE.M5-001/002 (#31, #32) — delegation-with-attestation record + attestation-required gate
+
+- **#31 LE.M5-001** — `ELVJ_EVT_ATTEST = 4` (`src/elevate_client_journal.pdx`)
+  and its entry point `elevate_client_cap_attest(row_id, actor_fp_lo,
+  reason_fp_lo) -> seq | ELVJ_ERR_*`. Appends one `uej_append` record
+  (`body0 = 4`, `body1 = actor_fp_lo`, `body2 = reason_fp_lo`) and, on
+  success, stamps two new shadow maps in `src/elevate_client_cap.pdx`
+  — `last_audit_seq` / `last_audit_kind` — via the new
+  `elevate_client_cap_bind_last_audit` (paired with read accessors
+  `_get_last_audit_seq` / `_get_last_audit_kind`).
+  `actor_fp_lo == 0` refuses `ELVJ_ERR_BAD_ACTOR` before any append.
+  New error `ELVJ_ERR_ATTEST_JOURNAL_FAIL = 0xFFFFEA44`; journal stats
+  table widened 8→10 slots (`ELVJ_ST_ATTEST_WRITES = 7`,
+  `ELVJ_ST_ATTEST_FAILS = 8`). `caps.decl` gained an
+  `elevate_client_cap_attest` entry (same `uej` write cap as
+  `journal_req`/`_apr`/`_op`).
+- **#32 LE.M5-002** — `elevate_client_cap_bind_attestation_required(row_id)`
+  / `_get_attestation_required(row_id)` (`src/elevate_client_cap.pdx`):
+  a per-row flag, no clear path by design. `elevate_client_cap_derive`
+  gains a gate, checked after the existing depth check and before any
+  kernel mint: a flagged parent whose shadow `last_audit_kind !=
+  ELVJ_EVT_ATTEST` refuses `ELCA_ERR_UNATTESTED = 0xFFFFEA63` (declared
+  in `elevate_client_require.pdx`'s `ELCA_ERR_*` 0xFFFFEA60..6F band —
+  see that constant's comment for why it is declared there but raised
+  from `elevate_client_cap.pdx`). A set flag is copied onto a
+  successfully-derived child so a require-attest delegation chain
+  stays require-attest at every depth. `elevate_client_cap_reset`,
+  `_check_and_revoke`, and derive's own bind-failure cleanup path all
+  scrub the three new shadow maps (`last_audit_seq`, `last_audit_kind`,
+  `attestation_required`) alongside the pre-existing five.
+- New boot witness `tests/elevate_client_attest_test.pdx`:
+  `elevate_client_attest_witness` (fingerprint `LIBPDX-ELEVATE LE.M5
+  ATTEST OK`) covers #31's attest/stamp/bad-actor paths;
+  `elevate_client_attest_required_witness` (fingerprint `LIBPDX-ELEVATE
+  LE.M5 REQ-ATTEST OK`) covers #32's refuse / gate-passes / unaffected
+  paths. Both new status-band constants also added to
+  `tests/elevate_client_bands_test.pdx` (B6 now 5 members, B8 now 4).
+  Derive's post-gate mint success and the child-inherits-the-flag
+  half of #32 are NOT exercised here — no live broker in a boot
+  witness, same documented deferral `tests/elevate_client_cap_m3_test.
+  pdx` already carries for LE.M3's derive gates.
+
 ### LE.M1-005 (#37) — result-band collision defence witness
 
 - **#37** — `tests/elevate_client_bands_test.pdx` (13-stage boot
@@ -300,17 +342,20 @@ to a future wave.  Full per-ticket state:
 | M3-002   | 27 | **LANDED** | Parent-row shadow map (`_elevate_client_cap_parent_map`, 16 slots) + `elevate_client_cap_bind_parent`, `_get_parent`, `_get_depth`. `bind_parent` refuses `ELCC_ERR_PARENT_SELF_LOOP 0xFFFFEA3D` (r,r) and `ELCC_ERR_PARENT_ALREADY_BOUND 0xFFFFEA3E` (rebind attempt). `_get_depth` is a bounded walk returning `ELCC_ERR_CYCLE_DETECTED 0xFFFFEA71` (extension band) if the map is corrupted past MAX_DELEGATION_DEPTH hops. |
 | M3-003   | 28 | **LANDED** | `ELCC_MAX_DELEGATION_DEPTH = 4` (root + up to 3 derived hops). Enforced in `elevate_client_cap_derive` before mint via `_get_depth(parent) < MAX - 1`. Widening later is backward-compatible; narrowing is not. |
 
-Deferred M4-M7 tickets (#29-#36) are commented on their respective
-GitHub issues with a pointer to this v1.1.0 release; they will be
-picked up in the follow-up Phase 2 wave when other consumers surface
-a need.  See:
+Deferred M4, M6, M7 tickets (#29-#30, #33-#36) are commented on their
+respective GitHub issues with a pointer to this v1.1.0 release; they
+will be picked up in the follow-up Phase 2 wave when other consumers
+surface a need. #31 and #32 (M5) have since landed — see the
+"LE.M5-001/002" section under Unreleased above. See:
 
 - #29 LE.M4-001 per-cap-mask duration ceilings on validator
 - #30 LE.M4-002 `elevate_client_cap_reap_expired` — idle-time sweep
-- #31 LE.M5-001 delegation-with-attestation record (`ELVJ_EVT_ATTEST`)
-- #32 LE.M5-002 attestation-required rows (`bind_attestation_required` flag)
 - #33 LE.M6-001 signed audit sink to `/system/audit/elevate.log`
-- #34 LE.M6-002 per-handle `last_audit_seq` + `last_audit_kind` attribution surface
+- #34 LE.M6-002 per-handle `last_audit_seq` + `last_audit_kind`
+  attribution surface — LE.M5-001 already introduced the two shadow
+  fields this ticket names (`elevate_client_cap.pdx`'s
+  `_elevate_client_cap_audit_seq_map` / `_audit_kind_map`); #34's
+  remaining scope is a broader attribution/query surface over them.
 - #35 LE.M7-001 `elevate_client_cap_revoke_cascade` over child chain
 - #36 LE.M7-002 broker-triggered revoke propagation via `drain_broker_exp`
 

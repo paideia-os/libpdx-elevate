@@ -97,11 +97,11 @@
 //   6.  B4 members (2): EXHAUSTED, BAD_ARG, membership + ordering.
 //   7.  B5 members (16, the band is fully packed): BAD_ROW..
 //       DELEGATION_TOO_DEEP, membership + ordering.
-//   8.  B6 members (4): BAD_ACTOR..OP_JOURNAL_FAIL, membership +
-//       ordering.
+//   8.  B6 members (5): BAD_ACTOR..OP_JOURNAL_FAIL, ATTEST_JOURNAL_FAIL
+//       (LE.M5-001, #31), membership + ordering.
 //   9.  B7 members (2): BAD_BUF, BAD_REPLY_BUF, membership + ordering.
-//   10. B8 members (3): EXPIRED, CAPS_INSUFFICIENT, SCOPE_MISMATCH,
-//       membership + ordering.
+//   10. B8 members (4): EXPIRED, CAPS_INSUFFICIENT, SCOPE_MISMATCH,
+//       UNATTESTED (LE.M5-002, #32), membership + ordering.
 //   11. B9 members (3): CYCLE_DETECTED, BAD_CTX, ZERO_GRANT,
 //       membership + ordering.
 //   12. ELVR_RETRIABLE_* alias equality against their B2 counterparts.
@@ -492,8 +492,8 @@ module ElevateClientBandsTest = structure {
         ja  ecbw_fail_stage;
 
         // ==============================================================
-        // Stage 8: B6 (ELVJ_ERR_*, elevate_client_journal.pdx) -- 4
-        // members.
+        // Stage 8: B6 (ELVJ_ERR_*, elevate_client_journal.pdx) -- 5
+        // members (LE.M5-001, #31, added ATTEST_JOURNAL_FAIL).
         // ==============================================================
         mov rax, 8;
         lea rcx, [rip + _ecbw_stage];
@@ -516,6 +516,11 @@ module ElevateClientBandsTest = structure {
         mov r9, r10;
 
         mov r10, 0xFFFFEA43;             // ELVJ_ERR_OP_JOURNAL_FAIL
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA44;             // ELVJ_ERR_ATTEST_JOURNAL_FAIL
         cmp r10, r9;
         jbe ecbw_fail_stage;
 
@@ -547,9 +552,12 @@ module ElevateClientBandsTest = structure {
 
         // ==============================================================
         // Stage 10: B8 (ELCA_ERR_* require-side,
-        // elevate_client_require.pdx) -- 3 members. Same ELCA_ERR_
-        // prefix as B7 but a DISTINCT band (0x60s vs 0x50s) --
-        // disambiguated here by value/file, not by name.
+        // elevate_client_require.pdx) -- 4 members (LE.M5-002, #32,
+        // added UNATTESTED -- declared in this file's band but
+        // actually RAISED by elevate_client_cap_derive; see that
+        // constant's own comment in elevate_client_require.pdx).
+        // Same ELCA_ERR_ prefix as B7 but a DISTINCT band (0x60s vs
+        // 0x50s) -- disambiguated here by value/file, not by name.
         // ==============================================================
         mov rax, 10;
         lea rcx, [rip + _ecbw_stage];
@@ -567,6 +575,11 @@ module ElevateClientBandsTest = structure {
         mov r9, r10;
 
         mov r10, 0xFFFFEA62;             // ELCA_ERR_SCOPE_MISMATCH
+        cmp r10, r9;
+        jbe ecbw_fail_stage;
+        mov r9, r10;
+
+        mov r10, 0xFFFFEA63;             // ELCA_ERR_UNATTESTED
         cmp r10, r9;
         jbe ecbw_fail_stage;
 

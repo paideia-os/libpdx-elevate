@@ -50,9 +50,23 @@ the caller-owned `mint_ctx_ptr` through — see the derive header in
 Source-breaking to a 3-arg caller of `_derive`; there are no working
 3-arg callers because the 3-arg form was non-functional.
 
-LE.M4-M7 (issues #29-#36) — reap, attestation, audit sink,
+LE.M4, M6, M7 (issues #29-#30, #33-#36) — reap, audit sink,
 revoke-cascade — all DEFERRED to the follow-up wave; comment posted
-on each issue.
+on each issue. LE.M5 (#31, #32, attestation) has since landed — see
+below.
+
+## LE.M5 — attestation (M5-001/002 landed; M5-003+ not filed)
+
+`ELVJ_EVT_ATTEST = 4` (`src/elevate_client_journal.pdx`) plus its
+entry point `elevate_client_cap_attest`, and `elevate_client_cap.pdx`'s
+`bind_attestation_required` / `get_attestation_required` gate on
+`elevate_client_cap_derive`. See the CHANGELOG's "LE.M5-001/002"
+Unreleased entry for the full shape, error codes, and shadow-map
+deltas. Not exercised here (deferred to an end-to-end broker witness,
+same as LE.M3's own post-mint state): `elevate_client_cap_derive`'s
+mint SUCCESS path when an attestation-required parent is correctly
+attested, and the child-inherits-the-flag assertion, since neither is
+reachable deterministically without a live broker in a boot witness.
 
 ## M6 — enhancement wave (complete)
 

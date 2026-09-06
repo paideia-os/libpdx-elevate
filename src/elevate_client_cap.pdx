@@ -259,6 +259,47 @@ module ElevateClientCap = structure {
   // minted directly (bypassing _derive) always has slot == 0.
   pub let mut _elevate_client_cap_parent_map : [u64; 16] = uninit @align(64)
 
+  // ---- LE.M5-001 (#31) shadow last-audit maps ----
+  //
+  // Slot i records, for row i, the seq / event-kind of the MOST
+  // RECENT audit record elevate_client_cap_attest (elevate_client_
+  // journal.pdx) appended against it.  0 in the kind map means "never
+  // attested" -- unambiguous because journal event kinds start at 1
+  // (ELVJ_EVT_REQ) and ATTEST is 4; no real kind is ever 0.  The seq
+  // map's 0 is not load-bearing the same way (a genuine seq of 0 is
+  // possible) -- only the kind map is read by elevate_client_cap_
+  // derive's LE.M5-002 gate below; the seq map exists purely so an
+  // auditor (or a future LE.M6 sink) can join "which row" to "which
+  // journal row" without a second lookup.
+  //
+  // Populated only through elevate_client_cap_bind_last_audit, which
+  // elevate_client_cap_attest calls after a successful uej_append.  A
+  // row that is never attested keeps 0 in both slots.
+  pub let mut _elevate_client_cap_audit_seq_map  : [u64; 16] = uninit @align(64)
+  pub let mut _elevate_client_cap_audit_kind_map : [u64; 16] = uninit @align(64)
+
+  // ---- LE.M5-002 (#32) shadow attestation-required flag ----
+  //
+  // Slot i is non-zero iff row i requires a fresh ELVJ_EVT_ATTEST
+  // record (last_audit_kind == 4) before elevate_client_cap_derive
+  // will mint a child from it.  0 (the default) means "no attestation
+  // required" -- every row minted before this wave, and every row a
+  // caller never calls elevate_client_cap_bind_attestation_required
+  // on, behaves exactly as it did pre-M5.  There is no "clear" path
+  // (bind_attestation_required takes only row_id, per #32's signature)
+  // because a require-attest cap that could silently downgrade itself
+  // back to optional would defeat the point of the flag; a row's only
+  // way back to "not required" is elevate_client_cap_reset /
+  // elevate_client_cap_check_and_revoke scrubbing it away with the
+  // rest of the row's shadow state.
+  //
+  // Inherited by derived children: elevate_client_cap_derive copies a
+  // set parent flag onto the freshly-minted child (see that function's
+  // header) so a delegation chain rooted at a require-attest cap stays
+  // require-attest at every depth -- a child cannot launder away its
+  // parent's attestation obligation by being derived.
+  pub let mut _elevate_client_cap_attest_required_map : [u64; 16] = uninit @align(64)
+
   // ---- Client-side counters ----
   //
   //   0 mints        successful cap mints (rax < ELCC_MAX_ROWS)
@@ -289,7 +330,7 @@ module ElevateClientCap = structure {
   pub let elevate_client_cap_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M2-003 (#5), extended at ENH-001 (#11), ENH-003 (#15), and LE.M3-002 (#27): scrub every 16-slot shadow map (deadline, grant, scope, budget, parent) and the stats. Boot / teardown only. Six independent loops so the arrays' lengths do not have to be composed in code; adding a new map is a paste-and-rename of one loop. Leaf. Labels prefixed elcc_rs_.",
+      justification: "libpdx-elevate.M2-003 (#5), extended at ENH-001 (#11), ENH-003 (#15), LE.M3-002 (#27), and LE.M5-001/002 (#31, #32): scrub every 16-slot shadow map (deadline, grant, scope, budget, parent, last-audit seq/kind, attestation-required) and the stats. Boot / teardown only. Independent loops so the arrays' lengths do not have to be composed in code; adding a new map is a paste-and-rename of one loop. Leaf. Labels prefixed elcc_rs_.",
       block: {
         lea r10, [rip + _elevate_client_cap_expire_map];
         xor rax, rax;
@@ -331,6 +372,30 @@ module ElevateClientCap = structure {
         add rcx, 1;
         cmp rcx, 16;
         jb  elcc_rs_parent;
+
+        lea r10, [rip + _elevate_client_cap_audit_seq_map];
+        xor rcx, rcx;
+      elcc_rs_audit_seq:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  elcc_rs_audit_seq;
+
+        lea r10, [rip + _elevate_client_cap_audit_kind_map];
+        xor rcx, rcx;
+      elcc_rs_audit_kind:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  elcc_rs_audit_kind;
+
+        lea r10, [rip + _elevate_client_cap_attest_required_map];
+        xor rcx, rcx;
+      elcc_rs_attest_req:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  elcc_rs_attest_req;
 
         lea r10, [rip + _elevate_client_cap_stats];
         xor rcx, rcx;
@@ -1062,6 +1127,12 @@ module ElevateClientCap = structure {
         mov [r10 + r12 * 8], r11;
         lea r10, [rip + _elevate_client_cap_parent_map];
         mov [r10 + r12 * 8], r11;
+        lea r10, [rip + _elevate_client_cap_audit_seq_map];
+        mov [r10 + r12 * 8], r11;
+        lea r10, [rip + _elevate_client_cap_audit_kind_map];
+        mov [r10 + r12 * 8], r11;
+        lea r10, [rip + _elevate_client_cap_attest_required_map];
+        mov [r10 + r12 * 8], r11;
 
         mov rdi, 1;                      // ELCC_ST_AUTO_REVOKES
         call elevate_client_cap_note;
@@ -1199,6 +1270,152 @@ module ElevateClientCap = structure {
     }
 
   // ==========================================================================
+  // elevate_client_cap_bind_last_audit(row_id, seq, kind)
+  //   -> ELCC_OK | ELCC_ERR_BAD_ROW
+  // elevate_client_cap_get_last_audit_seq(row_id)  -> seq | 0
+  // elevate_client_cap_get_last_audit_kind(row_id) -> kind | 0
+  //
+  // LE.M5-001 (#31).  Shadow the most recent audit event stamped
+  // against row_id.  bind_last_audit is called by elevate_client_
+  // cap_attest (elevate_client_journal.pdx) immediately after a
+  // successful uej_append; no other call site writes these maps.
+  //
+  // get_last_audit_kind is the read elevate_client_cap_derive consults
+  // for the LE.M5-002 (#32) attestation-required gate below: 0 means
+  // "never attested" (no real ELVJ_EVT_* kind is ever 0), so a plain
+  // equality-to-ELVJ_EVT_ATTEST (4) check on the read value handles
+  // both "never attested" and "attested for a different reason than
+  // expected" -- there is only one attest event kind today, but the
+  // gate is written as an explicit equality rather than a bare
+  // non-zero check so a hypothetical future ELVJ_EVT_* addition cannot
+  // silently satisfy it.
+  //
+  // Register plan: all three functions take their row_id in rdi and
+  // touch no register that needs to survive a nested CALL (there is
+  // none), so none of the three pushes anything -- same leaf shape as
+  // elevate_client_cap_get_parent / _get_scope.
+  // ==========================================================================
+
+  pub let elevate_client_cap_bind_last_audit : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (seq: u64) (kind: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.LE.M5-001 (#31): shadow-stamp the last-audit seq + kind for row_id in one call so elevate_client_cap_attest's caller-visible atomicity (one function call, one row stamped) matches the journal record it follows. No nested call; rdi (row_id) is read twice (bounds check, then as the index for both stores) and is never clobbered by an intervening instruction, so no push is needed. Labels prefixed elcc_bla_.",
+      block: {
+        cmp rdi, 16;
+        jae elcc_bla_bad_row;
+
+        lea r10, [rip + _elevate_client_cap_audit_seq_map];
+        mov [r10 + rdi * 8], rsi;
+
+        lea r10, [rip + _elevate_client_cap_audit_kind_map];
+        mov [r10 + rdi * 8], rdx;
+
+        xor rax, rax;                    // ELCC_OK
+        ret;
+
+      elcc_bla_bad_row:
+        mov rax, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
+        ret
+      }
+    }
+
+  pub let elevate_client_cap_get_last_audit_seq : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.LE.M5-001 (#31): bounded read of the shadow last-audit-seq map; out-of-range returns 0 (same convention as elevate_client_cap_get_expire / _get_grant). Leaf. Labels prefixed elcc_gls_.",
+      block: {
+        cmp rdi, 16;
+        jae elcc_gls_zero;
+        lea r10, [rip + _elevate_client_cap_audit_seq_map];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      elcc_gls_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let elevate_client_cap_get_last_audit_kind : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.LE.M5-001 (#31): bounded read of the shadow last-audit-kind map; out-of-range returns 0, which is also the 'never attested' sentinel since no real ELVJ_EVT_* kind is 0 -- elevate_client_cap_derive's LE.M5-002 gate relies on exactly this overlap so an out-of-range parent_row (already refused earlier in derive's own gate order) cannot be mistaken for an attested one. Leaf. Labels prefixed elcc_glk_.",
+      block: {
+        cmp rdi, 16;
+        jae elcc_glk_zero;
+        lea r10, [rip + _elevate_client_cap_audit_kind_map];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      elcc_glk_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_cap_bind_attestation_required(row_id) -> u64
+  // elevate_client_cap_get_attestation_required(row_id)  -> u64
+  //
+  // LE.M5-002 (#32).  Per-row flag: once set, elevate_client_cap_
+  // derive refuses to mint a child from this row unless its shadow
+  // last_audit_kind is currently ELVJ_EVT_ATTEST (4) -- see that
+  // function's ATTESTATION-REQUIRED GATE section below.
+  //
+  // bind_attestation_required takes ONLY row_id (matching #32's
+  // signature exactly) -- there is deliberately no argument to clear
+  // the flag again.  A cap that could downgrade itself from
+  // require-attest back to optional would defeat the reason the flag
+  // exists (a caller binding it is asserting a POLICY about this row,
+  // not a transient preference); the only way a row loses the flag is
+  // for the row itself to go away via elevate_client_cap_reset or
+  // elevate_client_cap_check_and_revoke, both of which scrub every
+  // shadow field including this one.
+  //
+  // get_attestation_required returns 0 for both "never bound" and
+  // "row_id out of range" (same convention as every other get_* in
+  // this file) and non-zero (1) once bound.
+  //
+  // Register plan: leaf, no nested call, rdi used directly -- same
+  // shape as bind_last_audit / get_last_audit_kind above.
+  // ==========================================================================
+
+  pub let elevate_client_cap_bind_attestation_required : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.LE.M5-002 (#32): set the per-row attestation-required flag. No clear path by design -- see the file section header above. No nested call; rdi read twice (bounds check, then index) without being clobbered in between, so no push is needed. Labels prefixed elcc_bar_.",
+      block: {
+        cmp rdi, 16;
+        jae elcc_bar_bad_row;
+
+        lea r10, [rip + _elevate_client_cap_attest_required_map];
+        mov rax, 1;
+        mov [r10 + rdi * 8], rax;
+
+        xor rax, rax;                    // ELCC_OK
+        ret;
+
+      elcc_bar_bad_row:
+        mov rax, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
+        ret
+      }
+    }
+
+  pub let elevate_client_cap_get_attestation_required : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.LE.M5-002 (#32): bounded read of the shadow attestation-required flag; out-of-range returns 0 (same convention as every other get_* accessor in this file). Leaf. Labels prefixed elcc_gar_.",
+      block: {
+        cmp rdi, 16;
+        jae elcc_gar_zero;
+        lea r10, [rip + _elevate_client_cap_attest_required_map];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      elcc_gar_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
   // elevate_client_cap_derive(parent_row, child_caps, child_dur_ns,
   //                           mint_ctx_ptr)
   //   -> child_row_id | ELCC_ERR_*
@@ -1269,6 +1486,18 @@ module ElevateClientCap = structure {
   //     the parent".
   //   * chain depth check: get_depth(parent) < ELCC_MAX_DELEGATION_
   //     DEPTH - 1 -- else DELEGATION_TOO_DEEP.
+  //   * LE.M5-002 (#32) ATTESTATION-REQUIRED GATE: if the parent has
+  //     elevate_client_cap_bind_attestation_required set, the parent's
+  //     shadow last_audit_kind must currently equal ELVJ_EVT_ATTEST
+  //     (4) -- else ELCA_ERR_UNATTESTED (0xFFFFEA63, the elevate_
+  //     client_require.pdx ELCA_ band -- see the elcc_dv_unattested
+  //     label below for why this file returns a code from that band).
+  //     Checked AFTER the depth check and BEFORE the mint, so an
+  //     unattested derive attempt never touches the kernel. On a
+  //     successful derive, a set parent flag is copied onto the fresh
+  //     child (elevate_client_cap_bind_attestation_required(child)) so
+  //     a require-attest delegation chain stays require-attest at
+  //     every depth.
   //
   // Kernel-side note: a hypothetical elevate_channel_cap_derive_inner
   // primitive that mints a row using an EXISTING parent row's cap slot
@@ -1283,7 +1512,7 @@ module ElevateClientCap = structure {
   pub let elevate_client_cap_derive : (u64, u64, u64, u64) -> u64 !{mem} @{cap, boot} =
     fn (parent_row_id: u64) (child_caps: u64) (child_dur_ns: u64) (mint_ctx_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {cap, boot},
-      justification: "libpdx-elevate.LE.M3-001 (#26) v1.1.1 real-mint-args pass: the v1.1.0 shape hardcoded parent_ep_slot=0, request_id=0, requester_pid=0 and was therefore non-functional against any caller whose broker cap did not accidentally live at slot 0 (kernel-side gate in kind_elevate_channel.pdx :229/:821 indexes the slot straight into the flat cap_table with only a kind==KIND_IPC_ENDPOINT check). Fix: a 4th argument mint_ctx_ptr points at a caller-owned 3-word (24-byte) scratch buffer -- [+0]=parent_ep_slot, [+8]=request_id, [+16]=requester_pid -- layout-compatible with the FIRST three words of elevate_client_acquire's mint_ctx_buf so a consumer holding an acquire ctx may pass its same address here. target_cap_kind stays fixed at ELCC_KIND_ELEVATE_CHANNEL (0x191) and target_cap_rights stays derived from child_caps (both are settled by derive's semantics, not the caller). Register plan: rbx=parent_row, r12=child_caps, r13=child_dur -> reused as clamped deadline post-clamp, r14=parent_grant -> reused as child_row_id post-mint, r15=parent_expire (dead after the clamp step), rbp=mint_ctx_ptr (live from entry through the mint CALL; kept in rbp because it must survive every nested CALL up to the mint and rbp is the last SysV callee-save not already in service). Six callee-save pushes + one 8-byte alignment pad = 56 bytes; entry rsp%16==8 -> (8-56) mod 16 == 0 across every nested call (get_expire, get_grant, get_depth, hpet_now_ns, elevate_client_cap_mint, bind_expire_abs, bind_grant, bind_parent, cap_note), matching the frame shape elevate_client_acquire (ENH-001) already runs. Order of gates unchanged from v1.1.0: BAD_CTX (mint_ctx_ptr==0), BAD_ROW (parent>=16), PARENT_EXPIRED (expire slot 0 or past), CHILD_CAPS_ESCALATION (bit-wise subset check via `mov r10, parent_grant; not r10; and r10, child_caps`), DELEGATION_TOO_DEEP (depth >= MAX-1). Deadline clamping is min(now + child_dur, parent_expire) -- child never outlives the parent. rbx (parent_row) is preserved through the whole function so bind_parent sources it directly as rsi at the end; r14 (parent_grant) is dead after the subset check so it is reused for child_row_id post-mint. rbp itself is never overwritten between prologue and mint, so [rbp+0]/[rbp+8]/[rbp+16] are read directly into rdi/rdx/rcx immediately before the elevate_client_cap_mint CALL. capabilities {cap, boot} propagate from elevate_client_cap_mint + hpet_now_ns. Frame prologue implicit. Labels prefixed elcc_dv_.",
+      justification: "libpdx-elevate.LE.M3-001 (#26) v1.1.1 real-mint-args pass, extended at LE.M5-002 (#32) with an attestation-required gate + flag inheritance: the v1.1.0 shape hardcoded parent_ep_slot=0, request_id=0, requester_pid=0 and was therefore non-functional against any caller whose broker cap did not accidentally live at slot 0 (kernel-side gate in kind_elevate_channel.pdx :229/:821 indexes the slot straight into the flat cap_table with only a kind==KIND_IPC_ENDPOINT check). Fix: a 4th argument mint_ctx_ptr points at a caller-owned 3-word (24-byte) scratch buffer -- [+0]=parent_ep_slot, [+8]=request_id, [+16]=requester_pid -- layout-compatible with the FIRST three words of elevate_client_acquire's mint_ctx_buf so a consumer holding an acquire ctx may pass its same address here. target_cap_kind stays fixed at ELCC_KIND_ELEVATE_CHANNEL (0x191) and target_cap_rights stays derived from child_caps (both are settled by derive's semantics, not the caller). Register plan: rbx=parent_row, r12=child_caps, r13=child_dur -> reused as clamped deadline post-clamp, r14=parent_grant -> reused as child_row_id post-mint, r15=parent_expire (dead after the clamp step, reused at LE.M5-002 to hold the attestation-required scratch read across the get_last_audit_kind call), rbp=mint_ctx_ptr (live from entry through the mint CALL; kept in rbp because it must survive every nested CALL up to the mint and rbp is the last SysV callee-save not already in service). Six callee-save pushes + one 8-byte alignment pad = 56 bytes; entry rsp%16==8 -> (8-56) mod 16 == 0 across every nested call (get_expire, get_grant, get_depth, get_attestation_required, get_last_audit_kind, hpet_now_ns, elevate_client_cap_mint, bind_expire_abs, bind_grant, bind_parent, bind_attestation_required, cap_note), matching the frame shape elevate_client_acquire (ENH-001) already runs. Order of gates: BAD_CTX (mint_ctx_ptr==0), BAD_ROW (parent>=16), PARENT_EXPIRED (expire slot 0 or past), CHILD_CAPS_ESCALATION (bit-wise subset check via `mov r10, parent_grant; not r10; and r10, child_caps`), DELEGATION_TOO_DEEP (depth >= MAX-1), then LE.M5-002's UNATTESTED gate (parent's attestation-required flag set AND parent's last_audit_kind != ELVJ_EVT_ATTEST). Deadline clamping is min(now + child_dur, parent_expire) -- child never outlives the parent. rbx (parent_row) is preserved through the whole function so bind_parent AND the LE.M5-002 gate/inherit reads both source it directly; r14 (parent_grant) is dead after the subset check so it is reused for child_row_id post-mint. rbp itself is never overwritten between prologue and mint, so [rbp+0]/[rbp+8]/[rbp+16] are read directly into rdi/rdx/rcx immediately before the elevate_client_cap_mint CALL. The attestation-required flag is re-read (not threaded through a register) at the post-bind_parent inherit site rather than reusing the gate's r15 copy, because several CALLs intervene between the gate and the inherit step and shadow-map re-reads are cheap (same philosophy as this function already re-reading get_grant / get_expire rather than caching them across the whole body). capabilities {cap, boot} propagate from elevate_client_cap_mint + hpet_now_ns. Frame prologue implicit. Labels prefixed elcc_dv_.",
       block: {
         push rbx;
         push r12;
@@ -1344,6 +1573,25 @@ module ElevateClientCap = structure {
         cmp rax, 3;                      // ELCC_MAX_DELEGATION_DEPTH - 1
         jae elcc_dv_too_deep;
 
+        // ---- LE.M5-002 (#32) attestation-required gate ----
+        // r15 is dead here (held parent_expire, unused since the
+        // deadline clamp above) -- reused as scratch for the
+        // attestation-required read.  A parent that never bound the
+        // flag (get_attestation_required == 0) skips straight past;
+        // one that did must show last_audit_kind == ELVJ_EVT_ATTEST
+        // (4) or the derive is refused UNATTESTED before any mint is
+        // attempted.
+        mov rdi, rbx;                    // parent_row
+        call elevate_client_cap_get_attestation_required;
+        mov r15, rax;
+        cmp r15, 0;
+        je  elcc_dv_attest_ok;
+        mov rdi, rbx;                    // parent_row
+        call elevate_client_cap_get_last_audit_kind;
+        cmp rax, 4;                      // ELVJ_EVT_ATTEST
+        jne elcc_dv_unattested;
+      elcc_dv_attest_ok:
+
         // ---- Mint the child row via caller-supplied broker context ----
         // v1.1.1: parent_ep_slot / request_id / requester_pid are now
         // read from the caller-owned mint_ctx buffer (rbp) instead of
@@ -1397,6 +1645,26 @@ module ElevateClientCap = structure {
         cmp rax, 0;
         jne elcc_dv_bind_fail;
 
+        // ---- LE.M5-002 (#32) inherit attestation-required from parent ----
+        // A require-attest parent's children stay require-attest at
+        // every depth -- see the file-section header above bind_
+        // attestation_required for why there is no un-inherit path.
+        // Re-reads the parent's flag (cheap shadow lookup, same
+        // philosophy as re-reading get_grant / get_expire elsewhere in
+        // this function rather than threading one more value through
+        // an already-full register set) instead of reusing r15, whose
+        // ATTESTATION-REQUIRED-GATE value is stale by the time control
+        // reaches here (multiple intervening CALLs).
+        mov rdi, rbx;                    // parent_row
+        call elevate_client_cap_get_attestation_required;
+        cmp rax, 0;
+        je  elcc_dv_no_inherit;
+        mov rdi, r14;                    // child_row_id
+        call elevate_client_cap_bind_attestation_required;
+        cmp rax, 0;
+        jne elcc_dv_bind_fail;
+      elcc_dv_no_inherit:
+
         mov rax, r14;                    // child_row_id
         add rsp, 8;
         pop rbp;
@@ -1427,6 +1695,12 @@ module ElevateClientCap = structure {
         lea r10, [rip + _elevate_client_cap_budget_map];
         mov [r10 + r14 * 8], r11;
         lea r10, [rip + _elevate_client_cap_parent_map];
+        mov [r10 + r14 * 8], r11;
+        lea r10, [rip + _elevate_client_cap_audit_seq_map];
+        mov [r10 + r14 * 8], r11;
+        lea r10, [rip + _elevate_client_cap_audit_kind_map];
+        mov [r10 + r14 * 8], r11;
+        lea r10, [rip + _elevate_client_cap_attest_required_map];
         mov [r10 + r14 * 8], r11;
         mov rdi, r14;                    // child row_id to revoke
         call elevate_channel_cap_revoke;
@@ -1497,6 +1771,27 @@ module ElevateClientCap = structure {
 
       elcc_dv_too_deep:
         mov rax, 0xFFFFEA3F;             // ELCC_ERR_DELEGATION_TOO_DEEP
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcc_dv_unattested:
+        // ELCA_ERR_UNATTESTED (0xFFFFEA63) -- LE.M5-002 (#32).  Lives
+        // in elevate_client_require.pdx's ELCA_ 0xFFFFEA60..6F band,
+        // not this file's own ELCC_ 0xFFFFEA30..3F / 0xFFFFEA70..7F
+        // bands, because the issue names it as a per-op-style refusal
+        // (the same family as ELCA_ERR_EXPIRED / _CAPS_INSUFFICIENT)
+        // even though it is raised here in derive rather than in
+        // elevate_client_require -- same cross-file literal-plus-
+        // comment convention this library already uses throughout
+        // (e.g. elevate_client_require.pdx returns this file's
+        // 0xFFFFEA38 ELCC_ERR_NO_GRANT inline).
+        mov rax, 0xFFFFEA63;             // ELCA_ERR_UNATTESTED
         add rsp, 8;
         pop rbp;
         pop r15;

@@ -43,15 +43,29 @@
 // Every elevate audit record uses UEJ_KIND_ELEVATE = 5 and packs the
 // event-specific fields into the three body words:
 //
-//   body0 = ELVJ_EVT_REQ (1) | ELVJ_EVT_APR (2)   -- discriminator
-//   body1 = caps (REQ) | granted_caps (APR)
-//   body2 = duration_ns (REQ) | expire_ns (APR)
+//   body0 = ELVJ_EVT_REQ (1) | ELVJ_EVT_APR (2) | ELVJ_EVT_ATTEST (4)
+//                                                  -- discriminator
+//   body1 = caps (REQ) | granted_caps (APR) | actor_fp_lo (ATTEST)
+//   body2 = duration_ns (REQ) | expire_ns (APR) | reason_fp_lo (ATTEST)
 //
 // actor_fp_lo is the caller's low-64 fingerprint (mirrors the
 // process-global _elevate_client_target_fp_lo set via
 // elevate_client_set_target_fp_lo).  subject_fp_lo is 0 for elevate
 // records (user_events_journal.pdx §1 explicitly documents "0 for
 // elevate" so this is the intended convention).
+//
+// LE.M5-001 (#31): ELVJ_EVT_ATTEST records a delegation-with-
+// attestation event -- an opaque caller-computed reason_fp_lo
+// (typically blake3(reason_string)[0..8]) attached to a row_id BEFORE
+// a derive.  Unlike REQ/APR/OP, ATTEST also stamps two per-row shadow
+// fields in elevate_client_cap.pdx -- last_audit_seq and
+// last_audit_kind -- via elevate_client_cap_bind_last_audit, so a
+// later elevate_client_cap_derive call can gate on "was this parent
+// attested since its last state change" (see LE.M5-002, #32).
+// body1 duplicates actor_fp_lo (rather than reason_fp_lo twice) so an
+// auditor reading only the journal (no row_id context) still learns
+// who attested; reason_fp_lo lives in body2 alongside every other
+// event's second payload word.
 //
 // =============================================================================
 // PER-OP CONSENT NOTE
@@ -90,6 +104,14 @@
 //                                          client_cap_check_and_revoke)
 //                                          or the audit chain is
 //                                          broken.
+//   0xFFFFEA43  ELVJ_ERR_OP_JOURNAL_FAIL
+//                                       -- uej_append refused the OP
+//                                          record (ENH-004, #16).
+//   0xFFFFEA44  ELVJ_ERR_ATTEST_JOURNAL_FAIL
+//                                       -- uej_append refused the
+//                                          ATTEST record (LE.M5-001,
+//                                          #31).  No row shadow state
+//                                          is stamped when this fires.
 
 module ElevateClientJournal = structure {
 
@@ -117,13 +139,24 @@ module ElevateClientJournal = structure {
   // zero or more OP records per handle.
   pub let ELVJ_EVT_OP : u64 = 3
 
+  // LE.M5-001 (#31): delegation-with-attestation discriminator.  Fires
+  // from elevate_client_cap_attest, NOT from the request/response/op
+  // flow above -- a caller invokes it explicitly, typically right
+  // before elevate_client_cap_derive on a row whose bind_attestation_
+  // required flag is set (LE.M5-002, #32).  Chosen as 4, immediately
+  // after OP, so the four discriminators still read as a chronological
+  // family even though ATTEST is not part of the REQ/APR/OP sequence
+  // every handle goes through.
+  pub let ELVJ_EVT_ATTEST : u64 = 4
+
   // ---- Result codes / error band 0xFFFFEA40..0xFFFFEA4F ----
 
-  pub let ELVJ_OK                   : u64 = 0
-  pub let ELVJ_ERR_BAD_ACTOR        : u64 = 0xFFFFEA40
-  pub let ELVJ_ERR_REQ_JOURNAL_FAIL : u64 = 0xFFFFEA41
-  pub let ELVJ_ERR_APR_JOURNAL_FAIL : u64 = 0xFFFFEA42
-  pub let ELVJ_ERR_OP_JOURNAL_FAIL  : u64 = 0xFFFFEA43
+  pub let ELVJ_OK                      : u64 = 0
+  pub let ELVJ_ERR_BAD_ACTOR           : u64 = 0xFFFFEA40
+  pub let ELVJ_ERR_REQ_JOURNAL_FAIL    : u64 = 0xFFFFEA41
+  pub let ELVJ_ERR_APR_JOURNAL_FAIL    : u64 = 0xFFFFEA42
+  pub let ELVJ_ERR_OP_JOURNAL_FAIL     : u64 = 0xFFFFEA43
+  pub let ELVJ_ERR_ATTEST_JOURNAL_FAIL : u64 = 0xFFFFEA44
 
   // Threshold used to discriminate uej_append return (seq | UEJ_ERR_*)
   // from a valid seq.  UEJ_MAX_RECORDS = 256 per user_events_journal.
@@ -145,18 +178,24 @@ module ElevateClientJournal = structure {
   //                   one acquired handle means N mutating uses of a
   //                   single broker grant.
   //   6 op_fails      uej_append refused an OP record
-  //   7 reserved
+  //   7 attest_writes successful ATTEST journal appends (LE.M5-001,
+  //                   #31) -- was "reserved" pre-M5; the slot was never
+  //                   read or written before this wave.
+  //   8 attest_fails  uej_append refused an ATTEST record
+  //   9 reserved
 
-  pub let mut _elevate_client_journal_stats : [u64; 8] = uninit @align(64)
+  pub let mut _elevate_client_journal_stats : [u64; 10] = uninit @align(64)
 
-  pub let ELVJ_ST_REQ_WRITES : u64 = 0
-  pub let ELVJ_ST_APR_WRITES : u64 = 1
-  pub let ELVJ_ST_REQ_FAILS  : u64 = 2
-  pub let ELVJ_ST_APR_FAILS  : u64 = 3
-  pub let ELVJ_ST_BAD_ACTOR  : u64 = 4
-  pub let ELVJ_ST_OP_WRITES  : u64 = 5
-  pub let ELVJ_ST_OP_FAILS   : u64 = 6
-  pub let ELVJ_ST_MAX        : u64 = 8
+  pub let ELVJ_ST_REQ_WRITES    : u64 = 0
+  pub let ELVJ_ST_APR_WRITES    : u64 = 1
+  pub let ELVJ_ST_REQ_FAILS     : u64 = 2
+  pub let ELVJ_ST_APR_FAILS     : u64 = 3
+  pub let ELVJ_ST_BAD_ACTOR     : u64 = 4
+  pub let ELVJ_ST_OP_WRITES     : u64 = 5
+  pub let ELVJ_ST_OP_FAILS      : u64 = 6
+  pub let ELVJ_ST_ATTEST_WRITES : u64 = 7
+  pub let ELVJ_ST_ATTEST_FAILS  : u64 = 8
+  pub let ELVJ_ST_MAX           : u64 = 10
 
   // ==========================================================================
   // elevate_client_journal_reset() -> ()
@@ -168,7 +207,7 @@ module ElevateClientJournal = structure {
   pub let elevate_client_journal_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M3-001 (#6): clear the 8-slot journal stats table. Boot / teardown discipline; a live counter reset would race any concurrent journal_req / journal_apr call. Leaf; single loop. Labels prefixed elcj_rs_.",
+      justification: "libpdx-elevate.M3-001 (#6), extended to 10 slots at LE.M5-001 (#31) for the ATTEST write/fail counters: clear the journal stats table. Boot / teardown discipline; a live counter reset would race any concurrent journal_req / journal_apr call. Leaf; single loop. Labels prefixed elcj_rs_.",
       block: {
         lea r10, [rip + _elevate_client_journal_stats];
         xor rax, rax;
@@ -176,7 +215,7 @@ module ElevateClientJournal = structure {
       elcj_rs_loop:
         mov [r10 + rcx * 8], rax;
         add rcx, 1;
-        cmp rcx, 8;
+        cmp rcx, 10;
         jb  elcj_rs_loop;
         ret
       }
@@ -185,9 +224,9 @@ module ElevateClientJournal = structure {
   pub let elevate_client_journal_note : (u64) -> () !{mem} @{} =
     fn (which: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M3-001 (#6): bounded increment; out-of-range which is a no-op. Same shape as elevate_client_note (elevate_client.pdx L127). Labels prefixed elcj_nt_.",
+      justification: "libpdx-elevate.M3-001 (#6), bound widened 8->10 at LE.M5-001 (#31): bounded increment; out-of-range which is a no-op. Same shape as elevate_client_note (elevate_client.pdx L127). Labels prefixed elcj_nt_.",
       block: {
-        cmp rdi, 8;
+        cmp rdi, 10;
         jae elcj_nt_out;
         lea r10, [rip + _elevate_client_journal_stats];
         mov rax, [r10 + rdi * 8];
@@ -201,9 +240,9 @@ module ElevateClientJournal = structure {
   pub let elevate_client_journal_stat : (u64) -> u64 !{mem} @{} =
     fn (which: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M3-001 (#6): bounded read; out-of-range which returns 0 (0 is the correct answer for both 'never touched' and 'out of range' -- same convention as elevate_client_stat). Labels prefixed elcj_st_.",
+      justification: "libpdx-elevate.M3-001 (#6), bound widened 8->10 at LE.M5-001 (#31): bounded read; out-of-range which returns 0 (0 is the correct answer for both 'never touched' and 'out of range' -- same convention as elevate_client_stat). Labels prefixed elcj_st_.",
       block: {
-        cmp rdi, 8;
+        cmp rdi, 10;
         jae elcj_st_zero;
         lea r10, [rip + _elevate_client_journal_stats];
         mov rax, [r10 + rdi * 8];
@@ -460,6 +499,123 @@ module ElevateClientJournal = structure {
         ret;
 
       elcj_jo_bad_actor:
+        mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
+        call elevate_client_journal_note;
+        mov rax, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_cap_attest(row_id, actor_fp_lo, reason_fp_lo)
+  //   -> seq | ELVJ_ERR_*
+  //
+  // LE.M5-001 (#31).  Delegation-with-attestation record.  Appends
+  // ONE ATTEST audit record (body0 = ELVJ_EVT_ATTEST = 4, body1 =
+  // actor_fp_lo, body2 = reason_fp_lo) and, on success, stamps
+  // row_id's shadow last_audit_seq / last_audit_kind fields
+  // (elevate_client_cap.pdx, elevate_client_cap_bind_last_audit) so a
+  // later elevate_client_cap_derive call can gate on "has this row
+  // been attested" (LE.M5-002, #32).
+  //
+  // Named elevate_client_cap_* rather than elevate_client_journal_*
+  // (unlike its req/apr/op siblings above) because its OBSERVABLE
+  // effect is a cap-row stamp -- callers reason about it as "attest
+  // this row", not "journal this event" -- even though it lives here
+  // alongside uej_append's other call sites, keeping every direct
+  // kernel-journal touch in one file.
+  //
+  // Preconditions:
+  //   * actor_fp_lo != 0 (uej_append refuses 0-actor; gated first, same
+  //     as journal_req / journal_apr / journal_op, so the caller sees
+  //     ELVJ_ERR_BAD_ACTOR rather than an opaque ATTEST_JOURNAL_FAIL).
+  //
+  // row_id is NOT range-checked here: the append happens regardless
+  // (an attestation is a fact about who/why independent of whether the
+  // row_id is currently live), and the row-stamp step
+  // (elevate_client_cap_bind_last_audit) silently no-ops on an
+  // out-of-range row_id -- its ELCC_ERR_BAD_ROW return is intentionally
+  // ignored here, mirroring elevate_client_cap_derive's own
+  // best-effort treatment of a kernel revoke's return in its
+  // elcc_dv_bind_fail path: the journal record already landed and
+  // cannot be un-appended, so a bad row_id degrades to "the audit
+  // trail exists but no row remembers it" rather than losing the
+  // record entirely.
+  //
+  // Register plan: r12=row_id, r13=actor_fp_lo, r14=reason_fp_lo;
+  // three callee-save pushes = 24 bytes; entry rsp%16==8 -> (8-24) mod
+  // 16 == 0, matching journal_req/journal_apr/journal_op's shape. The
+  // seq returned by uej_append is stashed on the stack (one push + an
+  // 8-byte realignment pad, same idiom those three functions use)
+  // across BOTH the bind_last_audit and journal_note calls before
+  // being restored into rax.
+  // ==========================================================================
+
+  pub let elevate_client_cap_attest : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (actor_fp_lo: u64) (reason_fp_lo: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.LE.M5-001 (#31): append an ATTEST audit record and stamp the row's shadow last_audit_seq/last_audit_kind. Three callee-save pushes (r12=row_id, r13=actor_fp_lo, r14=reason_fp_lo) = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0 so uej_append's CALL sees aligned rsp, matching journal_req/journal_apr/journal_op. Gate order: actor_fp_lo != 0 first, same as the three siblings. body0 = ELVJ_EVT_ATTEST (4); body1 = actor_fp_lo (so an auditor reading only the journal, without row_id context, still learns who attested); body2 = reason_fp_lo. On success the returned seq is pushed once and the stack padded by 8 (rsp%16==0 across the two follow-on calls), then read back via [rsp+8] as the `seq` argument to elevate_client_cap_bind_last_audit (row_id, seq, kind=4) -- that call's return is deliberately ignored (best-effort row stamp; the journal record itself is the durable fact and cannot be un-appended if the row_id happens to be stale or out of range). ELVJ_ST_ATTEST_WRITES is bumped after the stamp attempt, still inside the same aligned window, before the stashed seq is restored into rax. Labels prefixed elcj_at_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                    // row_id
+        mov r13, rsi;                    // actor_fp_lo
+        mov r14, rdx;                    // reason_fp_lo
+
+        // Gate: actor_fp_lo != 0.
+        cmp r13, 0;
+        je  elcj_at_bad_actor;
+
+        // uej_append(kind=5, actor=actor_fp_lo, subject=0,
+        //            body0=ELVJ_EVT_ATTEST, body1=actor_fp_lo,
+        //            body2=reason_fp_lo)
+        mov rdi, 5;                      // ELVJ_UEJ_KIND_ELEVATE
+        mov rsi, r13;                    // actor_fp_lo
+        xor rdx, rdx;                    // subject_fp_lo = 0
+        mov rcx, 4;                      // ELVJ_EVT_ATTEST
+        mov r8,  r13;                    // body1 = actor_fp_lo
+        mov r9,  r14;                    // body2 = reason_fp_lo
+        call uej_append;
+
+        cmp rax, 256;                    // ELVJ_UEJ_SEQ_MAX
+        jae elcj_at_fail;
+
+        // Success -- stamp the row's shadow last_audit fields, bump
+        // the stat, then restore the seq into rax.
+        push rax;                        // stash seq
+        sub rsp, 8;                      // realign for the two calls below
+
+        mov rdi, r12;                    // row_id
+        mov rsi, [rsp + 8];              // seq (stashed just under the pad)
+        mov rdx, 4;                      // ELVJ_EVT_ATTEST (last_audit_kind)
+        call elevate_client_cap_bind_last_audit;  // return ignored -- best effort
+
+        mov rdi, 7;                      // ELVJ_ST_ATTEST_WRITES
+        call elevate_client_journal_note;
+
+        add rsp, 8;
+        pop rax;                         // restore seq
+
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcj_at_fail:
+        mov rdi, 8;                      // ELVJ_ST_ATTEST_FAILS
+        call elevate_client_journal_note;
+        mov rax, 0xFFFFEA44;             // ELVJ_ERR_ATTEST_JOURNAL_FAIL
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcj_at_bad_actor:
         mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
         call elevate_client_journal_note;
         mov rax, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR

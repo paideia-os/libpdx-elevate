@@ -1,0 +1,425 @@
+// tests/elevate_client_attest_test.pdx -- libpdx-elevate.LE.M5-001/002
+// (paideia-os/libpdx-elevate#31, #32)
+//
+// Delegation-with-attestation record + attestation-required gate.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Two boot witnesses, one per issue, bundled in one file because #32
+// consumes exactly what #31 emits:
+//
+//   elevate_client_attest_witness()
+//     -- LE.M5-001 (#31): src/elevate_client_journal.pdx's
+//        elevate_client_cap_attest.  Appends an ELVJ_EVT_ATTEST (4)
+//        audit record and stamps the row's shadow last_audit_seq /
+//        last_audit_kind (src/elevate_client_cap.pdx).
+//
+//   elevate_client_attest_required_witness()
+//     -- LE.M5-002 (#32): src/elevate_client_cap.pdx's bind_
+//        attestation_required / get_attestation_required, and the
+//        gate they add to elevate_client_cap_derive.
+//
+// -----------------------------------------------------------------------------
+// WHY THE DERIVE-SUCCESS / INHERITANCE PATH IS NOT EXERCISED HERE
+// -----------------------------------------------------------------------------
+//
+// elevate_client_cap_derive's attestation-required gate fires BEFORE
+// the kernel mint call, so both the refusal case (a) and the
+// gate-passes case (b) below are fully deterministic in a boot
+// witness with no live broker -- exactly the property tests/
+// elevate_client_cap_m3_test.pdx already leans on for derive's other
+// gates (BAD_CTX, PARENT_EXPIRED, CHILD_CAPS_ESCALATION, DELEGATION_
+// TOO_DEEP).  What is NOT deterministic here is what happens AFTER
+// the gate passes: elevate_client_cap_mint's success depends on
+// whether cap-table slot 0 (this witness's mint_ctx_ptr parent_ep_
+// slot) holds a real KIND_IPC_ENDPOINT in whatever kernel boots this
+// test -- exactly the same "no live broker" constraint the M3 witness
+// documents for its own scope.  So stage (b) below asserts only that
+// the gate did NOT refuse UNATTESTED (accepting either a real
+// child_row_id or ELCC_ERR_MINT_FAIL as fine), and the "derived child
+// inherits the flag" half of #32's acceptance criteria -- which can
+// only be observed on a child_row_id that came from an actual
+// successful mint -- is deferred to an end-to-end broker witness, the
+// same deferral M3's own post-mint state got.
+//
+// =============================================================================
+// FINGERPRINTS
+// =============================================================================
+//
+//   LIBPDX-ELEVATE LE.M5 ATTEST OK        (#31, elevate_client_attest_witness)
+//   LIBPDX-ELEVATE LE.M5 REQ-ATTEST OK    (#32, elevate_client_attest_required_witness)
+//
+// Labels prefixed eatw_ (#31 witness) and eaqw_ (#32 witness) --
+// disjoint from every other elc*_ / ecc*_ / ecp*_ / ecq*_ / ecb*_ /
+// em3w_ prefix in this library.
+
+module ElevateClientAttestTest = structure {
+
+  pub let mut _eatw_stage : u64 = 0
+  pub let mut _eatw_seq   : u64 = 0
+
+  pub let eatw_ok   : [u8; 31] = "LIBPDX-ELEVATE LE.M5 ATTEST OK\0"
+  pub let eatw_fail : [u8; 33] = "LIBPDX-ELEVATE LE.M5 ATTEST FAIL\0"
+
+  pub let mut _eaqw_stage : u64 = 0
+
+  pub let eaqw_ok   : [u8; 35] = "LIBPDX-ELEVATE LE.M5 REQ-ATTEST OK\0"
+  pub let eaqw_fail : [u8; 37] = "LIBPDX-ELEVATE LE.M5 REQ-ATTEST FAIL\0"
+
+  // 24-byte mint_ctx scratch (parent_ep_slot / request_id /
+  // requester_pid), zeroed same as tests/elevate_client_cap_m3_test.
+  // pdx's _em3w_mint_ctx -- only its NON-NULL address is load-bearing
+  // for the two derive calls in the #32 witness below; neither reaches
+  // a point where its contents change the assertion.
+  pub let mut _eaqw_mint_ctx : [u64; 3] = uninit @align(64)
+
+  // ==========================================================================
+  // elevate_client_attest_witness() -- LE.M5-001 (#31)
+  //
+  // Stages:
+  //   1. reset -- cap shadow state + journal stats scrubbed to zero.
+  //   2. attest(row=0, actor=0xABCD, reason=0x1111) -> seq < 256.
+  //      ELVJ_ST_ATTEST_WRITES bumped to 1. Row 0's shadow
+  //      last_audit_kind == ELVJ_EVT_ATTEST (4) and last_audit_seq ==
+  //      the returned seq -- the row-stamp half of #31's contract.
+  //   3. attest(row=1, actor=0, reason=0x1111) -> ELVJ_ERR_BAD_ACTOR
+  //      (0xFFFFEA40, #31's acceptance criterion (c)). ELVJ_ST_BAD_
+  //      ACTOR bumped to 1; row 1's last_audit_kind stays 0 (untouched
+  //      -- the bad-actor gate fires before uej_append / bind_last_
+  //      audit ever run).
+  // ==========================================================================
+
+  pub let elevate_client_attest_witness : () -> u64 !{sysreg, mem} @{boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "libpdx-elevate.LE.M5-001 (#31): boot witness for elevate_client_cap_attest. Every stage reloads its rdi/rsi/rdx arguments as fresh immediates; the one value that must survive across CALLs (the seq returned by stage 2's attest call) is stashed to memory (_eatw_seq) rather than a register, same idiom as the stage counter itself, so no callee-save push is required -- only alignment. A bare `sub rsp, 24` reserves the same byte count the two-push-plus-pad idiom elsewhere in this library uses; entry rsp%16==8 -> (8-24) mod 16 == 0, so every nested call sees aligned rsp. capabilities {boot} propagate from klog_s1 / klog_s1_d1 only -- elevate_client_cap_attest, elevate_client_cap_get_last_audit_kind/_seq, and elevate_client_journal_stat all declare capabilities {} (they touch {mem} only; uej_append itself needs no capability in this model, matching journal_req/journal_apr/journal_op's own {} annotation), so this witness does not need {cap}. Labels prefixed eatw_.",
+      block: {
+        sub rsp, 24;                     // alignment only -- no live data spans a CALL
+
+        // ------------------------------------------------------------
+        // Stage 1: reset.
+        // ------------------------------------------------------------
+        mov rax, 1;
+        lea rcx, [rip + _eatw_stage];
+        mov [rcx], rax;
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+
+        mov rdi, 7;                      // ELVJ_ST_ATTEST_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 0;
+        jne eatw_fail_stage;
+
+        mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
+        call elevate_client_journal_stat;
+        cmp rax, 0;
+        jne eatw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 2: attest(row=0, actor=0xABCD, reason=0x1111) -> a
+        // valid seq (< 256).
+        // ------------------------------------------------------------
+        mov rax, 2;
+        lea rcx, [rip + _eatw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;                    // row = 0
+        mov rsi, 0xABCD;                 // actor_fp_lo
+        mov rdx, 0x1111;                 // reason_fp_lo
+        call elevate_client_cap_attest;
+        cmp rax, 256;                    // ELVJ_UEJ_SEQ_MAX
+        jae eatw_fail_stage;
+
+        lea rcx, [rip + _eatw_seq];
+        mov [rcx], rax;                  // stash the seq
+
+        mov rdi, 7;                      // ELVJ_ST_ATTEST_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 1;
+        jne eatw_fail_stage;
+
+        xor rdi, rdi;                    // row = 0
+        call elevate_client_cap_get_last_audit_kind;
+        cmp rax, 4;                      // ELVJ_EVT_ATTEST
+        jne eatw_fail_stage;
+
+        xor rdi, rdi;                    // row = 0
+        call elevate_client_cap_get_last_audit_seq;
+        lea rcx, [rip + _eatw_seq];
+        mov r10, [rcx];
+        cmp rax, r10;
+        jne eatw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 3: attest(row=1, actor=0, reason=0x1111) ->
+        // ELVJ_ERR_BAD_ACTOR. Row 1's last_audit_kind stays 0.
+        // ------------------------------------------------------------
+        mov rax, 3;
+        lea rcx, [rip + _eatw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 1;                      // row = 1
+        xor rsi, rsi;                    // actor_fp_lo = 0 <-- gate
+        mov rdx, 0x1111;                 // reason_fp_lo
+        call elevate_client_cap_attest;
+        mov r10, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR
+        cmp rax, r10;
+        jne eatw_fail_stage;
+
+        mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
+        call elevate_client_journal_stat;
+        cmp rax, 1;
+        jne eatw_fail_stage;
+
+        mov rdi, 1;                      // row = 1
+        call elevate_client_cap_get_last_audit_kind;
+        cmp rax, 0;
+        jne eatw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Success. Log OK, scrub state, return 0.
+        // ------------------------------------------------------------
+        mov rdi, 3;                      // KLOG_LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + eatw_ok];
+        call klog_s1;
+
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+        xor rax, rax;
+        jmp eatw_out;
+
+      eatw_fail_stage:
+        lea rax, [rip + _eatw_stage];
+        mov r8, [rax];                   // value1 -- failing stage id
+        mov rdi, 1;                      // KLOG_LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + eatw_fail];
+        lea rcx, [rip + k_line];         // key1 = "line"
+        call klog_s1_d1;
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+        mov rax, 1;
+
+      eatw_out:
+        add rsp, 24;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_attest_required_witness() -- LE.M5-002 (#32)
+  //
+  // Stages:
+  //   1. reset. get_attestation_required(0) == 0 (default).
+  //   2. bind_attestation_required(17) [out of range] -> ELCC_ERR_
+  //      BAD_ROW. get_attestation_required(17) == 0 (out-of-range
+  //      convention, unaffected by the refused bind).
+  //   3. bind_attestation_required(0) -> ELCC_OK.
+  //      get_attestation_required(0) == 1.
+  //   4. (a) row 0: live expire + grant 0x03, attestation required
+  //      (from stage 3), NEVER attested. derive(parent=0, child=0x01,
+  //      ...) -> ELCA_ERR_UNATTESTED (0xFFFFEA63) -- fully
+  //      deterministic; the gate fires before any mint is attempted.
+  //   5. (b) row 1: live expire + grant 0x03, attestation required,
+  //      attested via elevate_client_cap_attest (a real uej_append
+  //      call -- see the file header for why this is safe in a boot
+  //      witness). derive(parent=1, child=0x01, ...) must NOT return
+  //      ELCA_ERR_UNATTESTED (the gate passed; see the file header
+  //      for why the post-gate outcome itself is not asserted).
+  //   6. (c) row 2: live expire + grant 0x03, attestation NEVER
+  //      required. derive(parent=2, child=0x01, ...) must NOT return
+  //      ELCA_ERR_UNATTESTED -- proves an unflagged row's derive path
+  //      is unaffected by LE.M5-002.
+  // ==========================================================================
+
+  pub let elevate_client_attest_required_witness : () -> u64 !{sysreg, mem} @{cap, boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {cap, boot},
+      justification: "libpdx-elevate.LE.M5-002 (#32): boot witness for the attestation-required gate + accessors. Every stage reloads its rdi/rsi/rdx/rcx arguments as fresh immediates and records the stage id to memory (_eaqw_stage), so no value needs to survive across a CALL and no callee-save push is required for data -- only alignment. A bare `sub rsp, 24` reserves the same byte count the two-push-plus-pad idiom elsewhere in this library uses; entry rsp%16==8 -> (8-24) mod 16 == 0, so every nested call sees aligned rsp. capabilities {cap, boot} propagate from elevate_client_cap_derive's own {cap, boot} annotation (stages 4-6 each call it). Stages 4 and 5's derive calls are designed so the load-bearing assertion (UNATTESTED vs not) is settled by the client-side gate before any kernel mint is attempted -- see the file header for why the post-gate mint outcome itself is deliberately not asserted, matching tests/elevate_client_cap_m3_test.pdx's own documented scope. The scratch mint_ctx buffer at _eaqw_mint_ctx is 24 bytes = 3 u64 words matching derive's documented layout; only its NON-NULL address is load-bearing here. Labels prefixed eaqw_ -- disjoint from em3w_ (the LE.M3 derive-gate witness) and every other prefix in this library.",
+      block: {
+        sub rsp, 24;                     // alignment only -- no live data spans a CALL
+
+        // ------------------------------------------------------------
+        // Stage 1: reset. get_attestation_required(0) == 0 (default).
+        // ------------------------------------------------------------
+        mov rax, 1;
+        lea rcx, [rip + _eaqw_stage];
+        mov [rcx], rax;
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+
+        xor rdi, rdi;                    // row = 0
+        call elevate_client_cap_get_attestation_required;
+        cmp rax, 0;
+        jne eaqw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 2: bind_attestation_required(17) -> ELCC_ERR_BAD_ROW.
+        // get_attestation_required(17) stays 0.
+        // ------------------------------------------------------------
+        mov rax, 2;
+        lea rcx, [rip + _eaqw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 17;
+        call elevate_client_cap_bind_attestation_required;
+        mov r10, 0xFFFFEA30;             // ELCC_ERR_BAD_ROW
+        cmp rax, r10;
+        jne eaqw_fail_stage;
+
+        mov rdi, 17;
+        call elevate_client_cap_get_attestation_required;
+        cmp rax, 0;
+        jne eaqw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 3: bind_attestation_required(0) -> ELCC_OK.
+        // get_attestation_required(0) == 1.
+        // ------------------------------------------------------------
+        mov rax, 3;
+        lea rcx, [rip + _eaqw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;                    // row = 0
+        call elevate_client_cap_bind_attestation_required;
+        cmp rax, 0;                      // ELCC_OK
+        jne eaqw_fail_stage;
+
+        xor rdi, rdi;
+        call elevate_client_cap_get_attestation_required;
+        cmp rax, 1;
+        jne eaqw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 4 (a): row 0 -- required + never attested -> derive
+        // refuses ELCA_ERR_UNATTESTED.
+        // ------------------------------------------------------------
+        mov rax, 4;
+        lea rcx, [rip + _eaqw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;                    // row = 0
+        mov rsi, 60000000000;            // 60s
+        call elevate_client_cap_bind_expire;
+        cmp rax, 0;
+        jne eaqw_fail_stage;
+
+        xor rdi, rdi;                    // row = 0
+        mov rsi, 0x03;                   // granted_caps
+        call elevate_client_cap_bind_grant;
+        cmp rax, 0;
+        jne eaqw_fail_stage;
+
+        xor rdi, rdi;                    // parent_row = 0
+        mov rsi, 0x01;                   // child_caps
+        mov rdx, 1000000000;             // child_dur = 1s
+        lea rcx, [rip + _eaqw_mint_ctx]; // mint_ctx_ptr (non-NULL)
+        call elevate_client_cap_derive;
+        mov r10, 0xFFFFEA63;             // ELCA_ERR_UNATTESTED
+        cmp rax, r10;
+        jne eaqw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 5 (b): row 1 -- required + attested -> derive's gate
+        // passes (does NOT return UNATTESTED).
+        // ------------------------------------------------------------
+        mov rax, 5;
+        lea rcx, [rip + _eaqw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 1;                      // row = 1
+        mov rsi, 60000000000;            // 60s
+        call elevate_client_cap_bind_expire;
+        cmp rax, 0;
+        jne eaqw_fail_stage;
+
+        mov rdi, 1;                      // row = 1
+        mov rsi, 0x03;                   // granted_caps
+        call elevate_client_cap_bind_grant;
+        cmp rax, 0;
+        jne eaqw_fail_stage;
+
+        mov rdi, 1;                      // row = 1
+        call elevate_client_cap_bind_attestation_required;
+        cmp rax, 0;
+        jne eaqw_fail_stage;
+
+        mov rdi, 1;                      // row = 1
+        mov rsi, 0xBEEF;                 // actor_fp_lo
+        mov rdx, 0xCAFE;                 // reason_fp_lo
+        call elevate_client_cap_attest;
+        cmp rax, 256;                    // ELVJ_UEJ_SEQ_MAX
+        jae eaqw_fail_stage;
+
+        mov rdi, 1;                      // parent_row = 1
+        mov rsi, 0x01;                   // child_caps
+        mov rdx, 1000000000;             // child_dur = 1s
+        lea rcx, [rip + _eaqw_mint_ctx]; // mint_ctx_ptr (non-NULL)
+        call elevate_client_cap_derive;
+        mov r10, 0xFFFFEA63;             // ELCA_ERR_UNATTESTED
+        cmp rax, r10;
+        je  eaqw_fail_stage;             // gate must NOT have refused
+
+        // ------------------------------------------------------------
+        // Stage 6 (c): row 2 -- attestation never required -> derive's
+        // gate is a no-op (does NOT return UNATTESTED).
+        // ------------------------------------------------------------
+        mov rax, 6;
+        lea rcx, [rip + _eaqw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 2;                      // row = 2
+        mov rsi, 60000000000;            // 60s
+        call elevate_client_cap_bind_expire;
+        cmp rax, 0;
+        jne eaqw_fail_stage;
+
+        mov rdi, 2;                      // row = 2
+        mov rsi, 0x03;                   // granted_caps
+        call elevate_client_cap_bind_grant;
+        cmp rax, 0;
+        jne eaqw_fail_stage;
+
+        mov rdi, 2;                      // parent_row = 2
+        mov rsi, 0x01;                   // child_caps
+        mov rdx, 1000000000;             // child_dur = 1s
+        lea rcx, [rip + _eaqw_mint_ctx]; // mint_ctx_ptr (non-NULL)
+        call elevate_client_cap_derive;
+        mov r10, 0xFFFFEA63;             // ELCA_ERR_UNATTESTED
+        cmp rax, r10;
+        je  eaqw_fail_stage;             // must be unaffected -- no flag bound
+
+        // ------------------------------------------------------------
+        // Success. Log OK, scrub state, return 0.
+        // ------------------------------------------------------------
+        mov rdi, 3;                      // KLOG_LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + eaqw_ok];
+        call klog_s1;
+
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+        xor rax, rax;
+        jmp eaqw_out;
+
+      eaqw_fail_stage:
+        lea rax, [rip + _eaqw_stage];
+        mov r8, [rax];                   // value1 -- failing stage id
+        mov rdi, 1;                      // KLOG_LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + eaqw_fail];
+        lea rcx, [rip + k_line];         // key1 = "line"
+        call klog_s1_d1;
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+        mov rax, 1;
+
+      eaqw_out:
+        add rsp, 24;
+        ret
+      }
+    }
+}

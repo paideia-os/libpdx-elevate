@@ -65,6 +65,32 @@
 //                                                cap_bind_scope) and the
 //                                                caller's scope_fp does
 //                                                not match it
+//   0xFFFFEA63  ELCA_ERR_UNATTESTED          -- LE.M5-002 (#32): raised
+//                                                by elevate_client_cap_
+//                                                derive (elevate_client_
+//                                                cap.pdx), NOT by any
+//                                                entry point in this
+//                                                file.  Declared in
+//                                                THIS band (rather than
+//                                                cap.pdx's own ELCC_
+//                                                0xFFFFEA3*/0xFFFFEA7*
+//                                                bands) because the
+//                                                issue that named it
+//                                                treats it as a per-op-
+//                                                style refusal, the
+//                                                same family as
+//                                                ELCA_ERR_EXPIRED /
+//                                                _CAPS_INSUFFICIENT
+//                                                above.  A derive
+//                                                attempt against a row
+//                                                whose bind_
+//                                                attestation_required
+//                                                flag is set refuses
+//                                                with this code unless
+//                                                the row's shadow
+//                                                last_audit_kind is
+//                                                currently ELVJ_EVT_
+//                                                ATTEST (4).
 //
 // ELCC_ERR_BAD_ROW / ELCC_ERR_NO_DEADLINE / ELCC_ERR_NO_GRANT
 // (elevate_client_cap.pdx, 0xFFFFEA30 band) pass through unchanged
@@ -79,6 +105,11 @@ module ElevateClientRequire = structure {
   pub let ELCA_ERR_EXPIRED           : u64 = 0xFFFFEA60
   pub let ELCA_ERR_CAPS_INSUFFICIENT : u64 = 0xFFFFEA61
   pub let ELCA_ERR_SCOPE_MISMATCH    : u64 = 0xFFFFEA62
+  // LE.M5-002 (#32): documentary only -- this constant is never
+  // returned by an entry point IN this file.  See the file header
+  // ERROR BAND note above for why it lives in this band and who
+  // actually raises it (elevate_client_cap_derive).
+  pub let ELCA_ERR_UNATTESTED        : u64 = 0xFFFFEA63
 
   // ---- Stats ----
   //
