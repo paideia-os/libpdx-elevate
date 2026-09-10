@@ -10,69 +10,31 @@ covers.
 
 ## Unreleased
 
-### LE.M2-002 (#38) — journal_req / _apr / _op / cap_attest / journal_revoke_cascade route through libpdx-audit
+### #53 — LE.M7 cascade-fail: explicit abort-marker journal record
 
-- **Plumbing swap** (`src/elevate_client_journal.pdx`): every
-  audit-emitting body now composes a 256-byte `PdxAuditRecord@0.2` in
-  the new module-private scratch slot `_elevate_client_audit_entry`
-  and hands it to libpdx-audit's `audit_append_leaf(sink, 256, entry)`
-  before performing the existing `uej_append(UEJ_KIND_ELEVATE = 5, …)`
-  kernel-journal write. Five call sites: `elevate_client_journal_req`,
-  `elevate_client_journal_apr`, `elevate_client_journal_op`,
-  `elevate_client_cap_attest`, `elevate_client_journal_revoke_cascade`.
-  The mirror is skipped on the bad-actor path (same gate as
-  `uej_append`), so a bad-actor call remains a pure gate-fast return
-  with zero side-effect. New shared staging helper
-  `_elevate_client_audit_stage(actor, body0, body1, body2)` factors the
-  zero-fill + populate + call sequence; five callers vs. an inline
-  fifth copy at each site is the third-call-site rule this repo has
-  used for `elevate_client_cap_scrub_row` (LE.M7-001, #35) and
-  `elevate_client_journal_note`.
-
-- **Effect posture preserved.** `audit_append_leaf` is
-  `!{mem} @{}` — same as `uej_append` — so the five journal-emitting
-  entry points keep their existing `!{mem} @{}` (or, for
-  `elevate_client_request_ex_j`, `!{mem} @{boot}` propagated from
-  `elevate_client_request_ex`) signatures unchanged. Downstream
-  `_ex_j` / `_ex_r` / `_acquire` / `_require_j` callers see NO
-  effect-set widening, ruling out the v2.0 cap-manifest ripple the
-  full `audit_begin` / `audit_record_output` / `audit_commit` trio
-  (`!{mem, sysreg} @{cap, sched}`) would have forced.
-
-- **Byte-format on the wire is unchanged.** `uej_append(5, actor, 0,
-  body0, body1, body2)` still runs on every non-bad-actor call with
-  the same six arguments in the same order — the LE.M2-002 issue's
-  byte-identical-wire acceptance criterion is satisfied by
-  construction, not by comparison, since the wire call is literally
-  the same instruction. The mirror is a supplementary in-memory
-  staging step, not a wire change.
-
-- **Audit-first invariant preserved.** `elevate_client_request_ex_j`
-  still gates on `elevate_client_journal_req`'s uej_append-derived
-  return (`cmp rax, 256; jb elcj_rx_journaled`), so a REQ-record
-  refusal still aborts before the wire hop, exactly as it did pre-swap.
-  The mirror's `audit_append_leaf` return is intentionally IGNORED at
-  every call site — sink capacity (256) equals `AUDIT_PAYLOAD_BYTES`
-  exactly, so `AUDIT_ERR_BUFFER_FULL` cannot fire; a future
-  rolling-sink variant would need to observe the return.
-
-- **New module-private .bss slots** (`src/elevate_client_journal.pdx`):
-  `_elevate_client_audit_entry: [u8; 256] @align(8)` (composition
-  scratch) and `_elevate_client_audit_sink: [u8; 256] @align(8)`
-  (single-record mirror sink; successive calls overwrite it).
-  8-byte alignment satisfies `audit_append_leaf`'s caller-obligation
-  (audit_client.pdx L631-L638). AUDIT_OFF_* offsets are kept as
-  in-file constants in the header comment rather than re-exported
-  from libpdx-audit to keep this module's public surface decoupled
-  from libpdx-audit's internal layout.
-
-- **`deps.list`.** `libpdx-audit` line flipped `PENDING` →
-  `LANDED`, version constraint bumped `>=0.3.0` → `>=1.1.2` (the
-  release tag that carries `audit_append_leaf`, per libpdx-audit's
-  own CHANGELOG Unreleased entry).
-
-- **Fingerprint** (for future release notes): `LIBPDX-ELEVATE LE.M2
-  AUDIT-SWAP OK`.
+- New journal discriminator `ELVJ_EVT_CASCADE_ABORT = 6` and entry
+  point `elevate_client_journal_cascade_abort(actor_fp_lo,
+  packed_rows, kernel_err_code) -> seq | ELVJ_ERR_*`
+  (`src/elevate_client_journal.pdx`). `body1` packs
+  `(cascade_root_row_id << 32) | failing_row_id`; `body2` is the raw
+  kernel error code (the `elevate_channel_cap_revoke` return that was
+  neither `ELVC_OK` nor `ELVC_REVOKE_ALREADY`). New error
+  `ELVJ_ERR_CASCADE_ABORT_JOURNAL_FAIL = 0xFFFFEA46`; journal stats
+  table widened 11→13 slots (`ELVJ_ST_CASCADE_ABORT_WRITES = 11`,
+  `ELVJ_ST_CASCADE_ABORT_FAILS = 12`).
+- `elevate_client_cap_revoke_cascade`'s `elcc_rc_cascade_fail` branch
+  now emits exactly one such record before returning
+  `ELCC_ERR_CASCADE_FAIL`, using the still-live `r13` / `r14` / `r15`
+  (actor / failing row / cascade root) plus the preserved `rax`
+  kernel error code — four instructions of arg setup on the failure
+  path only, zero cost on the happy path. Best-effort: the journal
+  call's return is deliberately ignored, same discipline as the
+  per-row `ELVJ_EVT_REVOKE_CASCADE` records.
+- Closes the audit-trail gap identified by the LE.M7 debugger audit:
+  before this landing, an auditor reading N `REVOKE_CASCADE` rows
+  could not tell "cascade completed with N revokes" from "cascade
+  partially revoked N rows then aborted at row N+1" — both streams
+  were bit-for-bit identical.
 
 ### LE.M7-001/002 (#35, #36) — revoke cascade over the child chain + broker-triggered propagation
 

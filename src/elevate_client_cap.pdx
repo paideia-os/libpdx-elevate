@@ -161,6 +161,20 @@
 //                                          the deepest-first walk are left
 //                                          untouched.  The journal is the
 //                                          record of exactly which is which.
+//                                          As of paideia-os/libpdx-elevate#53
+//                                          the abort itself now emits ONE
+//                                          explicit ELVJ_EVT_CASCADE_ABORT
+//                                          journal record (best-effort, same
+//                                          discipline as the per-row REVOKE_
+//                                          CASCADE record) capturing the
+//                                          failing row_id, the cascade root,
+//                                          and the raw kernel error code, so
+//                                          an auditor no longer has to guess
+//                                          from a bare gap in the journal
+//                                          whether N REVOKE_CASCADE records
+//                                          mean "clean N-row cascade" or
+//                                          "partial N-row cascade that
+//                                          aborted at row N+1".
 
 module ElevateClientCap = structure {
 
@@ -2005,6 +2019,25 @@ module ElevateClientCap = structure {
   // (correctly) gone either way -- the worst outcome is a thinner
   // audit trail, not a live over-grant.
   //
+  // paideia-os/libpdx-elevate#53 (LE.M7 discipline gap) closes the
+  // OTHER end of the audit trail: the cascade-fail branch used to
+  // return ELCC_ERR_CASCADE_FAIL WITHOUT emitting a marker record, so
+  // an auditor reading N REVOKE_CASCADE rows could not tell "cascade
+  // completed cleanly with N revokes" from "cascade partially revoked
+  // N rows then aborted at row N+1 with kernel err E". elcc_rc_cascade_
+  // fail below now emits ONE elevate_client_journal_cascade_abort call
+  // (body0 = ELVJ_EVT_CASCADE_ABORT (6); body1 packs (cascade_root <<
+  // 32) | failing_row; body2 = the raw kernel err code that came back
+  // from elevate_channel_cap_revoke on the failing row) immediately
+  // BEFORE the ELCC_ERR_CASCADE_FAIL return, using the same actor,
+  // and honouring the same best-effort discipline (return ignored --
+  // the ELCC_ERR_CASCADE_FAIL surface to the caller does not depend
+  // on whether the marker landed). Registers r13 (actor), r14 (failing
+  // row_id), r15 (cascade root row_id) are all still live at the fail
+  // site by the register plan below, so this costs one extra CALL and
+  // ~6 arg-setup instructions on the failure path only -- zero cost
+  // on the happy path.
+  //
   // -------------------------------------------------------------------------
   // Register plan: r15=row_id (root, alive whole function), r12=
   // "changed" flag during the BFS closure then repurposed as the
@@ -2020,7 +2053,7 @@ module ElevateClientCap = structure {
   pub let elevate_client_cap_revoke_cascade : (u64) -> u64 !{mem} @{cap} =
     fn (row_id: u64) -> unsafe {
       effects: {mem}, capabilities: {cap},
-      justification: "libpdx-elevate.LE.M7-001 (#35): force-revoke row_id and every transitive shadow-map descendant, deepest-first. Six callee-save pushes (rbx, r12, r13, r14, r15, rbp) + one 8-byte alignment pad = 56 bytes; entry rsp%16==8 -> (8-56) mod 16 == 0 across every nested call (get_parent, get_depth, get_target_fp_lo, elevate_channel_cap_revoke, scrub_row, journal_revoke_cascade), matching elevate_client_cap_derive's frame shape exactly. r15 holds row_id for the entire function (never reused). r12 doubles as the BFS 'changed' flag during closure-building and the revoked_count accumulator afterward -- the two uses are temporally disjoint (closure-building fully completes, including the depth-cache pass, before any row is revoked), so no value ever needs to survive across the repurposing. r14 holds the loop index j across every phase and every nested CALL within a phase. rbp doubles as the BFS pass counter then the depth_level counter for the same disjoint-phases reason as r12. rbx is free scratch from the closure phase onward, used in step 3 to classify a kernel revoke's return (0 = revoked-now, 1 = already). capability {cap} propagates from elevate_channel_cap_revoke (get_parent, get_depth, get_target_fp_lo, scrub_row, and journal_revoke_cascade all declare capabilities {}). A cascade-fail abort happens INSIDE the depth_level/j double loop, so the shared epilogue at elcc_rc_out is reached from every exit (success, bad_row, cascade_fail) with a uniform pop sequence. Labels prefixed elcc_rc_.",
+      justification: "libpdx-elevate.LE.M7-001 (#35), extended at #53 with an explicit CASCADE_ABORT marker at the fail branch: force-revoke row_id and every transitive shadow-map descendant, deepest-first. Six callee-save pushes (rbx, r12, r13, r14, r15, rbp) + one 8-byte alignment pad = 56 bytes; entry rsp%16==8 -> (8-56) mod 16 == 0 across every nested call (get_parent, get_depth, get_target_fp_lo, elevate_channel_cap_revoke, scrub_row, journal_revoke_cascade, and the #53 elcc_rc_cascade_fail branch's journal_cascade_abort), matching elevate_client_cap_derive's frame shape exactly. r15 holds row_id for the entire function (never reused). r12 doubles as the BFS 'changed' flag during closure-building and the revoked_count accumulator afterward -- the two uses are temporally disjoint (closure-building fully completes, including the depth-cache pass, before any row is revoked), so no value ever needs to survive across the repurposing. r14 holds the loop index j across every phase and every nested CALL within a phase. rbp doubles as the BFS pass counter then the depth_level counter for the same disjoint-phases reason as r12. rbx is free scratch from the closure phase onward, used in step 3 to classify a kernel revoke's return (0 = revoked-now, 1 = already). capability {cap} propagates from elevate_channel_cap_revoke (get_parent, get_depth, get_target_fp_lo, scrub_row, journal_revoke_cascade, and #53's journal_cascade_abort all declare capabilities {}). The #53 marker CALL from elcc_rc_cascade_fail sees the same aligned rsp as every other in-body CALL (rsp is untouched between the double loop and the fail branch); r13/r14/r15 are all still live at the fail site so the four-instruction argument setup (stash kernel err in rdx, actor in rdi, pack (r15 << 32) | r14 into rsi) needs no reload from memory. A cascade-fail abort happens INSIDE the depth_level/j double loop, so the shared epilogue at elcc_rc_out is reached from every exit (success, bad_row, cascade_fail) with a uniform pop sequence. Labels prefixed elcc_rc_.",
       block: {
         push rbx;
         push r12;
@@ -2192,6 +2225,30 @@ module ElevateClientCap = structure {
         ret;
 
       elcc_rc_cascade_fail:
+        // #53: emit the once-per-cascade abort marker BEFORE returning
+        // so the audit stream carries an explicit sentinel rather than
+        // a bare gap after the last REVOKE_CASCADE record.  Registers
+        // at entry to this label:
+        //   rax = raw kernel err code (return of elevate_channel_cap_
+        //         revoke that was neither ELVC_OK nor ELVC_REVOKE_
+        //         ALREADY; preserved through the two flag-only cmps
+        //         and the intermediate `xor rbx, rbx` / `mov r10,
+        //         0xFFFFEC06` above -- neither touches rax).
+        //   r13 = actor_fp_lo (fetched once at step 3).
+        //   r14 = failing row_id (the j the fail was diagnosed on).
+        //   r15 = cascade_root_row_id (function argument, alive whole
+        //         function per the register plan).
+        // Best-effort discipline (return of journal_cascade_abort is
+        // deliberately ignored -- see the AUDIT + ACTOR block above).
+        // rsp is untouched since prologue so alignment holds for the
+        // CALL.
+        mov rdx, rax;                     // stash kernel err -> body2
+        mov rdi, r13;                     // actor_fp_lo
+        mov rsi, r15;                     // cascade_root_row_id
+        shl rsi, 32;                      // ...into high 32 bits
+        or  rsi, r14;                     // | failing_row_id in low 32
+        call elevate_client_journal_cascade_abort;
+
         mov rax, 0xFFFFEA74;              // ELCC_ERR_CASCADE_FAIL
         add rsp, 8;
         pop rbp;

@@ -150,6 +150,29 @@
 //                                          band coverage even though no
 //                                          call site currently branches
 //                                          on it.
+//   0xFFFFEA46  ELVJ_ERR_CASCADE_ABORT_JOURNAL_FAIL
+//                                       -- uej_append refused the
+//                                          CASCADE_ABORT marker record
+//                                          (paideia-os/libpdx-elevate#53,
+//                                          LE.M7 audit-discipline gap).
+//                                          Emitted exactly once from
+//                                          elevate_client_cap_revoke_
+//                                          cascade's cascade-fail branch
+//                                          so an auditor can distinguish
+//                                          "cascade completed cleanly
+//                                          with N revokes" from "cascade
+//                                          partially revoked N rows then
+//                                          aborted at row X due to kernel
+//                                          err E"; without it the two
+//                                          journal streams are bit-for-
+//                                          bit identical.  Same best-
+//                                          effort discipline as
+//                                          ELVJ_ERR_REVOKE_CASCADE_
+//                                          JOURNAL_FAIL: the caller
+//                                          ignores this return -- a
+//                                          missing marker is a thinner
+//                                          audit trail, not a live
+//                                          over-grant.
 
 module ElevateClientJournal = structure {
 
@@ -205,6 +228,39 @@ module ElevateClientJournal = structure {
   // or its consumers reserves 5 for anything else.
   pub let ELVJ_EVT_REVOKE_CASCADE : u64 = 5
 
+  // paideia-os/libpdx-elevate#53 (LE.M7 audit-discipline gap): the
+  // once-per-cascade abort marker.  Fires from elevate_client_cap_
+  // revoke_cascade's elcc_rc_cascade_fail branch, immediately BEFORE
+  // that path returns ELCC_ERR_CASCADE_FAIL.  Chosen as 6 -- the
+  // next contiguous body0 slot -- so the five discriminators still
+  // read as a chronological family: REQ, APR, OP, ATTEST, REVOKE_
+  // CASCADE, CASCADE_ABORT.  Without this record, an auditor reading
+  // the journal alone cannot tell "cascade completed cleanly with N
+  // rows revoked" from "cascade partially revoked N rows then aborted
+  // at row X" -- both stream shapes are bit-for-bit identical (N
+  // REVOKE_CASCADE records with no marker after them).
+  //
+  // Body layout differs from its four ELV* siblings above (all of which
+  // put a single row_id-or-similar value in body1): body1 packs BOTH
+  // row identifiers so the record is self-describing without needing
+  // to correlate with preceding REVOKE_CASCADE records by actor +
+  // timestamp -- important because a durable audit record should stand
+  // on its own.  body2 holds the kernel error code that triggered the
+  // abort (the return of elevate_channel_cap_revoke that was neither
+  // ELVC_OK nor ELVC_REVOKE_ALREADY -- typically ELVC_ERR_BAD_SLOT or
+  // similar in the 0xFFFFEC0* band), so an auditor can classify the
+  // failure without a separate error map.
+  //
+  //   body0 = ELVJ_EVT_CASCADE_ABORT (6)
+  //   body1 = (cascade_root_row_id << 32) | failing_row_id
+  //           -- both row_ids fit in the low 4 bits (< ELCC_MAX_ROWS
+  //              == 16), so 32-bit halves are massive overkill and
+  //              leave room for a future audit consumer to widen
+  //              either half without a schema break.
+  //   body2 = kernel_err_code (the raw elevate_channel_cap_revoke
+  //           return that triggered the abort)
+  pub let ELVJ_EVT_CASCADE_ABORT : u64 = 6
+
   // ---- Result codes / error band 0xFFFFEA40..0xFFFFEA4F ----
 
   pub let ELVJ_OK                      : u64 = 0
@@ -214,6 +270,7 @@ module ElevateClientJournal = structure {
   pub let ELVJ_ERR_OP_JOURNAL_FAIL     : u64 = 0xFFFFEA43
   pub let ELVJ_ERR_ATTEST_JOURNAL_FAIL : u64 = 0xFFFFEA44
   pub let ELVJ_ERR_REVOKE_CASCADE_JOURNAL_FAIL : u64 = 0xFFFFEA45
+  pub let ELVJ_ERR_CASCADE_ABORT_JOURNAL_FAIL  : u64 = 0xFFFFEA46
 
   // Threshold used to discriminate uej_append return (seq | UEJ_ERR_*)
   // from a valid seq.  UEJ_MAX_RECORDS = 256 per user_events_journal.
@@ -245,8 +302,22 @@ module ElevateClientJournal = structure {
   //                   slot was never read or written before this wave.
   //   10 revoke_cascade_fails
   //                   uej_append refused a REVOKE_CASCADE record
+  //   11 cascade_abort_writes
+  //                   successful CASCADE_ABORT marker appends
+  //                   (paideia-os/libpdx-elevate#53) -- one per aborted
+  //                   cascade at most; a healthy audit stream shows
+  //                   this counter <= revoke_cascade_writes / N with a
+  //                   HARD zero in the audit-clean case.
+  //   12 cascade_abort_fails
+  //                   uej_append refused a CASCADE_ABORT record.  The
+  //                   caller (revoke_cascade's elcc_rc_cascade_fail
+  //                   branch) treats this as best-effort and does NOT
+  //                   surface the failure -- same discipline as the
+  //                   per-row REVOKE_CASCADE record above -- but the
+  //                   counter is here so a health probe can spot a
+  //                   journal that is silently dropping abort markers.
 
-  pub let mut _elevate_client_journal_stats : [u64; 11] = uninit @align(64)
+  pub let mut _elevate_client_journal_stats : [u64; 13] = uninit @align(64)
 
   pub let ELVJ_ST_REQ_WRITES    : u64 = 0
   pub let ELVJ_ST_APR_WRITES    : u64 = 1
@@ -259,7 +330,9 @@ module ElevateClientJournal = structure {
   pub let ELVJ_ST_ATTEST_FAILS  : u64 = 8
   pub let ELVJ_ST_REVOKE_CASCADE_WRITES : u64 = 9   // LE.M7-001 (#35)
   pub let ELVJ_ST_REVOKE_CASCADE_FAILS  : u64 = 10  // LE.M7-001 (#35)
-  pub let ELVJ_ST_MAX           : u64 = 11
+  pub let ELVJ_ST_CASCADE_ABORT_WRITES  : u64 = 11  // #53
+  pub let ELVJ_ST_CASCADE_ABORT_FAILS   : u64 = 12  // #53
+  pub let ELVJ_ST_MAX           : u64 = 13
 
   // ==========================================================================
   // libpdx-audit mirror plumbing (LE.M2-002, libpdx-elevate#38)
@@ -368,7 +441,7 @@ module ElevateClientJournal = structure {
   pub let elevate_client_journal_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M3-001 (#6), extended to 10 slots at LE.M5-001 (#31) for the ATTEST write/fail counters, extended again to 11 at LE.M7-001 (#35) for the REVOKE_CASCADE write counter: clear the journal stats table. Boot / teardown discipline; a live counter reset would race any concurrent journal_req / journal_apr call. Leaf; single loop. Labels prefixed elcj_rs_.",
+      justification: "libpdx-elevate.M3-001 (#6), extended to 10 slots at LE.M5-001 (#31) for the ATTEST write/fail counters, extended again to 11 at LE.M7-001 (#35) for the REVOKE_CASCADE write counter, extended again to 13 at #53 for the CASCADE_ABORT write/fail counters: clear the journal stats table. Boot / teardown discipline; a live counter reset would race any concurrent journal_req / journal_apr call. Leaf; single loop. Labels prefixed elcj_rs_.",
       block: {
         lea r10, [rip + _elevate_client_journal_stats];
         xor rax, rax;
@@ -376,7 +449,7 @@ module ElevateClientJournal = structure {
       elcj_rs_loop:
         mov [r10 + rcx * 8], rax;
         add rcx, 1;
-        cmp rcx, 11;
+        cmp rcx, 13;
         jb  elcj_rs_loop;
         ret
       }
@@ -385,9 +458,9 @@ module ElevateClientJournal = structure {
   pub let elevate_client_journal_note : (u64) -> () !{mem} @{} =
     fn (which: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M3-001 (#6), bound widened 8->10 at LE.M5-001 (#31), widened again 10->11 at LE.M7-001 (#35): bounded increment; out-of-range which is a no-op. Same shape as elevate_client_note (elevate_client.pdx L127). Labels prefixed elcj_nt_.",
+      justification: "libpdx-elevate.M3-001 (#6), bound widened 8->10 at LE.M5-001 (#31), widened again 10->11 at LE.M7-001 (#35), widened again 11->13 at #53: bounded increment; out-of-range which is a no-op. Same shape as elevate_client_note (elevate_client.pdx L127). Labels prefixed elcj_nt_.",
       block: {
-        cmp rdi, 11;
+        cmp rdi, 13;
         jae elcj_nt_out;
         lea r10, [rip + _elevate_client_journal_stats];
         mov rax, [r10 + rdi * 8];
@@ -401,9 +474,9 @@ module ElevateClientJournal = structure {
   pub let elevate_client_journal_stat : (u64) -> u64 !{mem} @{} =
     fn (which: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M3-001 (#6), bound widened 8->10 at LE.M5-001 (#31), widened again 10->11 at LE.M7-001 (#35): bounded read; out-of-range which returns 0 (0 is the correct answer for both 'never touched' and 'out of range' -- same convention as elevate_client_stat). Labels prefixed elcj_st_.",
+      justification: "libpdx-elevate.M3-001 (#6), bound widened 8->10 at LE.M5-001 (#31), widened again 10->11 at LE.M7-001 (#35), widened again 11->13 at #53: bounded read; out-of-range which returns 0 (0 is the correct answer for both 'never touched' and 'out of range' -- same convention as elevate_client_stat). Labels prefixed elcj_st_.",
       block: {
-        cmp rdi, 11;
+        cmp rdi, 13;
         jae elcj_st_zero;
         lea r10, [rip + _elevate_client_journal_stats];
         mov rax, [r10 + rdi * 8];
@@ -901,6 +974,117 @@ module ElevateClientJournal = structure {
         ret;
 
       elcj_rc_bad_actor:
+        mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
+        call elevate_client_journal_note;
+        mov rax, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_journal_cascade_abort(actor_fp_lo, packed_rows,
+  //                                      kernel_err_code)
+  //   -> seq | ELVJ_ERR_*
+  //
+  // paideia-os/libpdx-elevate#53.  Append the once-per-cascade abort
+  // marker.  Fires exactly once from elevate_client_cap_revoke_
+  // cascade's elcc_rc_cascade_fail branch, right before that path
+  // returns ELCC_ERR_CASCADE_FAIL to its caller.  Without this record,
+  // an audit consumer sees N REVOKE_CASCADE rows and cannot tell "the
+  // cascade completed with N revokes" from "the cascade partially
+  // revoked N rows and then aborted at row N+1 due to kernel err E" --
+  // both streams are bit-for-bit identical.
+  //
+  // ARGUMENTS
+  //   actor_fp_lo       -- same value the per-row REVOKE_CASCADE
+  //                        records carried, so the abort marker
+  //                        correlates with them at the actor level
+  //                        even without body-content matching.
+  //   packed_rows       -- (cascade_root_row_id << 32) | failing_row_id
+  //                        Both row_ids are < ELCC_MAX_ROWS (16) so
+  //                        they fit in the low 4 bits of each 32-bit
+  //                        half; the wide packing leaves room for a
+  //                        future audit consumer to widen either half
+  //                        without a schema break.  The caller
+  //                        (revoke_cascade) computes this packing
+  //                        because both values are already live in
+  //                        callee-save registers at the fail site
+  //                        (r14, r15) and doing the pack there costs
+  //                        two instructions we'd otherwise have to
+  //                        pay for on every abort in this function.
+  //   kernel_err_code   -- the raw elevate_channel_cap_revoke return
+  //                        that triggered the abort (neither ELVC_OK
+  //                        nor ELVC_REVOKE_ALREADY -- typically
+  //                        something in the kernel's 0xFFFFEC0* band
+  //                        like ELVC_ERR_BAD_SLOT).  Preserved as-is,
+  //                        not normalised, so an auditor tracing a
+  //                        kernel-side regression can grep for the
+  //                        specific code without reverse-mapping.
+  //
+  // Shape mirrors journal_revoke_cascade exactly -- three callee-save
+  // pushes (r12 = actor, r13 = packed_rows, r14 = kernel_err_code)
+  // and the same actor_fp_lo != 0 gate.  Same best-effort discipline
+  // (caller ignores the return; a failed marker degrades to a thinner
+  // audit trail, not a live over-grant), same failure normalisation to
+  // one client-band code + counter bump.
+  //
+  // Register plan / alignment: identical to journal_revoke_cascade --
+  // three callee-save pushes = 24 bytes; entry rsp%16==8 -> (8-24) mod
+  // 16 == 0, no pad needed for the uej_append CALL.
+  // ==========================================================================
+
+  pub let elevate_client_journal_cascade_abort : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (actor_fp_lo: u64) (packed_rows: u64) (kernel_err_code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate #53 (LE.M7 audit-discipline gap): append the once-per-cascade CASCADE_ABORT marker so an auditor can distinguish 'cascade completed cleanly' from 'cascade partially revoked then aborted'. Shape mirrors elevate_client_journal_revoke_cascade -- see that function's justification for the alignment / gate reasoning; the only differences are body0 = ELVJ_EVT_CASCADE_ABORT (6) and body1/body2 = (packed_rows, kernel_err_code) where packed_rows = (cascade_root_row_id << 32) | failing_row_id (both row_ids fit in 4 bits so the packing is safe with generous room for future widening). The caller (revoke_cascade's elcc_rc_cascade_fail branch) does the pack because both values are already live in r14/r15 at the fail site. Failure normalises to ELVJ_ERR_CASCADE_ABORT_JOURNAL_FAIL and bumps ELVJ_ST_CASCADE_ABORT_FAILS; success bumps ELVJ_ST_CASCADE_ABORT_WRITES. Same best-effort discipline as journal_revoke_cascade -- caller ignores the return (see that function's AUDIT + ACTOR section in elevate_client_cap.pdx). Labels prefixed elcj_ca_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                    // actor_fp_lo
+        mov r13, rsi;                    // packed_rows
+        mov r14, rdx;                    // kernel_err_code
+
+        cmp r12, 0;
+        je  elcj_ca_bad_actor;
+
+        mov rdi, 5;                      // ELVJ_UEJ_KIND_ELEVATE
+        mov rsi, r12;                    // actor_fp_lo
+        xor rdx, rdx;                    // subject_fp_lo = 0
+        mov rcx, 6;                      // ELVJ_EVT_CASCADE_ABORT
+        mov r8,  r13;                    // packed_rows
+        mov r9,  r14;                    // kernel_err_code
+        call uej_append;
+
+        cmp rax, 256;                    // ELVJ_UEJ_SEQ_MAX
+        jae elcj_ca_fail;
+
+        push rax;
+        sub rsp, 8;
+        mov rdi, 11;                     // ELVJ_ST_CASCADE_ABORT_WRITES
+        call elevate_client_journal_note;
+        add rsp, 8;
+        pop rax;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcj_ca_fail:
+        mov rdi, 12;                     // ELVJ_ST_CASCADE_ABORT_FAILS
+        call elevate_client_journal_note;
+        mov rax, 0xFFFFEA46;             // ELVJ_ERR_CASCADE_ABORT_JOURNAL_FAIL
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcj_ca_bad_actor:
         mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
         call elevate_client_journal_note;
         mov rax, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR
