@@ -17,24 +17,47 @@
 // half lives in elevate_client_retry.pdx (M3-002, #7).
 //
 // =============================================================================
-// LIBPDX-AUDIT.M2 DEPENDENCY
+// LIBPDX-AUDIT ROUTING (LE.M2-002, libpdx-elevate#38)
 // =============================================================================
 //
-// The design at r49-r50-plan.md §5.14 says "journals via libpdx-audit"
-// -- but libpdx-audit is itself an R49-wave library and its M2 has NOT
-// landed at the time of libpdx-elevate.M3.  So this module wires
-// directly to the kernel's user_events_journal (uej_append) using
-// UEJ_KIND_ELEVATE = 5, which is the same append route libpdx-audit.M2
-// will eventually consume for KIND_ELEVATE events.  The two-hop shape
-// (journal_req + journal_apr) matches libpdx-audit's
-// (audit_begin, audit_record_output, audit_commit) triple minus the
-// commit step -- an elevate has no exit_code the way a tool invocation
-// does, so the commit collapses.
+// The design at r49-r50-plan.md §5.14 says "journals via libpdx-audit".
+// libpdx-audit.M2 originally exported only the AuditClient trio
+// (audit_begin / audit_record_output / audit_commit) with effect tail
+// `!{mem, sysreg} @{cap, sched}` -- adopting that trio here would have
+// propagated `sysreg`/`sched` up through every _ex_j / _ex_r / _acquire
+// / _require_j entry point, a v2.0 cap-manifest ripple on every
+// downstream tool.  libpdx-audit#31 unblocked the swap with a thin
+// `!{mem} @{}` leaf, `audit_append_leaf(buf, buf_len, entry_ptr)`,
+// which byte-copies one pre-composed 256-byte `PdxAuditRecord@0.2`
+// record into a caller-owned sink buffer without touching the wire,
+// without consuming a cap, and without a syscall.  Adopting that leaf
+// preserves this module's `!{mem} @{}` effect posture and therefore
+// leaves every downstream caller's effect signature unchanged.
 //
-// When libpdx-audit.M2 lands, replace the direct uej_append calls with
-// the corresponding libpdx-audit entry points; the elevate_client_
-// journal_req / _apr entry points here keep their signatures so the
-// wrapper elevate_client_request_ex_j does not need to change.
+// LE.M2-002 shape.  Each journal-emitting body
+// (elevate_client_journal_req/_apr/_op, elevate_client_cap_attest,
+// elevate_client_journal_revoke_cascade) now composes a
+// `PdxAuditRecord@0.2` in the module-private scratch buffer
+// `_elevate_client_audit_entry`, hands it to `audit_append_leaf` (which
+// mirrors it into the module-private sink slot
+// `_elevate_client_audit_sink`), THEN performs the existing
+// `uej_append(UEJ_KIND_ELEVATE = 5, ...)` kernel-journal write.  The
+// two-step is deliberate: the `audit_append_leaf` call is the "route
+// through libpdx-audit" the M2 mandate requires, and the follow-up
+// `uej_append` remains the durable kernel-visible record that gives
+// this module its `seq | ELVJ_ERR_*` return contract and satisfies
+// LE.M2-002's byte-identical-wire acceptance criterion.  The two paths
+// are independent -- `audit_append_leaf`'s return is intentionally
+// IGNORED (its worst outcome is a silently-overwritten sink slot; the
+// durable `uej_append` return is what gates the caller-visible
+// success/failure code and the audit-first invariant in
+// elevate_client_request_ex_j).  The record layout mirrors the
+// `AUDIT_OFF_*` offset table from libpdx-audit's `audit_record.pdx`:
+// EVENT_KIND = UEJ_KIND_ELEVATE (5), PARENT_ID = actor_fp_lo,
+// OUTPUT_HASH = the ELVJ_EVT_* discriminator, and the first qwords of
+// OP_NAME / OP_ARGS carry the two body words (body1 / body2) that
+// `uej_append` also writes on the wire; the remaining bytes of the
+// 256-byte record are zeroed.
 //
 // =============================================================================
 // RECORD LAYOUT (per uej_append)
@@ -239,6 +262,103 @@ module ElevateClientJournal = structure {
   pub let ELVJ_ST_MAX           : u64 = 11
 
   // ==========================================================================
+  // libpdx-audit mirror plumbing (LE.M2-002, libpdx-elevate#38)
+  //
+  // Two module-private .bss slots plus a shared staging helper.  Both
+  // slots are 8-byte-aligned per libpdx-audit's `audit_append_leaf`
+  // caller-obligation (audit_client.pdx L631-L638).  The sink slot is a
+  // single-record buffer -- successive calls overwrite it -- because
+  // this module's durable audit record is the follow-up `uej_append`
+  // write, not the mirror.  A future consolidation that promotes the
+  // mirror to the primary path can widen the sink to a rolling ring and
+  // add a flush-to-svc.audit-journal transport; that widening lives
+  // outside LE.M2-002.
+  //
+  // AUDIT_OFF_* offsets mirrored from libpdx-audit's audit_record.pdx
+  // @0.2 layout (kept as file-local constants rather than re-exported
+  // to avoid coupling libpdx-elevate's public surface to libpdx-audit's
+  // internal offsets; if audit_record.pdx retargets the layout the swap
+  // is a local edit here, not a downstream break).
+  //
+  //   AUDIT_OFF_AUDIT_ID        =   0   -- unused by the mirror (kept 0;
+  //                                        seq numbering lives on the
+  //                                        uej_append side)
+  //   AUDIT_OFF_EVENT_KIND      =   8   -- UEJ_KIND_ELEVATE (5)
+  //   AUDIT_OFF_EXIT_CODE       =  16   -- unused (kept 0)
+  //   AUDIT_OFF_PARENT_ID       =  24   -- actor_fp_lo
+  //   AUDIT_OFF_OUTPUT_HASH     =  32   -- ELVJ_EVT_* discriminator
+  //   AUDIT_OFF_OP_NAME         =  40   -- body1 in first qword, 24 bytes
+  //                                        zeroed tail
+  //   AUDIT_OFF_OP_ARGS         =  72   -- body2 in first qword, 120 bytes
+  //                                        zeroed tail
+  //   AUDIT_OFF_OUTPUT_SCHEMA   = 200   -- zeroed (32 bytes)
+  //   AUDIT_OFF_RESERVED        = 232   -- zeroed (24 bytes)
+
+  pub let mut _elevate_client_audit_entry : [u8; 256] = uninit @align(8)
+  pub let mut _elevate_client_audit_sink  : [u8; 256] = uninit @align(8)
+
+  // ==========================================================================
+  // _elevate_client_audit_stage(actor_fp_lo, body0_disc, body1, body2) -> ()
+  //
+  // Shared staging helper: compose a 256-byte PdxAuditRecord@0.2 in
+  // `_elevate_client_audit_entry`, then hand it to `audit_append_leaf`
+  // which byte-copies it into `_elevate_client_audit_sink`.  Return is
+  // ignored -- the sink write is a best-effort mirror; the durable
+  // record is the `uej_append` call the caller performs immediately
+  // after this helper returns.
+  //
+  // Called from elevate_client_journal_req / _apr / _op /
+  // cap_attest / journal_revoke_cascade at the same alignment point:
+  // three callee-save pushes have just happened (rsp%16 == 0) so this
+  // helper's CALL sees rsp%16 == 8; the helper's own `sub rsp, 8` pad
+  // restores rsp%16 == 0 for the nested `audit_append_leaf` CALL, then
+  // adds it back before ret.  No callee-save touched here (r10/r11/rax
+  // are all caller-save; the caller has already stashed the values it
+  // needs to survive the helper into r12/r13/r14 before invoking).
+  //
+  // Args (SysV): rdi=actor_fp_lo, rsi=body0_disc, rdx=body1, rcx=body2.
+  // All four are captured into the entry buffer BEFORE the argument
+  // registers are clobbered for the `audit_append_leaf` call
+  // (audit_append_leaf takes rdi=buf, rsi=buf_len, rdx=entry_ptr).
+  // ==========================================================================
+
+  pub let _elevate_client_audit_stage : (u64, u64, u64, u64) -> () !{mem} @{} =
+    fn (actor_fp_lo: u64) (body0_disc: u64) (body1: u64) (body2: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.LE.M2-002 (#38): shared staging helper that composes a 256-byte PdxAuditRecord@0.2 in _elevate_client_audit_entry then invokes libpdx-audit's audit_append_leaf to byte-copy it into _elevate_client_audit_sink. Kept private-by-convention (leading underscore) rather than a bare `let` because the entire module's declarations use `pub let`; downstream tools should NOT call this directly -- the five audit-emitting bodies below are the intended call sites. Alignment: every caller invokes this at rsp%16 == 0 (post three callee-save pushes, before any pad), so entry rsp%16 == 8; `sub rsp, 8` restores 0 for the nested audit_append_leaf CALL, `add rsp, 8` pre-ret. Register plan: rdi/rsi/rdx/rcx carry the four semantic fields on entry and are stored into the entry buffer BEFORE rdi/rsi/rdx are re-loaded for the audit_append_leaf call (audit_append_leaf takes rdi=buf, rsi=buf_len, rdx=entry_ptr). r10 holds &_elevate_client_audit_entry across the whole body; r11 is the zero-loop counter (0..32). No callee-save touched. rax is caller-save, used only as the zero source for the fill loop. Return from audit_append_leaf is IGNORED -- AUDIT_ERR_BUFFER_FULL cannot fire here because sink capacity (256) equals AUDIT_PAYLOAD_BYTES exactly, so the failure branch is unreachable by construction; a future rolling-sink variant would need to observe the return. Effects `!{mem} @{}` -- pure in-memory composition + audit_append_leaf's own !{mem} @{} leaf; no syscall, no cap. Immediates: 32 (zero-loop iteration count), 8 (per-iteration qword advance), 5 (UEJ_KIND_ELEVATE mirrored to AUDIT_OFF_EVENT_KIND), 256 (audit_append_leaf buf_len), and the AUDIT_OFF_* byte offsets (8/24/32/40/72) -- all within the imm32-sign-extended range. Constants staged to r11 before store since paideia-as `mov [mem], imm` is not the codebase convention -- every existing memory write in this module (see elevate_client_policy.pdx L322+) routes through a register. Labels prefixed elcs_ (elcs_zero_loop) so a future paideia-as file-scope label uniqueness pass keeps this helper's labels disjoint from every other function's elcj_/elcq_/elca_/elcc_ family.",
+      block: {
+        sub rsp, 8;                              // align for audit_append_leaf CALL
+
+        // ---- Zero the 256-byte entry scratch (32 qwords). ----
+        lea r10, [rip + _elevate_client_audit_entry];
+        xor rax, rax;
+        xor r11, r11;
+      elcs_zero_loop:
+        mov [r10 + r11 * 8], rax;
+        add r11, 1;
+        cmp r11, 32;
+        jb  elcs_zero_loop;
+
+        // ---- Populate the AUDIT_OFF_* fields the mirror carries. ----
+        mov r11, 5;                              // UEJ_KIND_ELEVATE
+        mov [r10 + 8],  r11;                     // AUDIT_OFF_EVENT_KIND
+        mov [r10 + 24], rdi;                     // AUDIT_OFF_PARENT_ID   = actor_fp_lo
+        mov [r10 + 32], rsi;                     // AUDIT_OFF_OUTPUT_HASH = body0 discriminator
+        mov [r10 + 40], rdx;                     // AUDIT_OFF_OP_NAME[0]  = body1
+        mov [r10 + 72], rcx;                     // AUDIT_OFF_OP_ARGS[0]  = body2
+
+        // ---- Call audit_append_leaf(sink, 256, entry). Return ignored. ----
+        lea rdi, [rip + _elevate_client_audit_sink];
+        mov rsi, 256;
+        mov rdx, r10;                            // entry_ptr (already in r10)
+        call audit_append_leaf;
+
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
   // elevate_client_journal_reset() -> ()
   //
   // Scrub the stats table.  Boot / teardown only.  Same shape as
@@ -322,7 +442,7 @@ module ElevateClientJournal = structure {
   pub let elevate_client_journal_req : (u64, u64, u64) -> u64 !{mem} @{} =
     fn (actor_fp_lo: u64) (caps: u64) (dur_ns: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M3-001 (#6): append a REQ audit record. Three callee-save pushes (r12=actor, r13=caps, r14=dur) = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0 so uej_append CALL sees aligned rsp -- no additional pad required. Gate order matches uej_append's own: actor_fp_lo != 0 first (an audit record with no actor is not verifiable, refuse rather than corrupt the audit trail with an anonymous entry). ELVJ_UEJ_KIND_ELEVATE (5) matches user_events_journal.pdx UEJ_KIND_ELEVATE. body0 = ELVJ_EVT_REQ (1) as the record discriminator; body1 = caps; body2 = dur_ns. Kernel returns seq (< 256) on OK or UEJ_ERR_* (0xFFFFE5A[B-F]) on refusal; we discriminate via `cmp rax, 256` (256 fits imm32, no staging) and collapse any failure to ELVJ_ERR_REQ_JOURNAL_FAIL -- the specific UEJ_ERR_* is observable via ELVJ_ST_REQ_FAILS on the stats table. On success we bump ELVJ_ST_REQ_WRITES via elevate_client_journal_note. Labels prefixed elcj_jr_.",
+      justification: "libpdx-elevate.M3-001 (#6), extended at LE.M2-002 (#38) to route the record through libpdx-audit's audit_append_leaf leaf before the durable uej_append call: append a REQ audit record. Three callee-save pushes (r12=actor, r13=caps, r14=dur) = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0 so BOTH the LE.M2-002 mirror CALL (_elevate_client_audit_stage) AND the follow-up uej_append CALL see aligned rsp -- no additional pad required. The stage helper itself handles its own inner alignment for the nested audit_append_leaf call. Gate order matches uej_append's own: actor_fp_lo != 0 first (an audit record with no actor is not verifiable, refuse rather than corrupt the audit trail with an anonymous entry) -- the mirror is skipped on the bad-actor path for the same reason. ELVJ_UEJ_KIND_ELEVATE (5) matches user_events_journal.pdx UEJ_KIND_ELEVATE. body0 = ELVJ_EVT_REQ (1) as the record discriminator; body1 = caps; body2 = dur_ns -- the mirror carries the same three values into the PdxAuditRecord's AUDIT_OFF_OUTPUT_HASH / OP_NAME / OP_ARGS slots (see _elevate_client_audit_stage). Kernel returns seq (< 256) on OK or UEJ_ERR_* (0xFFFFE5A[B-F]) on refusal; we discriminate via `cmp rax, 256` (256 fits imm32, no staging) and collapse any failure to ELVJ_ERR_REQ_JOURNAL_FAIL -- the specific UEJ_ERR_* is observable via ELVJ_ST_REQ_FAILS on the stats table. On success we bump ELVJ_ST_REQ_WRITES via elevate_client_journal_note. The mirror return is intentionally ignored: sink capacity == AUDIT_PAYLOAD_BYTES so AUDIT_ERR_BUFFER_FULL cannot fire, and even if a future rolling-sink variant surfaces a real refusal, the durable uej_append below is what feeds this function's caller-visible seq/error return contract. Labels prefixed elcj_jr_.",
       block: {
         push r12;
         push r13;
@@ -335,6 +455,14 @@ module ElevateClientJournal = structure {
         // Gate: actor_fp_lo != 0.
         cmp r12, 0;
         je  elcj_jr_bad_actor;
+
+        // ---- LE.M2-002: mirror through libpdx-audit BEFORE the durable
+        //      uej_append below. Best-effort; return ignored. ---------------
+        mov rdi, r12;                    // actor_fp_lo
+        mov rsi, 1;                      // body0 = ELVJ_EVT_REQ
+        mov rdx, r13;                    // body1 = caps
+        mov rcx, r14;                    // body2 = dur_ns
+        call _elevate_client_audit_stage;
 
         // uej_append(kind=5, actor, subject=0, body0=ELVJ_EVT_REQ,
         //            body1=caps, body2=dur_ns)
@@ -408,7 +536,7 @@ module ElevateClientJournal = structure {
   pub let elevate_client_journal_apr : (u64, u64, u64) -> u64 !{mem} @{} =
     fn (actor_fp_lo: u64) (granted_caps: u64) (expire_ns: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M3-001 (#6): append an APR audit record. Shape mirrors elevate_client_journal_req -- see that function's justification for the alignment / gate reasoning. Differences: body0 = ELVJ_EVT_APR (2); body1/body2 are (granted_caps, expire_ns) rather than (caps, dur_ns). Failure normalisation collapses UEJ_ERR_* to ELVJ_ERR_APR_JOURNAL_FAIL and bumps ELVJ_ST_APR_FAILS. Success bumps ELVJ_ST_APR_WRITES. Labels prefixed elcj_ja_.",
+      justification: "libpdx-elevate.M3-001 (#6), extended at LE.M2-002 (#38) with the same libpdx-audit mirror the REQ path carries: append an APR audit record. Shape mirrors elevate_client_journal_req -- see that function's justification for the alignment / gate / mirror reasoning. Differences: body0 = ELVJ_EVT_APR (2); body1/body2 are (granted_caps, expire_ns) rather than (caps, dur_ns) -- the mirror carries the same three values into the PdxAuditRecord fields. Failure normalisation collapses UEJ_ERR_* to ELVJ_ERR_APR_JOURNAL_FAIL and bumps ELVJ_ST_APR_FAILS. Success bumps ELVJ_ST_APR_WRITES. Labels prefixed elcj_ja_.",
       block: {
         push r12;
         push r13;
@@ -420,6 +548,13 @@ module ElevateClientJournal = structure {
 
         cmp r12, 0;
         je  elcj_ja_bad_actor;
+
+        // ---- LE.M2-002: mirror through libpdx-audit. --------------------
+        mov rdi, r12;                    // actor_fp_lo
+        mov rsi, 2;                      // body0 = ELVJ_EVT_APR
+        mov rdx, r13;                    // body1 = granted_caps
+        mov rcx, r14;                    // body2 = expire_ns
+        call _elevate_client_audit_stage;
 
         mov rdi, 5;                      // ELVJ_UEJ_KIND_ELEVATE
         mov rsi, r12;                    // actor_fp_lo
@@ -494,7 +629,7 @@ module ElevateClientJournal = structure {
   pub let elevate_client_journal_op : (u64, u64, u64) -> u64 !{mem} @{} =
     fn (actor_fp_lo: u64) (row_id: u64) (needed_caps: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.ENH-004 (#16): append a per-op audit record so grant amplification (1 REQ/APR pair, N mutating uses) is legible to an auditor. Shape mirrors elevate_client_journal_req -- see that function's justification for the alignment / gate reasoning; the only differences are body0 = ELVJ_EVT_OP (3) and body1/body2 = (row_id, needed_caps) rather than (caps, dur_ns). Failure normalises to ELVJ_ERR_OP_JOURNAL_FAIL and bumps ELVJ_ST_OP_FAILS; success bumps ELVJ_ST_OP_WRITES. Labels prefixed elcj_jo_.",
+      justification: "libpdx-elevate.ENH-004 (#16), extended at LE.M2-002 (#38) with the same libpdx-audit mirror the REQ/APR paths carry: append a per-op audit record so grant amplification (1 REQ/APR pair, N mutating uses) is legible to an auditor. Shape mirrors elevate_client_journal_req -- see that function's justification for the alignment / gate / mirror reasoning; the only differences are body0 = ELVJ_EVT_OP (3) and body1/body2 = (row_id, needed_caps) rather than (caps, dur_ns). Failure normalises to ELVJ_ERR_OP_JOURNAL_FAIL and bumps ELVJ_ST_OP_FAILS; success bumps ELVJ_ST_OP_WRITES. Labels prefixed elcj_jo_.",
       block: {
         push r12;
         push r13;
@@ -506,6 +641,13 @@ module ElevateClientJournal = structure {
 
         cmp r12, 0;
         je  elcj_jo_bad_actor;
+
+        // ---- LE.M2-002: mirror through libpdx-audit. --------------------
+        mov rdi, r12;                    // actor_fp_lo
+        mov rsi, 3;                      // body0 = ELVJ_EVT_OP
+        mov rdx, r13;                    // body1 = row_id
+        mov rcx, r14;                    // body2 = needed_caps
+        call _elevate_client_audit_stage;
 
         mov rdi, 5;                      // ELVJ_UEJ_KIND_ELEVATE
         mov rsi, r12;                    // actor_fp_lo
@@ -598,7 +740,7 @@ module ElevateClientJournal = structure {
   pub let elevate_client_cap_attest : (u64, u64, u64) -> u64 !{mem} @{} =
     fn (row_id: u64) (actor_fp_lo: u64) (reason_fp_lo: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.LE.M5-001 (#31): append an ATTEST audit record and stamp the row's shadow last_audit_seq/last_audit_kind. Three callee-save pushes (r12=row_id, r13=actor_fp_lo, r14=reason_fp_lo) = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0 so uej_append's CALL sees aligned rsp, matching journal_req/journal_apr/journal_op. Gate order: actor_fp_lo != 0 first, same as the three siblings. body0 = ELVJ_EVT_ATTEST (4); body1 = actor_fp_lo (so an auditor reading only the journal, without row_id context, still learns who attested); body2 = reason_fp_lo. On success the returned seq is pushed once and the stack padded by 8 (rsp%16==0 across the two follow-on calls), then read back via [rsp+8] as the `seq` argument to elevate_client_cap_bind_last_audit (row_id, seq, kind=4) -- that call's return is deliberately ignored (best-effort row stamp; the journal record itself is the durable fact and cannot be un-appended if the row_id happens to be stale or out of range). ELVJ_ST_ATTEST_WRITES is bumped after the stamp attempt, still inside the same aligned window, before the stashed seq is restored into rax. Labels prefixed elcj_at_.",
+      justification: "libpdx-elevate.LE.M5-001 (#31), extended at LE.M2-002 (#38) with the same libpdx-audit mirror the REQ/APR/OP paths carry: append an ATTEST audit record and stamp the row's shadow last_audit_seq/last_audit_kind. Three callee-save pushes (r12=row_id, r13=actor_fp_lo, r14=reason_fp_lo) = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0 so BOTH the mirror CALL (_elevate_client_audit_stage) AND the follow-up uej_append CALL see aligned rsp, matching journal_req/journal_apr/journal_op. Gate order: actor_fp_lo != 0 first, same as the three siblings; the mirror is skipped on the bad-actor path. body0 = ELVJ_EVT_ATTEST (4); body1 = actor_fp_lo (so an auditor reading only the journal, without row_id context, still learns who attested) -- the mirror carries the same actor duplication in its AUDIT_OFF_OP_NAME slot; body2 = reason_fp_lo. On success the uej_append seq is pushed once and the stack padded by 8 (rsp%16==0 across the two follow-on calls), then read back via [rsp+8] as the `seq` argument to elevate_client_cap_bind_last_audit (row_id, seq, kind=4) -- that call's return is deliberately ignored (best-effort row stamp; the journal record itself is the durable fact and cannot be un-appended if the row_id happens to be stale or out of range). ELVJ_ST_ATTEST_WRITES is bumped after the stamp attempt, still inside the same aligned window, before the stashed seq is restored into rax. Labels prefixed elcj_at_.",
       block: {
         push r12;
         push r13;
@@ -611,6 +753,15 @@ module ElevateClientJournal = structure {
         // Gate: actor_fp_lo != 0.
         cmp r13, 0;
         je  elcj_at_bad_actor;
+
+        // ---- LE.M2-002: mirror through libpdx-audit. body1 duplicates
+        //      actor_fp_lo (mirroring the uej_append call below), so an
+        //      auditor reading only the mirror still learns who attested. --
+        mov rdi, r13;                    // actor_fp_lo
+        mov rsi, 4;                      // body0 = ELVJ_EVT_ATTEST
+        mov rdx, r13;                    // body1 = actor_fp_lo
+        mov rcx, r14;                    // body2 = reason_fp_lo
+        call _elevate_client_audit_stage;
 
         // uej_append(kind=5, actor=actor_fp_lo, subject=0,
         //            body0=ELVJ_EVT_ATTEST, body1=actor_fp_lo,
@@ -697,7 +848,7 @@ module ElevateClientJournal = structure {
   pub let elevate_client_journal_revoke_cascade : (u64, u64, u64) -> u64 !{mem} @{} =
     fn (actor_fp_lo: u64) (row_id: u64) (cascade_root_row_id: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.LE.M7-001 (#35): append a per-row revoke-cascade audit record. Shape mirrors elevate_client_journal_op -- see that function's justification for the alignment / gate reasoning; the only differences are body0 = ELVJ_EVT_REVOKE_CASCADE (5) and body1/body2 = (row_id, cascade_root_row_id) rather than (row_id, needed_caps). Failure normalises to ELVJ_ERR_REVOKE_CASCADE_JOURNAL_FAIL and bumps ELVJ_ST_REVOKE_CASCADE_FAILS; success bumps ELVJ_ST_REVOKE_CASCADE_WRITES. Labels prefixed elcj_rc_.",
+      justification: "libpdx-elevate.LE.M7-001 (#35), extended at LE.M2-002 (#38) with the same libpdx-audit mirror the REQ/APR/OP/ATTEST paths carry: append a per-row revoke-cascade audit record. Shape mirrors elevate_client_journal_op -- see that function's justification for the alignment / gate / mirror reasoning; the only differences are body0 = ELVJ_EVT_REVOKE_CASCADE (5) and body1/body2 = (row_id, cascade_root_row_id) rather than (row_id, needed_caps). Failure normalises to ELVJ_ERR_REVOKE_CASCADE_JOURNAL_FAIL and bumps ELVJ_ST_REVOKE_CASCADE_FAILS; success bumps ELVJ_ST_REVOKE_CASCADE_WRITES. Labels prefixed elcj_rc_.",
       block: {
         push r12;
         push r13;
@@ -709,6 +860,13 @@ module ElevateClientJournal = structure {
 
         cmp r12, 0;
         je  elcj_rc_bad_actor;
+
+        // ---- LE.M2-002: mirror through libpdx-audit. --------------------
+        mov rdi, r12;                    // actor_fp_lo
+        mov rsi, 5;                      // body0 = ELVJ_EVT_REVOKE_CASCADE
+        mov rdx, r13;                    // body1 = row_id
+        mov rcx, r14;                    // body2 = cascade_root_row_id
+        call _elevate_client_audit_stage;
 
         mov rdi, 5;                      // ELVJ_UEJ_KIND_ELEVATE
         mov rsi, r12;                    // actor_fp_lo
