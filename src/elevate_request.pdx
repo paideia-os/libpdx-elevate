@@ -66,6 +66,9 @@
 // ERROR BAND 0xFFFFE5E0..0xFFFFE5EF (shared with kernel ElevateChannel)
 // =============================================================================
 //
+//   0xFFFFE5E9  ELV_ERR_DUR_EXCEEDS_CEILING (NEW LE.M4-001 -- client-side:
+//                                           dur > per-cap-mask ceiling for
+//                                           at least one bit set in caps)
 //   0xFFFFE5EA  ELV_ERR_BAD_BUF   (NEW -- client-side: buf pointer null)
 //   0xFFFFE5EB  ELV_ERR_BAD_GRANT (kernel: approver invariant violated)
 //   0xFFFFE5EC  ELV_ERR_BAD_RSV   (kernel: reserved-bit set)
@@ -73,9 +76,33 @@
 //   0xFFFFE5EE  ELV_ERR_BAD_MASK  (both: reserved-bit set or mask == 0)
 //   0xFFFFE5EF  ELV_ERR_BAD_OP    (kernel: op not in [1,3])
 //
-// Codes 0xFFFFE5E0..0xFFFFE5E9 stay reserved for future client-side
+// Codes 0xFFFFE5E0..0xFFFFE5E8 stay reserved for future client-side
 // errors (see also libpdx-elevate ELVC_* band in elevate_client.pdx,
 // which occupies 0xFFFFEA00..0xFFFFEA0F).
+//
+// =============================================================================
+// LE.M4-001: PER-CAP-MASK DURATION CEILINGS
+// =============================================================================
+//
+// The legacy `elevate_request_duration_valid` gate applies one flat
+// [1s, 1h] range regardless of which cap bits the REQ names.  Read-only
+// or enumerate-shaped caps are safe at 1h; destructive caps (unlink,
+// mount, /system write) are not.  LE.M4-001 introduces a per-cap-mask
+// ceiling table (_elv_bit_ceiling_ns) and a new validator
+// (elevate_request_duration_valid_for) that returns
+// ELV_ERR_DUR_EXCEEDS_CEILING when the requested duration exceeds the
+// combined mask's ceiling (the min ceiling over every set bit).
+//
+// The packer (elevate_request_pack_op_word) runs the new gate as its
+// third check, immediately after the flat range gate; every callsite
+// that already routes through the packer (including
+// elevate_request_write_frame) inherits ceiling enforcement without a
+// separate wire-in.  The legacy elevate_request_duration_valid entry
+// point stays available for source-compat but is DEPRECATED for
+// pre-packer client-side gating; new callers should use the
+// per-cap-aware validator.
+//
+// Bit-to-ceiling mapping is documented at _elv_bit_ceiling_ns.
 
 module ElevateRequest = structure {
 
@@ -91,13 +118,37 @@ module ElevateRequest = structure {
   pub let ELV_DUR_MIN_NS : u64 = 1000000000            // 1 sec
   pub let ELV_DUR_MAX_NS : u64 = 3600000000000         // 1 hour
 
-  pub let ELV_OK             : u64 = 0
-  pub let ELV_ERR_BAD_BUF    : u64 = 0xFFFFE5EA
-  pub let ELV_ERR_BAD_GRANT  : u64 = 0xFFFFE5EB
-  pub let ELV_ERR_BAD_RSV    : u64 = 0xFFFFE5EC
-  pub let ELV_ERR_BAD_DUR    : u64 = 0xFFFFE5ED
-  pub let ELV_ERR_BAD_MASK   : u64 = 0xFFFFE5EE
-  pub let ELV_ERR_BAD_OP     : u64 = 0xFFFFE5EF
+  pub let ELV_OK                       : u64 = 0
+  pub let ELV_ERR_DUR_EXCEEDS_CEILING  : u64 = 0xFFFFE5E9  // LE.M4-001 (#29)
+  pub let ELV_ERR_BAD_BUF              : u64 = 0xFFFFE5EA
+  pub let ELV_ERR_BAD_GRANT            : u64 = 0xFFFFE5EB
+  pub let ELV_ERR_BAD_RSV              : u64 = 0xFFFFE5EC
+  pub let ELV_ERR_BAD_DUR              : u64 = 0xFFFFE5ED
+  pub let ELV_ERR_BAD_MASK             : u64 = 0xFFFFE5EE
+  pub let ELV_ERR_BAD_OP               : u64 = 0xFFFFE5EF
+
+  // ---- LE.M4-001: per-cap-mask duration ceilings ------------------
+  //
+  // Named ceilings for the five request classes called out in issue
+  // #29's acceptance criteria.  Every value is in nanoseconds so it
+  // can be compared directly against a duration_ns argument without
+  // unit conversion.  Read-only classes (ENUMERATE/READ) share the
+  // 1 h ceiling used by the legacy flat gate; every write-shaped
+  // class shrinks below that.  All five exceed imm32 and MUST be
+  // staged in a register before any compare (`mov r10, <val>; cmp
+  // rdi, r10`), matching the ELV_DUR_MIN_NS / ELV_DUR_MAX_NS
+  // discipline elsewhere in this module.
+  //
+  // These constants are the CATEGORY ceilings; the per-bit ceiling
+  // table (_elv_bit_ceiling_ns) is what the validator walks.  Each
+  // bit in the wire cap mask is classified into one of these five
+  // categories per the mapping documented at the table.
+
+  pub let ELV_CAP_R_ENUMERATE : u64 = 3600000000000        // 1 h
+  pub let ELV_CAP_R_READ      : u64 = 3600000000000        // 1 h
+  pub let ELV_CAP_R_WRITE     : u64 =   60000000000        // 60 s
+  pub let ELV_CAP_R_UNLINK    : u64 =   30000000000        // 30 s
+  pub let ELV_CAP_R_MOUNT     : u64 =   30000000000        // 30 s
 
   // ---- REQ frame layout ----
 
@@ -106,6 +157,55 @@ module ElevateRequest = structure {
   pub let ELEVATE_REQ_OFF_CAPS    : u64 = 8
   pub let ELEVATE_REQ_OFF_DUR     : u64 = 16
   pub let ELEVATE_REQ_OFF_RSV     : u64 = 24
+
+  // ---- LE.M4-001: per-bit ceiling table ---------------------------
+  //
+  // Slot i holds the max duration (ns) tolerated for a REQ that has
+  // bit i of the cap mask set.  The combined ceiling of a mask with
+  // multiple bits set is min(slot_i) over every set bit -- the most
+  // restrictive category wins.  Bits 8..63 are reserved (refused by
+  // elevate_request_cap_mask_valid before this table is ever read),
+  // so only slots 0..7 are meaningful.
+  //
+  // Bit-to-wire-meaning is fixed by
+  // src/kernel/core/ipc/elevate_channel.pdx §2 CAP BITMASK LAYOUT:
+  //
+  //   bit 0  PDXFS_WRITE_PKGS    -> WRITE    60 s
+  //   bit 1  NETWORK_FETCH_PKGS  -> WRITE    60 s   (fetch mutates the
+  //                                                  pkgs-mirror cache)
+  //   bit 2  SIG_VERIFY_ROOT     -> READ     1 h   (pure verify, no
+  //                                                  side effect beyond
+  //                                                  the caller's own
+  //                                                  read of the result)
+  //   bit 3  PDXFS_WRITE_SYSTEM  -> UNLINK   30 s  (/system is the most
+  //                                                  destructive write
+  //                                                  target; issue AC
+  //                                                  §"90 s destructive
+  //                                                  -> refused")
+  //   bit 4  USER_CREATE         -> WRITE    60 s
+  //   bit 5  USER_REVOKE         -> UNLINK   30 s  (user-revoke deletes
+  //                                                  a principal, same
+  //                                                  irreversibility
+  //                                                  class as unlink)
+  //   bit 6  HW_MINT             -> WRITE    60 s  (unknown-category
+  //                                                  default per issue
+  //                                                  AC §"conservative
+  //                                                  = write's 60s")
+  //   bit 7  DRIVER_MINT         -> WRITE    60 s  (same conservative
+  //                                                  default)
+  //
+  // Read-only after link.  Cache-line aligned so the whole table
+  // fits in one 64-byte line for the walk.  Sizeof = 8 * 8 = 64 B.
+
+  pub let _elv_bit_ceiling_ns : [u64; 8] =
+    [ 60000000000,      // bit 0  PDXFS_WRITE_PKGS      WRITE
+      60000000000,      // bit 1  NETWORK_FETCH_PKGS    WRITE
+      3600000000000,    // bit 2  SIG_VERIFY_ROOT       READ
+      30000000000,      // bit 3  PDXFS_WRITE_SYSTEM    UNLINK
+      60000000000,      // bit 4  USER_CREATE           WRITE
+      30000000000,      // bit 5  USER_REVOKE           UNLINK
+      60000000000,      // bit 6  HW_MINT               WRITE (default)
+      60000000000 ]     // bit 7  DRIVER_MINT           WRITE (default)
 
   // ==========================================================================
   // elevate_request_cap_mask_valid(mask) -> 1 | 0
@@ -147,12 +247,20 @@ module ElevateRequest = structure {
   // src/kernel/core/ipc/elevate_channel.pdx:141.  Both endpoints exceed
   // imm32 so they are staged in r10/r11 per the paideia-as compliance
   // discipline (no `cmp reg, imm64`).
+  //
+  // DEPRECATED (LE.M4-001, #29): the flat [1s, 1h] range is too
+  // permissive for destructive caps.  Kept for source-compat -- the
+  // packer still runs this gate as its second check for the specific
+  // ELV_ERR_BAD_DUR return -- but new callers wanting a pre-packer
+  // client-side check SHOULD use elevate_request_duration_valid_for
+  // (which subsumes this gate's semantic for any non-empty cap mask,
+  // since every per-cap ceiling is <= ELV_DUR_MAX_NS by construction).
   // ==========================================================================
 
   pub let elevate_request_duration_valid : (u64) -> u64 !{} @{} =
     fn (dur: u64) -> unsafe {
       effects: {}, capabilities: {},
-      justification: "libpdx-elevate.M1-001 (#1): mirror of kernel elv_dur_valid. Both bounds (1e9 ns and 3.6e12 ns) exceed imm32; staged in r10 / r11 for the compare. Leaf function. Labels prefixed elreq_dv_.",
+      justification: "libpdx-elevate.M1-001 (#1): mirror of kernel elv_dur_valid. Both bounds (1e9 ns and 3.6e12 ns) exceed imm32; staged in r10 / r11 for the compare. Leaf function. Labels prefixed elreq_dv_. DEPRECATED at LE.M4-001 (#29) in favor of elevate_request_duration_valid_for; kept for source-compat + still called by the packer for the ELV_ERR_BAD_DUR specific return.",
       block: {
         mov r10, 1000000000;             // ELV_DUR_MIN_NS
         cmp rdi, r10;
@@ -164,6 +272,86 @@ module ElevateRequest = structure {
         ret;
       elreq_dv_no:
         xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_request_duration_valid_for(caps, dur) -> 1 | ELV_ERR_DUR_EXCEEDS_CEILING
+  //
+  // LE.M4-001 (#29): per-cap-mask duration ceiling gate.  For every
+  // bit set in caps, dur MUST NOT exceed that bit's ceiling in the
+  // _elv_bit_ceiling_ns table.  Equivalently, dur MUST be <= the
+  // combined mask's ceiling, defined as min(_elv_bit_ceiling_ns[i])
+  // over every set bit i.
+  //
+  // Return:
+  //   1                                on pass
+  //   ELV_ERR_DUR_EXCEEDS_CEILING      on fail (dur > combined ceiling)
+  //
+  // This gate does NOT re-validate the flat [1s, 1h] range -- the
+  // packer runs elevate_request_duration_valid first for the
+  // ELV_ERR_BAD_DUR specific return.  It also does NOT re-validate
+  // the cap mask; a caller passing reserved bits (>= bit 8) will
+  // find those bits' ceilings walked as 0 iff the table were 8
+  // slots long past the reserved boundary, but since the loop is
+  // bounded at 8 iterations the reserved bits are simply ignored
+  // here (elevate_request_cap_mask_valid is the layer that refuses
+  // reserved bits, and the packer runs that gate first).
+  //
+  // Semantics on caps == 0: the loop finds no set bits, running_min
+  // stays at ELV_DUR_MAX_NS (1 h), and any dur <= 1 h passes.  This
+  // is not a code path a well-formed caller can reach because
+  // elevate_request_cap_mask_valid refuses mask == 0 before the
+  // packer would call this validator; documented for completeness.
+  //
+  // Register plan: no CALL is issued, no callee-save push needed.
+  // r10 = caps working copy (shifted right by 1 each iter, bit-0
+  // test).  r11 = running_min (initialised to ELV_DUR_MAX_NS =
+  // 3600e9 ns, staged via movabs since it exceeds imm32).  rcx =
+  // table base VA (RIP-relative).  rax = bit index 0..7 (also
+  // doubles as the return-value register at exit).  r8, r9 =
+  // scratch for the per-iter bit test and table load.
+  // Labels prefixed elreq_dvf_.
+  // ==========================================================================
+
+  pub let elevate_request_duration_valid_for : (u64, u64) -> u64 !{} @{} =
+    fn (caps: u64) (dur: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-elevate.LE.M4-001 (#29): per-cap-mask duration ceiling gate. Walk bits 0..7 of caps; for each set bit look up its ceiling in the read-only _elv_bit_ceiling_ns[8] table and keep the running min. Compare dur against the running min; return 1 on pass or ELV_ERR_DUR_EXCEEDS_CEILING (0xFFFFE5E9, LE.M4-001 slot in band 0xFFFFE5E0..EF) on fail. NO nested CALL -> NO callee-save push -> NO alignment pad -> straight-line leaf function. Register plan: r10=caps working copy (shifted right by 1 each iteration so bit-0 test suffices), r11=running_min (initialised via movabs to ELV_DUR_MAX_NS = 3600e9 ns which exceeds imm32), rcx=table base VA via lea [rip + _elv_bit_ceiling_ns], rax=bit index 0..7 (also the return value at exit -- fresh rax write on both exits), r8/r9=per-iter scratch. Loop bound rax < 8 uses `cmp rax, 8` (fits imm32). Per-iter bit-0 test uses `mov r8, r10; and r8, 1; cmp r8, 0; je next` -- the and-imm8 form is safe on r8 (only `and rN, imm64` is refused by the encoder, per repo memory). Table load uses `mov r9, [rcx + rax * 8]` -- the SIB [reg + reg * 8] shape used already at elevate_client.pdx:176/192, elevate_client_require.pdx:164/180, and elsewhere. Running min update: `cmp r9, r11; jae skip; mov r11, r9` keeps the smaller ceiling. Right-shift caps by 1 (`shr r10, 1`) makes the next bit occupy bit 0 for the next iteration; `add rax, 1` walks the table index in parallel. At the exit compare, `cmp rsi, r11` (dur vs running_min); `ja` branches to the exceed exit which stages 0xFFFFE5E9 via `mov rax, 0xFFFFE5E9` -- the value exceeds signed imm32 so the encoder emits movabs (same discipline as `mov rax, 0xFFFFE5EE` in elevate_request_pack_op_word's BAD_MASK exit at L216). Pass exit stages `mov rax, 1`. Both exits `ret` directly (no unwind). This validator is invoked by elevate_request_pack_op_word as its third gate (LE.M4-001 wire-in); no other caller today, but its stability contract matches every other public entry point in this module.",
+      block: {
+        mov r10, rdi;                    // caps working copy
+        mov r11, 3600000000000;          // running_min = ELV_DUR_MAX_NS (1 h)
+        lea rcx, [rip + _elv_bit_ceiling_ns];
+        xor rax, rax;                    // bit index i = 0
+
+      elreq_dvf_loop:
+        cmp rax, 8;
+        jae elreq_dvf_check;
+
+        mov r8, r10;
+        and r8, 1;
+        cmp r8, 0;
+        je  elreq_dvf_next;
+
+        mov r9, [rcx + rax * 8];
+        cmp r9, r11;
+        jae elreq_dvf_next;
+        mov r11, r9;
+
+      elreq_dvf_next:
+        shr r10, 1;
+        add rax, 1;
+        jmp elreq_dvf_loop;
+
+      elreq_dvf_check:
+        cmp rsi, r11;
+        ja  elreq_dvf_exceed;
+        mov rax, 1;
+        ret;
+
+      elreq_dvf_exceed:
+        mov rax, 0xFFFFE5E9;             // ELV_ERR_DUR_EXCEEDS_CEILING
         ret
       }
     }
@@ -185,7 +373,7 @@ module ElevateRequest = structure {
   pub let elevate_request_pack_op_word : (u64, u64) -> u64 !{} @{} =
     fn (caps: u64) (dur: u64) -> unsafe {
       effects: {}, capabilities: {},
-      justification: "libpdx-elevate.M1-001 (#1): mirror of kernel elv_pack_req. Gates: (1) elevate_request_cap_mask_valid -> BAD_MASK. (2) elevate_request_duration_valid -> BAD_DUR. Composition: op | (caps & 0xFF) << 8. Two callee-save pushes (r12, r13) preserve caps + dur across the nested validator calls; r12 = caps, r13 = dur. Two pushes = 16 bytes, keeps rsp%16 stable across the nested calls (same disipline as elevate_broker_register / elev_pack_req). Labels prefixed elreq_po_.",
+      justification: "libpdx-elevate.M1-001 (#1), extended at LE.M4-001 (#29) with a per-cap-mask ceiling gate: mirror of kernel elv_pack_req. Gates: (1) elevate_request_cap_mask_valid -> BAD_MASK. (2) elevate_request_duration_valid -> BAD_DUR (flat [1s, 1h] range). (3) LE.M4-001 elevate_request_duration_valid_for(caps, dur) -> ELV_ERR_DUR_EXCEEDS_CEILING (per-bit ceiling min-wins). Composition: op | (caps & 0xFF) << 8. Two callee-save pushes (r12, r13) preserve caps + dur across the three nested validator calls; r12 = caps, r13 = dur. Two pushes = 16 bytes, keeps rsp%16 stable across every nested call (same discipline as elevate_broker_register / elev_pack_req). The LE.M4-001 gate is the third and final validator call before the op-word composition; the ceiling validator returns 1 on pass or 0xFFFFE5E9 on fail, discriminated via `cmp rax, 1; jne` (fail path takes rax through unchanged since the returned error code is already the value we want to propagate). Because every callsite of elevate_request_write_frame flows through this packer, the ceiling gate propagates transparently -- write_frame's existing `shr rax, 24; jnz` propagation clause treats 0xFFFFE5E9 the same as every other ELV_ERR_* in the 0xFFFF band and returns it unchanged with buf UNMODIFIED. Labels prefixed elreq_po_.",
       block: {
         push r12;
         push r13;
@@ -202,6 +390,18 @@ module ElevateRequest = structure {
         call elevate_request_duration_valid;
         cmp rax, 0;
         je  elreq_po_bad_dur;
+
+        // LE.M4-001 (#29): per-cap-mask ceiling gate.  Returns 1 on
+        // pass or ELV_ERR_DUR_EXCEEDS_CEILING (0xFFFFE5E9) on fail;
+        // the fail-path branch keeps rax unchanged so the returned
+        // error propagates directly to the caller (and, through
+        // elevate_request_write_frame's pack-err propagation, to
+        // any write_frame consumer as well).
+        mov rdi, r12;
+        mov rsi, r13;
+        call elevate_request_duration_valid_for;
+        cmp rax, 1;
+        jne elreq_po_bad_ceiling;
 
         mov rax, 1;                      // ELV_OP_REQ
         mov r10, r12;
@@ -221,6 +421,12 @@ module ElevateRequest = structure {
         mov rax, 0xFFFFE5ED;             // ELV_ERR_BAD_DUR
         pop r13;
         pop r12;
+        ret;
+      elreq_po_bad_ceiling:
+        // rax already carries ELV_ERR_DUR_EXCEEDS_CEILING (0xFFFFE5E9)
+        // from the elevate_request_duration_valid_for return.
+        pop r13;
+        pop r12;
         ret
       }
     }
@@ -236,15 +442,20 @@ module ElevateRequest = structure {
   //   [buf + 24]  reserved   body word 2 -- always 0
   //
   // Return codes:
-  //   ELV_OK           frame written; every field validated.
-  //   ELV_ERR_BAD_BUF  buf is 0 (nullptr) -- the library never writes to 0.
-  //   ELV_ERR_BAD_MASK caps mask invalid; buf UNCHANGED.
-  //   ELV_ERR_BAD_DUR  duration out of range; buf UNCHANGED.
+  //   ELV_OK                        frame written; every field validated.
+  //   ELV_ERR_BAD_BUF               buf is 0 (nullptr) -- the library
+  //                                 never writes to 0.
+  //   ELV_ERR_BAD_MASK              caps mask invalid; buf UNCHANGED.
+  //   ELV_ERR_BAD_DUR               duration out of flat [1s, 1h] range;
+  //                                 buf UNCHANGED.
+  //   ELV_ERR_DUR_EXCEEDS_CEILING   duration exceeds per-cap-mask ceiling
+  //                                 (LE.M4-001, #29); buf UNCHANGED.
   //
   // The discriminator for pack failure vs success: a valid packed op
   // word has bits [63:24] == 0 (op fits in 8 bits + caps mask fits in
   // 16 bits = 24 bits total).  Every ELV_ERR_* code is in the 0xFFFF...
-  // band, so `shr rax, 24; jnz` cleanly discriminates.
+  // band (including LE.M4-001's ELV_ERR_DUR_EXCEEDS_CEILING = 0xFFFFE5E9),
+  // so `shr rax, 24; jnz` cleanly discriminates.
   // ==========================================================================
 
   pub let elevate_request_write_frame : (u64, u64, u64) -> u64 !{mem} @{} =

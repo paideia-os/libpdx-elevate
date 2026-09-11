@@ -43,9 +43,10 @@ REQ-frame builder and the client-side mirrors of the kernel validators.
 | Signature | Purpose |
 | --- | --- |
 | `elevate_request_cap_mask_valid(mask) -> u64 !{} @{}` | `1` iff `mask != 0` and no reserved bits (8..63) set; mirror of kernel `elv_mask_valid`. |
-| `elevate_request_duration_valid(dur) -> u64 !{} @{}` | `1` iff `dur ∈ [1 s, 1 h]`; mirror of kernel `elv_dur_valid`. |
-| `elevate_request_pack_op_word(caps, dur) -> u64 !{} @{}` | Pack `op \| (caps << 8)`; returns `ELV_ERR_BAD_MASK` / `ELV_ERR_BAD_DUR` on gate failure. Mirror of `elv_pack_req`. |
-| `elevate_request_write_frame(buf, caps, dur) -> u64 !{mem} @{}` | Assemble the full 32-byte REQ frame into `buf`. `buf` is left untouched on any error (no partial write). |
+| `elevate_request_duration_valid(dur) -> u64 !{} @{}` | `1` iff `dur ∈ [1 s, 1 h]`; mirror of kernel `elv_dur_valid`. **Deprecated at LE.M4-001 (#29)** for new pre-packer client-side use; kept for source-compat + still called by the packer for the `ELV_ERR_BAD_DUR` specific return. New callers should use `elevate_request_duration_valid_for`. |
+| `elevate_request_duration_valid_for(caps, dur) -> u64 !{} @{}` | **LE.M4-001 (#29).** `1` iff `dur` is `<=` the per-bit ceiling for every set bit in `caps` (combined ceiling = `min(_elv_bit_ceiling_ns[i])` over set bits). Returns `ELV_ERR_DUR_EXCEEDS_CEILING = 0xFFFFE5E9` on refusal. Named category ceilings: `ELV_CAP_R_ENUMERATE` / `_READ` = 1 h, `ELV_CAP_R_WRITE` = 60 s, `ELV_CAP_R_UNLINK` / `_MOUNT` = 30 s. |
+| `elevate_request_pack_op_word(caps, dur) -> u64 !{} @{}` | Pack `op \| (caps << 8)`; three gates in sequence: `cap_mask_valid` → `ELV_ERR_BAD_MASK`, `duration_valid` → `ELV_ERR_BAD_DUR`, `duration_valid_for` → `ELV_ERR_DUR_EXCEEDS_CEILING` (LE.M4-001). Mirror of `elv_pack_req` extended with the ceiling gate. |
+| `elevate_request_write_frame(buf, caps, dur) -> u64 !{mem} @{}` | Assemble the full 32-byte REQ frame into `buf`. `buf` is left untouched on any error (no partial write). Ceiling errors from the packer (LE.M4-001) propagate through the pack-err clause unchanged. |
 
 ### `src/elevate_client.pdx` — module `ElevateClient`
 

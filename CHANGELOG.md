@@ -10,6 +10,94 @@ covers.
 
 ## Unreleased
 
+### #29 — LE.M4-001 per-cap-mask duration ceilings on validator (2026-09-11)
+
+- Named gap: `elevate_request_duration_valid` in
+  `src/elevate_request.pdx` accepted any duration in `[1 s, 1 h]`
+  regardless of the cap mask.  A destructive `/system` write cap was
+  indistinguishable from a read-only `SIG_VERIFY_ROOT` verify at the
+  packer's second gate; both slid through with a 1 h hold.  Per-cap
+  ceilings restore the differentiation without breaking the
+  source-compat surface (the flat validator stays; every existing
+  caller is unaffected until it stops satisfying the tighter gate).
+- New wire constant: `ELV_ERR_DUR_EXCEEDS_CEILING = 0xFFFFE5E9`
+  (LE.M4-001 slot in the shared B1 band 0xFFFFE5E0..EF; the
+  0xFFFFE5E0..0xFFFFE5E8 range that stayed reserved when B1 was
+  documented at M1-001 shrinks to 0xFFFFE5E0..0xFFFFE5E8).
+- New category ceiling constants (values in ns):
+  - `ELV_CAP_R_ENUMERATE = 3_600_000_000_000` (1 h)
+  - `ELV_CAP_R_READ      = 3_600_000_000_000` (1 h)
+  - `ELV_CAP_R_WRITE     =    60_000_000_000` (60 s)
+  - `ELV_CAP_R_UNLINK    =    30_000_000_000` (30 s)
+  - `ELV_CAP_R_MOUNT     =    30_000_000_000` (30 s)
+- New per-bit ceiling table `_elv_bit_ceiling_ns : [u64; 8]`.  Each
+  of the 8 defined cap bits (0..7 per `elevate_channel.pdx §2 CAP
+  BITMASK LAYOUT`) is classified into one of the five categories:
+  - bit 0 PDXFS_WRITE_PKGS -> WRITE (60 s)
+  - bit 1 NETWORK_FETCH_PKGS -> WRITE (60 s; fetch mutates the
+    pkgs-mirror cache -- treated as write-shaped)
+  - bit 2 SIG_VERIFY_ROOT -> READ (1 h; pure verify)
+  - bit 3 PDXFS_WRITE_SYSTEM -> UNLINK (30 s; issue AC "destructive")
+  - bit 4 USER_CREATE -> WRITE (60 s)
+  - bit 5 USER_REVOKE -> UNLINK (30 s; irreversible principal delete)
+  - bit 6 HW_MINT -> WRITE (60 s; unknown-category default per AC)
+  - bit 7 DRIVER_MINT -> WRITE (60 s; unknown-category default per AC)
+- New validator
+  `elevate_request_duration_valid_for(caps, dur) -> u64 !{} @{}`
+  walks bits 0..7 of `caps`; for each set bit it looks up the
+  per-bit ceiling in the read-only `_elv_bit_ceiling_ns` table and
+  keeps a running min.  Returns `1` when `dur <= running_min`, or
+  `ELV_ERR_DUR_EXCEEDS_CEILING` otherwise.  No callee-save push and
+  no alignment pad -- straight-line leaf function; loop uses SIB
+  addressing `[rcx + rax * 8]` for the per-iter table load and
+  right-shifts the caps working copy by 1 each iteration.
+- Packer wire-in: `elevate_request_pack_op_word` now runs three
+  gates in sequence -- (1) `cap_mask_valid` -> BAD_MASK, (2)
+  `duration_valid` -> BAD_DUR (flat range, unchanged), (3)
+  `duration_valid_for` -> DUR_EXCEEDS_CEILING (per-bit ceiling).
+  The two callee-save pushes (r12=caps, r13=dur) already in the
+  packer suffice for the third nested call.  `elevate_request_
+  write_frame` inherits the ceiling gate transparently: its
+  existing `shr rax, 24; jnz elreq_wf_pack_err` propagation clause
+  treats the new error the same as every other 0xFFFF-band ELV_
+  ERR_* and returns it unchanged with `buf` UNMODIFIED (partial-
+  write invariant preserved).
+- `elevate_request_duration_valid` is now documented DEPRECATED
+  for pre-packer client-side gating.  It stays available for
+  source-compat and is still called by the packer as its second
+  gate for the specific ELV_ERR_BAD_DUR return; new callers should
+  use `elevate_request_duration_valid_for`, which subsumes the flat
+  gate's semantic for any non-empty cap mask (every per-bit
+  ceiling is `<= ELV_DUR_MAX_NS` by construction).
+- New witness `tests/elevate_request_ceiling_test.pdx` --
+  fingerprint `LIBPDX-ELEVATE LE.M4 CEILING OK`.  Eleven stages
+  exercise (i) the validator on read-only-passes, destructive-
+  refuses, mixed-mask-min-wins, and boundary-at-ceiling cases;
+  (ii) the packer's third gate propagating the ceiling error;
+  (iii) `elevate_request_write_frame`'s pack-err clause carrying
+  the new error through unchanged with `buf` untouched; (iv) the
+  named-category equality invariants (ENUMERATE == READ,
+  UNLINK == MOUNT); (v) B1 band membership + neighbor-slot
+  distinctness for the new error.  Every ceiling value (60e9,
+  30e9, 3600e9) exceeds imm32 signed and is staged in a scratch
+  register before compare; the 0xFFFFE5E9 error literal is
+  likewise staged.  Labels prefixed `erctw_` (disjoint from every
+  other witness prefix in this library).
+- No caller migration required: the only caller of the packer
+  today is `elevate_request_write_frame`, which propagates the
+  ceiling error through its existing pack-err clause unchanged.
+  Downstream `elevate_client_*` entry points that dispatch through
+  `write_frame` (elevate_client / elevate_client_send / elevate_
+  client_journal / elevate_client_retry / elevate_client_acquire)
+  observe the new error at their own return sites without a source
+  edit; a consumer requesting a destructive cap for `> 60 s` now
+  fails at the packer instead of at the broker, matching issue
+  #29's consumer-impact paragraph.
+- File header §"ERROR BAND" and §"LE.M4-001: PER-CAP-MASK DURATION
+  CEILINGS" refreshed; `elevate_request_write_frame`'s return-code
+  table extended with the new error; `STATUS.md` gains an
+  LE.M4-001 section under M4 (see companion entry).
+
 ### #22 — LE.M1-004 README/STATUS Callers list accuracy re-verification (2026-09-11)
 
 - Doc-only pass. No source, test, `caps.decl`, `deps.list`, or

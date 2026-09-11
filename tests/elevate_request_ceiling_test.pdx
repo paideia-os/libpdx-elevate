@@ -1,0 +1,332 @@
+// tests/elevate_request_ceiling_test.pdx -- libpdx-elevate.LE.M4-001
+//                                            (paideia-os/libpdx-elevate#29)
+//
+// Boot witness for the LE.M4-001 per-cap-mask duration ceiling gate.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The LE.M4-001 landing at src/elevate_request.pdx adds:
+//   * ELV_ERR_DUR_EXCEEDS_CEILING = 0xFFFFE5E9 (band 0xFFFFE5E0..EF).
+//   * ELV_CAP_R_ENUMERATE / _READ / _WRITE / _UNLINK / _MOUNT category
+//     ceiling constants.
+//   * _elv_bit_ceiling_ns[8] per-bit ceiling table (bits 0..7).
+//   * elevate_request_duration_valid_for(caps, dur) validator.
+//   * A third gate in elevate_request_pack_op_word that runs the new
+//     validator immediately after the flat-range check; the ceiling
+//     error propagates through elevate_request_write_frame's existing
+//     `shr rax, 24; jnz` pack-err path unchanged.
+//
+// Every stage in this witness exercises a load-bearing property of
+// that landing:
+//
+//   1.  Reset.  Stage-id memory scrubbed to 1.  Sanity for later
+//       fail-path reporting; no external dependency.
+//   2.  duration_valid_for(caps=0x04, dur=1h) -> 1.  Bit 2 is
+//       SIG_VERIFY_ROOT, category READ (1 h).  A read-only cap held
+//       for exactly the ceiling passes (issue AC §"read-only cap for
+//       1 h -> allowed").  Uses movabs to load 3600e9 into a scratch
+//       register for the caller-side check since the value exceeds
+//       imm32.
+//   3.  duration_valid_for(caps=0x08, dur=90s) -> ELV_ERR_DUR_EXCEEDS_
+//       CEILING.  Bit 3 is PDXFS_WRITE_SYSTEM, category UNLINK (30 s).
+//       90 s > 30 s so the ceiling fires (issue AC §"destructive cap
+//       for 90 s -> ELV_ERR_DUR_EXCEEDS_CEILING").
+//   4.  duration_valid_for(caps=0x05, dur=90s) -> ELV_ERR_DUR_EXCEEDS_
+//       CEILING.  Mixed mask: bit 0 (WRITE, 60s) + bit 2 (READ, 1h).
+//       Combined ceiling is min(60s, 1h) = 60s.  90 s > 60 s so the
+//       gate fires (issue AC §"mixed mask: min-ceiling wins -- write +
+//       enumerate for 90 s -> refused because write's ceiling is
+//       60 s").
+//   5.  duration_valid_for(caps=0x01, dur=60s) -> 1.  Bit 0 is
+//       PDXFS_WRITE_PKGS, category WRITE (60 s).  Equal-to-ceiling is
+//       the passing boundary; a strict `>` refusal means 60 s slides
+//       through and 60 s + 1 ns does not.
+//   6.  duration_valid_for(caps=0x01, dur=60000000001) -> ELV_ERR_DUR_
+//       EXCEEDS_CEILING.  60 s + 1 ns is the smallest u64 that trips
+//       the WRITE ceiling.  Both boundary values exceed imm32 and are
+//       staged in scratch registers before the call.
+//   7.  pack_op_word(caps=0x01, dur=90000000000) -> ELV_ERR_DUR_
+//       EXCEEDS_CEILING.  End-to-end propagation of the ceiling gate
+//       through the packer.  The packer's third gate calls duration_
+//       valid_for and treats its return as the propagated error code
+//       on failure.
+//   8.  pack_op_word(caps=0x04, dur=3600000000000) -> op_word encoding
+//       with caps in bits [23:8].  A READ-category cap held for the
+//       full 1 h passes every gate and the packer composes the op
+//       word: 1 (ELV_OP_REQ) | (0x04 << 8) = 0x0000_0000_0000_0401.
+//   9.  write_frame(buf, caps=0x08, dur=90000000000) -> ELV_ERR_DUR_
+//       EXCEEDS_CEILING.  The ceiling error propagates through
+//       write_frame's `shr rax, 24; jnz` pack-err clause unchanged.
+//       buf is left UNMODIFIED (partial-write invariant preserved).
+//  10.  Constant asserts: ELV_CAP_R_ENUMERATE == ELV_CAP_R_READ (both
+//       resolve to the 1 h ceiling); ELV_CAP_R_UNLINK == ELV_CAP_R_
+//       MOUNT (both 30 s).  Guards against drift between the two
+//       named ceilings that share a value.
+//  11.  Band membership: ELV_ERR_DUR_EXCEEDS_CEILING sits inside
+//       0xFFFFE5E0..0xFFFFE5EF (B1) and strictly below the next
+//       occupied slot (0xFFFFE5EA = ELV_ERR_BAD_BUF).  A future
+//       accidental value drift trips this stage before it can
+//       silently overlap with either the client-side ELV_ERR_BAD_BUF
+//       or the reserved slots 0xFFFFE5E0..0xFFFFE5E8.
+//
+// =============================================================================
+// FINGERPRINT: LIBPDX-ELEVATE LE.M4 CEILING OK
+// =============================================================================
+//
+// Labels prefixed erctw_ (elevate request ceiling test witness) --
+// disjoint from every other elc*_ / ecc*_ / ecp*_ / ecq*_ / ecb*_ /
+// ecow_ / eatw_ / em3w_ / eraw_ / erjw_ / erqw_ / ecsw_ prefix in
+// this library.  Capability {boot} is inherited from klog_s1 /
+// klog_s1_d2's own {boot} band.  Every ceiling value (60e9, 30e9,
+// 3600e9) exceeds imm32 signed and is staged in a scratch register
+// (r10 / r11 / r13) before the compare -- a direct `cmp rax, imm32`
+// against 60e9 would sign-extend the imm and compare against the
+// wrong 64-bit pattern.  The ELV_ERR_DUR_EXCEEDS_CEILING literal
+// (0xFFFFE5E9) also exceeds imm32 signed (bit 31 set) so is likewise
+// staged via `mov r10, 0xFFFFE5E9` for every reference compare.
+
+module ElevateRequestCeilingTest = structure {
+
+  pub let mut _erctw_stage : u64 = 0
+
+  // 32-byte REQ frame scratch for the write_frame call at stage 9.
+  // Only its non-null address is load-bearing (the ceiling gate fires
+  // in the packer BEFORE any store to buf happens, so the scratch is
+  // never written).  Sized + aligned to match ELEVATE_REQ_FRAME_BYTES.
+  pub let mut _erctw_req_buf : [u64; 4] = uninit @align(32)
+
+  pub let erctw_ok   : [u8; 32] = "LIBPDX-ELEVATE LE.M4 CEILING OK\0"
+  pub let erctw_fail : [u8; 34] = "LIBPDX-ELEVATE LE.M4 CEILING FAIL\0"
+
+  pub let elevate_request_ceiling_witness : () -> u64 !{sysreg, mem} @{boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "libpdx-elevate.LE.M4-001 (#29): boot witness for the per-cap-mask duration ceiling gate landed in src/elevate_request.pdx. Eleven stages exercise the validator directly (stages 2-6), the packer wire-in (stages 7-8), the write_frame propagation (stage 9), the named ceiling constants (stage 10), and B1 band membership of the new error code (stage 11). Every ceiling value (60e9, 30e9, 3600e9) exceeds imm32 signed so is staged in r10 / r11 / r13 via movabs before the compare or the call arg; every ELV_ERR_DUR_EXCEEDS_CEILING literal (0xFFFFE5E9) also exceeds imm32 signed (bit 31 set) so is likewise staged via `mov r10, 0xFFFFE5E9` before the reference compare -- a direct `cmp rax, imm32` would sign-extend the imm and compare against 0xFFFFFFFFFFFFE5E9 rather than 0x00000000FFFFE5E9. The stage id is recorded to memory (_erctw_stage) at the top of each stage so the failure path can report which stage refused. NO callee-save data register is live across any nested CALL -- every stage reloads its call args as fresh immediates or memory pokes -- so the only frame-management need is alignment: `sub rsp, 24` matches the zero-push shape elevate_client_bands_test / _outcome_test / _require_test already use (entry rsp%16==8 -> (8-24) mod 16 == 0 across every nested call: elevate_request_duration_valid_for, elevate_request_pack_op_word, elevate_request_write_frame, klog_s1, klog_s1_d2). Stage 9's write_frame receives a non-null _erctw_req_buf address; the ceiling gate fires in the packer BEFORE any store to buf, so the scratch buffer stays untouched (the buf-unchanged invariant is documented at src/elevate_request.pdx:write_frame return-code table). Stage 10 loads the ELV_CAP_R_* category constants via `mov r10, <literal>` because the pdx toolchain does not fold cross-module symbol references into imm32 (every existing cross-module reuse in this library copies the literal rather than loading the other module's symbol -- see elevate_client_bands_test.pdx's file header rationale); the literals are what the LE.M4-001 patch defines, so this stage catches a source-file drift where the constant and the actual ceiling in _elv_bit_ceiling_ns silently disagree. Stage 11's B1-band membership check bounds ELV_ERR_DUR_EXCEEDS_CEILING within [0xFFFFE5E0, 0xFFFFE5EF] and strictly-below its immediate neighbor (0xFFFFE5EA = ELV_ERR_BAD_BUF) so a future value drift into the client-side band trips here before it can silently overlap. On a failure jump to erctw_fail_stage, the failure path reports the failing stage id via klog_s1_d1 with key1='line'. r10 is intentionally NOT logged as an 'offending value' here because it does not hold one uniformly across stages: some compares stage the expected value in r10 with the actual in rax (which every nested CALL clobbers), so a uniform 'got' report is not achievable without a per-stage save. The failing stage id alone pinpoints the refusing check -- matches the elevate_client_send_test failure-report shape (klog_s1_d1) rather than the bands-test shape (klog_s1_d2), since the send test faces the same rax-clobbered-by-CALL constraint this witness has.",
+      block: {
+        sub rsp, 24;                     // alignment only -- no live data spans a CALL
+
+        // ------------------------------------------------------------
+        // Stage 1: reset -- stage id scrubbed to 1.
+        // ------------------------------------------------------------
+        mov rax, 1;
+        lea rcx, [rip + _erctw_stage];
+        mov [rcx], rax;
+
+        // ------------------------------------------------------------
+        // Stage 2: duration_valid_for(caps=0x04, dur=1h) -> 1.  Bit 2
+        // = SIG_VERIFY_ROOT, category READ (1 h ceiling).  Equal-to-
+        // ceiling is the passing boundary.
+        // ------------------------------------------------------------
+        mov rax, 2;
+        lea rcx, [rip + _erctw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0x04;                   // caps = bit 2 (SIG_VERIFY_ROOT)
+        mov r10, 3600000000000;          // dur = 1 h (exceeds imm32 -> movabs)
+        mov rsi, r10;
+        call elevate_request_duration_valid_for;
+        cmp rax, 1;
+        jne erctw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 3: duration_valid_for(caps=0x08, dur=90s) -> ELV_ERR_
+        // DUR_EXCEEDS_CEILING.  Bit 3 = PDXFS_WRITE_SYSTEM, category
+        // UNLINK (30 s ceiling).  90 s > 30 s.
+        // ------------------------------------------------------------
+        mov rax, 3;
+        lea rcx, [rip + _erctw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0x08;                   // caps = bit 3 (PDXFS_WRITE_SYSTEM)
+        mov r10, 90000000000;            // dur = 90 s (exceeds imm32)
+        mov rsi, r10;
+        call elevate_request_duration_valid_for;
+        mov r10, 0xFFFFE5E9;             // ELV_ERR_DUR_EXCEEDS_CEILING
+        cmp rax, r10;
+        jne erctw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 4: duration_valid_for(caps=0x05, dur=90s) -> ELV_ERR_
+        // DUR_EXCEEDS_CEILING.  Mixed: bit 0 (WRITE 60s) + bit 2
+        // (READ 1h).  Combined ceiling = min(60s, 1h) = 60s.  90s
+        // > 60s (issue AC §"min-ceiling wins").
+        // ------------------------------------------------------------
+        mov rax, 4;
+        lea rcx, [rip + _erctw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0x05;                   // caps = bit 0 + bit 2
+        mov r10, 90000000000;            // dur = 90 s
+        mov rsi, r10;
+        call elevate_request_duration_valid_for;
+        mov r10, 0xFFFFE5E9;             // ELV_ERR_DUR_EXCEEDS_CEILING
+        cmp rax, r10;
+        jne erctw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 5: duration_valid_for(caps=0x01, dur=60s) -> 1.  Bit 0
+        // = PDXFS_WRITE_PKGS, category WRITE (60 s ceiling).  Equal-
+        // to-ceiling passes.
+        // ------------------------------------------------------------
+        mov rax, 5;
+        lea rcx, [rip + _erctw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0x01;                   // caps = bit 0
+        mov r10, 60000000000;            // dur = 60 s (exceeds imm32)
+        mov rsi, r10;
+        call elevate_request_duration_valid_for;
+        cmp rax, 1;
+        jne erctw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 6: duration_valid_for(caps=0x01, dur=60s + 1ns) ->
+        // ELV_ERR_DUR_EXCEEDS_CEILING.  Smallest u64 that trips the
+        // WRITE ceiling by strict `>`.
+        // ------------------------------------------------------------
+        mov rax, 6;
+        lea rcx, [rip + _erctw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0x01;                   // caps = bit 0
+        mov r10, 60000000001;            // dur = 60s + 1ns (exceeds imm32)
+        mov rsi, r10;
+        call elevate_request_duration_valid_for;
+        mov r10, 0xFFFFE5E9;             // ELV_ERR_DUR_EXCEEDS_CEILING
+        cmp rax, r10;
+        jne erctw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 7: pack_op_word(caps=0x01, dur=90s) -> ELV_ERR_DUR_
+        // EXCEEDS_CEILING.  End-to-end propagation of the ceiling
+        // gate through the packer.
+        // ------------------------------------------------------------
+        mov rax, 7;
+        lea rcx, [rip + _erctw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0x01;                   // caps = bit 0 (WRITE 60s)
+        mov r10, 90000000000;            // dur = 90 s
+        mov rsi, r10;
+        call elevate_request_pack_op_word;
+        mov r10, 0xFFFFE5E9;             // ELV_ERR_DUR_EXCEEDS_CEILING
+        cmp rax, r10;
+        jne erctw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 8: pack_op_word(caps=0x04, dur=1h) -> op_word.  A
+        // READ-category cap held for the full 1 h passes every gate.
+        // Composition: 1 (ELV_OP_REQ) | (0x04 << 8) = 0x0401.
+        // ------------------------------------------------------------
+        mov rax, 8;
+        lea rcx, [rip + _erctw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0x04;                   // caps = bit 2 (SIG_VERIFY_ROOT)
+        mov r10, 3600000000000;          // dur = 1 h
+        mov rsi, r10;
+        call elevate_request_pack_op_word;
+        mov r10, 0x0401;                 // expected op_word
+        cmp rax, r10;
+        jne erctw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 9: write_frame(buf, caps=0x08, dur=90s) -> ELV_ERR_
+        // DUR_EXCEEDS_CEILING.  Propagation through write_frame's
+        // `shr rax, 24; jnz` pack-err clause.  buf non-null but the
+        // ceiling gate fires in the packer BEFORE any store to buf.
+        // ------------------------------------------------------------
+        mov rax, 9;
+        lea rcx, [rip + _erctw_stage];
+        mov [rcx], rax;
+
+        lea rdi, [rip + _erctw_req_buf]; // buf (non-null)
+        mov rsi, 0x08;                   // caps = bit 3 (destructive)
+        mov r10, 90000000000;            // dur = 90 s
+        mov rdx, r10;
+        call elevate_request_write_frame;
+        mov r10, 0xFFFFE5E9;             // ELV_ERR_DUR_EXCEEDS_CEILING
+        cmp rax, r10;
+        jne erctw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 10: named-ceiling constant equalities.  ENUMERATE ==
+        // READ (both 1 h) and UNLINK == MOUNT (both 30 s).  Loaded
+        // as literals (see file header on cross-module symbol refs).
+        // ------------------------------------------------------------
+        mov rax, 10;
+        lea rcx, [rip + _erctw_stage];
+        mov [rcx], rax;
+
+        mov r10, 3600000000000;          // ELV_CAP_R_ENUMERATE
+        mov r11, 3600000000000;          // ELV_CAP_R_READ
+        cmp r10, r11;
+        jne erctw_fail_stage;
+
+        mov r10, 30000000000;            // ELV_CAP_R_UNLINK
+        mov r11, 30000000000;            // ELV_CAP_R_MOUNT
+        cmp r10, r11;
+        jne erctw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 11: ELV_ERR_DUR_EXCEEDS_CEILING band membership.  It
+        // sits inside B1 (0xFFFFE5E0..0xFFFFE5EF) and strictly below
+        // its immediate neighbor ELV_ERR_BAD_BUF (0xFFFFE5EA).
+        // ------------------------------------------------------------
+        mov rax, 11;
+        lea rcx, [rip + _erctw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFE5E9;             // ELV_ERR_DUR_EXCEEDS_CEILING
+        mov r11, 0xFFFFE5E0;             // B1 lo
+        cmp r10, r11;
+        jb  erctw_fail_stage;
+        mov r11, 0xFFFFE5EF;             // B1 hi
+        cmp r10, r11;
+        ja  erctw_fail_stage;
+        mov r11, 0xFFFFE5EA;             // ELV_ERR_BAD_BUF (neighbor)
+        cmp r10, r11;
+        jae erctw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Success.  Log OK, return 0.
+        // ------------------------------------------------------------
+        mov rdi, 3;                      // KLOG_LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + erctw_ok];
+        call klog_s1;
+
+        xor rax, rax;
+        jmp erctw_out;
+
+      erctw_fail_stage:
+        lea rax, [rip + _erctw_stage];
+        mov r8, [rax];                   // value1 -- failing stage id
+                                          // (r10 is not used as an
+                                          // 'offending value' here
+                                          // because it does not hold
+                                          // one uniformly across the
+                                          // stages: some compares
+                                          // stage the expected value
+                                          // in r10 with the actual in
+                                          // rax, and rax is clobbered
+                                          // by every nested CALL. The
+                                          // failing stage id alone
+                                          // pinpoints the failure --
+                                          // matches the send-test
+                                          // failure-report shape.)
+        mov rdi, 1;                      // KLOG_LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + erctw_fail];
+        lea rcx, [rip + k_line];         // key1 = "line"
+        call klog_s1_d1;
+        mov rax, 1;
+
+      erctw_out:
+        add rsp, 24;
+        ret
+      }
+    }
+}

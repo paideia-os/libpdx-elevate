@@ -54,11 +54,55 @@ Source-breaking to a 3-arg caller of `_derive`; there are no working
 
 LE.M4, M6, M7 (issues #29-#30, #33-#36) — reap, audit sink,
 revoke-cascade — all DEFERRED to the follow-up wave; comment posted
-on each issue. LE.M5 (#31, #32, attestation) and LE.M7-001/002 (#35,
-#36, revoke cascade) have since landed — see below. LE.M4-002 (#30,
+on each issue. LE.M5 (#31, #32, attestation), LE.M7-001/002 (#35,
+#36, revoke cascade), and LE.M4-001 (#29, per-cap-mask duration
+ceilings) have since landed — see below. LE.M4-002 (#30,
 `elevate_client_cap_reap_expired`) and LE.M6 (#33, #34, audit sink)
 remain deferred; #30 stays open by the reporter's own request even
 though revoke_cascade's landing removes its stated blocker.
+
+## LE.M4-001 — per-cap-mask duration ceilings (landed, 2026-09-11)
+
+`elevate_request_duration_valid_for(caps, dur)`
+(`src/elevate_request.pdx`, #29) is the per-cap-mask ceiling gate.
+Every set bit in `caps` looks up its ceiling in the read-only
+`_elv_bit_ceiling_ns[8]` table; the combined-mask ceiling is
+`min(_elv_bit_ceiling_ns[i])` over every set bit `i`.  Returns `1`
+on pass or `ELV_ERR_DUR_EXCEEDS_CEILING = 0xFFFFE5E9` on fail (new
+LE.M4-001 slot in the shared B1 band 0xFFFFE5E0..EF; the reserved
+range under B1 shrinks to 0xFFFFE5E0..0xFFFFE5E8).  Named category
+ceilings are surfaced as `ELV_CAP_R_ENUMERATE` / `_READ` (both 1 h),
+`ELV_CAP_R_WRITE` (60 s), `ELV_CAP_R_UNLINK` / `_MOUNT` (both 30 s).
+Bits 0..7 of the wire cap mask are classified per the CHANGELOG's
+LE.M4-001 table (PDXFS_WRITE_SYSTEM as UNLINK-shaped, USER_REVOKE
+as UNLINK-shaped, HW_MINT / DRIVER_MINT default to WRITE per issue
+AC's "unknown = write's 60 s" conservative rule).
+
+`elevate_request_pack_op_word` (same file) now runs three gates in
+sequence — `cap_mask_valid` → BAD_MASK, `duration_valid` → BAD_DUR
+(flat range, unchanged for source-compat), `duration_valid_for` →
+DUR_EXCEEDS_CEILING (per-bit).  `elevate_request_write_frame`
+inherits the ceiling gate transparently through its existing
+`shr rax, 24; jnz` pack-err propagation clause; `buf` is left
+UNMODIFIED on any ceiling refusal, preserving the partial-write
+invariant documented at the write_frame return-code table.
+`elevate_request_duration_valid` (the flat gate) is now marked
+DEPRECATED for new pre-packer client-side use; kept for source-
+compat + still called by the packer for the ELV_ERR_BAD_DUR
+specific return.
+
+Witness: `tests/elevate_request_ceiling_test.pdx` — fingerprint
+`LIBPDX-ELEVATE LE.M4 CEILING OK`.  Eleven stages cover the
+validator (read-only-passes, destructive-refuses, mixed-mask-
+min-wins, boundary-at-ceiling), packer propagation, write_frame
+propagation, named-ceiling equality invariants, and B1 band
+membership + neighbor-slot distinctness for the new error.
+
+Consumer impact: no source edit required today — every existing
+caller reaches the ceiling gate via `elevate_request_write_frame`,
+which returns the new error unchanged.  A consumer that used to
+hold a destructive cap for > 60 s now fails at the packer instead
+of at the broker, matching issue #29's stated end-state.
 
 ## LE.M5 — attestation (M5-001/002 landed; M5-003+ not filed)
 
