@@ -2271,4 +2271,218 @@ module ElevateClientCap = structure {
         ret
       }
     }
+
+  // ==========================================================================
+  // elevate_client_cap_reap_expired() -> reaped_count : u64
+  //
+  // LE.M4-002 (libpdx-elevate#30).  Idle-time sweep of the shadow
+  // deadline map: walks all ELCC_MAX_ROWS (16) slots and, for each
+  // whose deadline is non-zero and past hpet_now_ns(), calls the
+  // kernel elevate_channel_cap_revoke and scrubs the row's shadow
+  // state via elevate_client_cap_scrub_row.  Returns the count of
+  // rows we FRESHLY revoked in this call (ELVC_OK from the kernel);
+  // rows already revoked (ELVC_REVOKE_ALREADY) or that never made it
+  // into the kernel table (ELVC_ERR_BAD_SLOT / other refusal) are
+  // still SCRUBBED so the shadow map stays coherent, but they are
+  // NOT counted and NOT audited -- exactly the ALREADY-vs-OK
+  // discrimination elevate_client_cap_revoke_cascade already runs.
+  //
+  // -------------------------------------------------------------------------
+  // WHY THIS EXISTS
+  // -------------------------------------------------------------------------
+  //
+  // The shadow deadline map today is only consulted when a caller
+  // explicitly invokes elevate_client_cap_check_and_revoke(row_id) or
+  // elevate_client_require(row_id, caps).  A row minted by
+  // elevate_client_acquire and never re-checked -- caller returned
+  // early after the mint, caller crashed post-mint, caller lost its
+  // row_id reference -- stays live in the kernel table until the row
+  // slot is reclaimed by other means.  This sweep closes that leak
+  // without requiring every caller to remember its handles.
+  //
+  // Suggested wire-up:
+  //   * boot-idle: paideia-os boot cascade may call this once every
+  //     10 s in a low-priority slot (kernel-side, outside this repo).
+  //   * library teardown: elevate_client_shutdown (below) composes
+  //     reap + reset for the exit path.
+  //
+  // -------------------------------------------------------------------------
+  // IDEMPOTENCY
+  // -------------------------------------------------------------------------
+  //
+  // A back-to-back second call returns 0 by construction: every row
+  // the first call touched has its deadline slot scrubbed to 0
+  // regardless of whether the kernel revoke returned OK, ALREADY, or
+  // any other code, so the second pass skips it at the "deadline == 0
+  // -> not bound" gate before any kernel touch.  This is the same
+  // idempotency shape check_and_revoke and revoke_cascade already
+  // guarantee -- the fact that a row is scrubbed even after a
+  // best-effort kernel refusal is what preserves it here (revoking
+  // on a stale shadow would burn a kernel round-trip every sweep for
+  // the life of the process otherwise).
+  //
+  // -------------------------------------------------------------------------
+  // AUDIT
+  // -------------------------------------------------------------------------
+  //
+  // Per successfully-revoked row we emit ONE elevate_client_journal_
+  // reap record (body0 = ELVJ_EVT_REAP (7); body1 = row_id;
+  // body2 = the past deadline_ns that made the row eligible for
+  // reap).  The actor for the audit is read ONCE from
+  // _elevate_client_target_fp_lo via elevate_client_get_target_fp_lo
+  // (same source as revoke_cascade's per-row REVOKE_CASCADE records),
+  // outside the loop, so N reaps cost 1 fp-lookup + N uej_appends.
+  // The audit CALL's return is DELIBERATELY IGNORED (same best-effort
+  // discipline as revoke_cascade's own per-row audit -- see that
+  // function's AUDIT + ACTOR section for the "removing authority
+  // needs no gate" reasoning).
+  //
+  // -------------------------------------------------------------------------
+  // Register plan: rbx=j (row index, 0..16, live across every nested
+  // CALL), r12=reaped_count accumulator, r13=actor_fp_lo (fetched
+  // once outside the loop), r14=now_ns (fetched once outside the
+  // loop; the AC does NOT require a fresh hpet_now_ns per row --
+  // "past" means "past when we started sweeping"), r15=deadline
+  // scratch (loaded per row from the shadow map, live only across
+  // one iteration).  Five callee-save pushes = 40 bytes; entry
+  // rsp%16 == 8 -> (8 - 40) mod 16 == 0, so nested CALLs see aligned
+  // rsp with NO extra pad -- same math as an unrelated 5-push
+  // function elsewhere in this library would use.  capabilities
+  // {cap, boot} propagate from elevate_channel_cap_revoke ({cap})
+  // and hpet_now_ns ({boot}).  Labels prefixed ecrp_ (elevate cap
+  // reap; disjoint from every other ecc*_ / elcc_* / ercw_ prefix in
+  // the codebase).
+  // ==========================================================================
+
+  pub let elevate_client_cap_reap_expired : () -> u64 !{mem} @{cap, boot} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {cap, boot},
+      justification: "libpdx-elevate.LE.M4-002 (#30): idle-time sweep of the 16-slot shadow deadline map. Five callee-save pushes (rbx=j, r12=reaped_count, r13=actor_fp_lo, r14=now_ns, r15=deadline scratch) = 40 bytes; entry rsp%16 == 8 -> (8-40) mod 16 == 0, so every nested CALL (hpet_now_ns, get_target_fp_lo, elevate_channel_cap_revoke, elevate_client_cap_scrub_row, elevate_client_journal_reap) sees aligned rsp WITHOUT an extra pad -- five-push is exactly the count that lands aligned. now_ns and actor_fp_lo are both fetched ONCE outside the loop: 'past' in 'past deadline' means past when we started sweeping (the AC does not require a fresh clock per row, and cheaper is better here), and actor never changes over the sweep. Per-row branching: deadline == 0 -> skip (row has no bound); deadline > now -> skip (still live); else attempt kernel revoke and classify. Classification mirrors elevate_client_cap_check_and_revoke exactly: ELVC_OK (0) counts + audits + scrubs; ELVC_REVOKE_ALREADY (0xFFFFEC06, staged in r10 since it exceeds imm32 sign-extended range) scrubs but does NOT count and does NOT audit (row was already gone -- no reap happened here, only shadow cleanup); anything else (typically ELVC_ERR_BAD_SLOT) also scrubs to avoid a stale shadow but does not count / audit (best-effort discipline, same as revoke_cascade would do at its ALREADY branch's classification). Scrubbing on EVERY expired-row outcome is what makes the function idempotent: a back-to-back second call sees every touched slot at 0 and skips it before any kernel round-trip. Journal call's return is DELIBERATELY IGNORED (see AUDIT section in file header block above) -- a failed audit is a thinner trail, not a live over-grant. Labels prefixed ecrp_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ---- Fetch now_ns and actor_fp_lo once, outside the loop. ----
+        call hpet_now_ns;
+        mov r14, rax;                    // now_ns
+
+        call elevate_client_get_target_fp_lo;
+        mov r13, rax;                    // actor_fp_lo (may be 0; audit
+                                          // path will refuse with BAD_ACTOR
+                                          // which we ignore -- see justification)
+
+        xor r12, r12;                    // reaped_count = 0
+        xor rbx, rbx;                    // j = 0
+
+      ecrp_loop:
+        // ---- Load slot j's shadow deadline. ----
+        lea r10, [rip + _elevate_client_cap_expire_map];
+        mov r15, [r10 + rbx * 8];
+        cmp r15, 0;
+        je  ecrp_next;                   // no deadline bound -> live indefinitely
+        cmp r14, r15;
+        jb  ecrp_next;                   // now < deadline -> still live
+
+        // ---- Row rbx is expired.  Attempt kernel revoke. ----
+        mov rdi, rbx;
+        call elevate_channel_cap_revoke;
+        // rax = 0 (OK) | 0xFFFFEC06 (ALREADY) | 0xFFFFEC08 (BAD_SLOT) | ...
+        cmp rax, 0;
+        je  ecrp_fresh_revoke;
+        mov r10, 0xFFFFEC06;             // ELVC_REVOKE_ALREADY
+        cmp rax, r10;
+        je  ecrp_scrub_only;
+        // Any other refusal: still scrub the shadow (avoid stale rows
+        // causing repeated kernel round-trips every sweep) but do NOT
+        // count and do NOT audit -- no reap happened here.
+        jmp ecrp_scrub_only;
+
+      ecrp_fresh_revoke:
+        // Successful kernel revoke -> scrub, count, audit.
+        mov rdi, rbx;
+        call elevate_client_cap_scrub_row;
+        add r12, 1;                      // reaped_count++
+
+        // Best-effort audit: one ELVJ_EVT_REAP record per fresh revoke.
+        // Return deliberately ignored (see justification / file-section
+        // AUDIT block).
+        mov rdi, r13;                    // actor_fp_lo
+        mov rsi, rbx;                    // row_id (just reaped)
+        mov rdx, r15;                    // deadline_ns (the past deadline)
+        call elevate_client_journal_reap;
+        jmp ecrp_next;
+
+      ecrp_scrub_only:
+        // Row was gone already (ALREADY) or never in the kernel table
+        // (BAD_SLOT / other): clear the shadow so the next sweep skips
+        // it, but do not count and do not audit -- no reap this call.
+        mov rdi, rbx;
+        call elevate_client_cap_scrub_row;
+
+      ecrp_next:
+        add rbx, 1;
+        cmp rbx, 16;
+        jb  ecrp_loop;
+
+        mov rax, r12;                    // reaped_count
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_shutdown() -> reaped_count : u64
+  //
+  // LE.M4-002 (libpdx-elevate#30) teardown helper (optional per the
+  // issue's suggested wire-up points).  Runs elevate_client_cap_reap_
+  // expired to sweep any past-deadline rows the caller leaked, then
+  // scrubs ALL client-side shadow state via elevate_client_cap_reset
+  // + elevate_client_journal_reset.  Returns the reap count so a
+  // caller can log "shut down with N grants reaped" without a
+  // separate call.
+  //
+  // A tool that has its own explicit revoke discipline may skip this
+  // entirely and call elevate_client_cap_reset directly; the helper
+  // exists for tools whose exit path is "just stop", where letting
+  // the reap sweep catch any strays is safer than assuming none exist.
+  //
+  // Alignment: composes three void CALLs.  reap_expired's return is
+  // stashed in rax across the two follow-on scrub CALLs via a
+  // push/realign/pop idiom; no callee-save needed (the count is the
+  // only value that survives).  sub rsp, 8 gives the initial CALL
+  // alignment (entry rsp%16==8 -> (8-8) mod 16 == 0).  Labels
+  // prefixed ecsd_ (elevate client shutdown; disjoint from every
+  // other prefix in this library).
+  // ==========================================================================
+
+  pub let elevate_client_shutdown : () -> u64 !{mem} @{cap, boot} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {cap, boot},
+      justification: "libpdx-elevate.LE.M4-002 (#30): optional teardown helper. Composes elevate_client_cap_reap_expired + elevate_client_cap_reset + elevate_client_journal_reset. sub rsp, 8 aligns the FIRST CALL (entry rsp%16 == 8 -> post-sub rsp%16 == 0). reap_expired's count is stashed via push/realign so both follow-on void CALLs see aligned rsp: push rax (rsp%16 back to 8), sub rsp, 8 (rsp%16 == 0), two CALLs, add rsp, 8 (rsp%16 == 8), pop rax (rsp%16 == 0 -- matching the frame's outer sub rsp, 8), add rsp, 8, ret. No callee-save touched (reap's return is the only value that must survive, and it survives on the stack). capabilities {cap, boot} propagate from elevate_client_cap_reap_expired. Labels prefixed ecsd_.",
+      block: {
+        sub rsp, 8;                      // align first CALL
+
+        call elevate_client_cap_reap_expired;
+
+        push rax;                        // stash reap count
+        sub rsp, 8;                      // realign for the two scrubs
+
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+
+        add rsp, 8;
+        pop rax;                         // restore reap count
+
+        add rsp, 8;
+        ret
+      }
+    }
 }

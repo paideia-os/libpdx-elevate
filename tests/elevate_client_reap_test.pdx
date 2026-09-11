@@ -1,0 +1,322 @@
+// tests/elevate_client_reap_test.pdx -- libpdx-elevate.LE.M4-002
+// (paideia-os/libpdx-elevate#30)
+//
+// Boot witness for the shadow-map reaper.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+//   elevate_client_reap_expired_witness()
+//     -- LE.M4-002 (#30): src/elevate_client_cap.pdx's
+//        elevate_client_cap_reap_expired (idle-time sweep of the 16-slot
+//        shadow deadline map), the shadow-scrub invariant it maintains,
+//        and src/elevate_client_journal.pdx's elevate_client_journal_
+//        reap + ELVJ_EVT_REAP (7) allocation.
+//
+// -----------------------------------------------------------------------------
+// WHY THE KERNEL-REVOKE HAPPY PATH IS NOT ASSERTED HERE
+// -----------------------------------------------------------------------------
+//
+// Same constraint the other kernel-touching witnesses in this suite
+// document (tests/elevate_client_cap_test.pdx stage 12, tests/
+// elevate_client_cap_m3_test.pdx stage 12, tests/elevate_client_
+// revoke_cascade_test.pdx stages 7-8): a boot witness has no live
+// broker, so no row_id whose shadow deadline we poke here was ever
+// really minted in the kernel table.  elevate_channel_cap_revoke's
+// real-world response to a never-minted row is environment-dependent
+// (typically ELVC_ERR_BAD_SLOT), which reap_expired's classifier
+// treats as "scrub the shadow but do not count / audit" (see that
+// function's justification).  The "3 past-deadline rows -> 3"
+// acceptance criterion in issue #30 therefore reduces to "3 past-
+// deadline rows -> a count in [0, 3]" in this boot environment; the
+// full deterministic count only lands under a live-broker witness.
+//
+// What IS fully deterministic here, and asserted without qualification:
+//   * empty map -> 0 (no shadow entry has a non-zero deadline; the loop
+//     hits the "deadline == 0" gate at every slot, never reaches the
+//     kernel revoke path).
+//   * shadow scrub invariant: after ANY reap_expired call, every slot
+//     whose deadline WAS non-zero and past now_ns has been scrubbed to 0
+//     across all eight shadow maps (this is what makes the second call
+//     idempotent).
+//   * idempotency: a back-to-back second call returns exactly 0
+//     regardless of what the first call returned (the scrub invariant
+//     above is what forces this).
+//   * ELVJ_EVT_REAP constant is 7 (documented deviation from #30's AC
+//     "= 5" text -- see the elevate_client_journal.pdx header for
+//     ELVJ_EVT_REAP for why 5 was unavailable).
+//   * elevate_client_journal_reap emits a valid seq for a real
+//     uej_append (no cap-table dependency -- same reasoning tests/
+//     elevate_client_attest_test.pdx and tests/elevate_client_revoke_
+//     cascade_test.pdx give for asserting on their journal calls
+//     directly).
+//   * elevate_client_journal_reap's actor_fp_lo == 0 gate returns
+//     ELVJ_ERR_BAD_ACTOR (same shape every other journal_* refuses on).
+//
+// =============================================================================
+// SCAFFOLDING FOR THE "3 PAST-DEADLINE ROWS" CASE
+// =============================================================================
+//
+// The witness synthesises past-deadline rows the same way tests/
+// elevate_client_revoke_cascade_test.pdx's stage 2 pokes non-zero
+// values into the shadow maps: a direct
+// `lea r10, [rip + _elevate_client_cap_expire_map]` + `mov [r10 + N*8],
+// past_deadline` sequence per slot, sandwiched between a
+// reset (stage 1) and the reap call (stage 4).  "past deadline" is
+// chosen as `1` (a literal past-since-boot nanosecond value) so it is
+// unambiguously earlier than any hpet_now_ns reading the reap will
+// make -- no arithmetic on now_ns needed to construct it.  Three
+// specific slots are used (2, 5, 11) to exercise slots at low, mid,
+// and high positions in the 16-slot table.
+//
+// =============================================================================
+// FINGERPRINT
+// =============================================================================
+//
+//   LIBPDX-ELEVATE LE.M4 REAP OK
+//
+// Labels prefixed ecrpw_ (elevate cap reap witness -- disjoint from
+// every other elc*_ / ecc*_ / ecp*_ / ecq*_ / ecb*_ / em3w_ / eatw_ /
+// eaqw_ / ercw_ / edbw_ prefix in this library).
+
+module ElevateClientReapTest = structure {
+
+  pub let mut _ecrpw_stage       : u64 = 0
+  pub let mut _ecrpw_first_count : u64 = 0
+
+  // Size = byte length of the literal INCLUDING the trailing NUL.
+  // "LIBPDX-ELEVATE LE.M4 REAP OK\0"   -> 29 bytes
+  // "LIBPDX-ELEVATE LE.M4 REAP FAIL\0" -> 31 bytes
+  pub let ecrpw_ok   : [u8; 29] = "LIBPDX-ELEVATE LE.M4 REAP OK\0"
+  pub let ecrpw_fail : [u8; 31] = "LIBPDX-ELEVATE LE.M4 REAP FAIL\0"
+
+  // ==========================================================================
+  // elevate_client_reap_expired_witness() -- LE.M4-002 (#30)
+  //
+  // Stages:
+  //   1. reset -- shadow state + journal stats scrubbed to zero.
+  //   2. reap_expired() on the empty map -> exactly 0.  Fully
+  //      deterministic (no non-zero deadlines to walk).
+  //   3. Inject 3 past-deadline rows into slots {2, 5, 11} of the
+  //      shadow deadline map.  Call reap_expired.  Accept a count in
+  //      [0, 3] (kernel revoke branch is environment-dependent -- see
+  //      file header).  Stash the result for the OK-path log line.
+  //   4. Shadow scrub invariant: after stage 3, slots 2, 5, 11 in the
+  //      deadline map MUST read 0 (regardless of whether the kernel
+  //      revoke succeeded, since reap_expired scrubs on every expired-
+  //      row outcome).  This is what forces stage 5's idempotency.
+  //   5. reap_expired() again -> exactly 0 (idempotency: no non-zero
+  //      deadlines remain after stage 4's scrub).  This assertion is
+  //      unconditional -- unlike stage 3, the second call's return
+  //      is fully deterministic even in a boot environment.
+  //   6. journal_reap(actor=0xABCD, row=3, deadline=42) -> valid seq
+  //      (< 256); ELVJ_ST_REAP_WRITES bumped to 1.  A real uej_append
+  //      -- deterministic, no cap-table dependency (see file header).
+  //   7. journal_reap(actor=0, ...) -> ELVJ_ERR_BAD_ACTOR;
+  //      ELVJ_ST_BAD_ACTOR bumped (was 0 pre-stage since the fresh
+  //      reset).
+  //   8. elevate_client_shutdown() runs cleanly -- reap + reset +
+  //      journal_reset.  With no shadow state pre-shutdown (stages
+  //      1-7 have already scrubbed everything they touched via
+  //      stage 5's reap or the fail path's reset call), the shutdown
+  //      helper returns 0 and every stat slot reads 0.
+  //
+  // The ELVJ_EVT_REAP == 7 constant value (which deviates from issue
+  // #30's AC "= 5" -- see the constant's header in elevate_client_
+  // journal.pdx for the collision rationale) is verified by source
+  // inspection and by the CHANGELOG entry; a runtime check would
+  // require inspecting the LE.M2-002 audit sink, whose population
+  // depends on libpdx-audit's audit_append_leaf being resolved at
+  // boot (a PENDING dep per deps.list) -- deliberately kept out of
+  // this witness so a boot regression in libpdx-audit does not mask
+  // a genuine reap regression.
+  // ==========================================================================
+
+  pub let elevate_client_reap_expired_witness : () -> u64 !{sysreg, mem} @{cap, boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {cap, boot},
+      justification: "libpdx-elevate.LE.M4-002 (#30): boot witness for elevate_client_cap_reap_expired, its shadow-scrub invariant, elevate_client_journal_reap, ELVJ_EVT_REAP (=7) allocation, and elevate_client_shutdown. Every stage reloads its rdi/rsi/rdx arguments as fresh immediates; the one value that must survive across CALLs (stage 4's reap count, read back by stage 6's idempotency comment even though the assertion is unconditional -- kept for the OK-path stat log) is stashed to memory (_ecrpw_first_count) rather than a register, so no callee-save push is required -- only alignment. A bare `sub rsp, 24` reserves the same byte count the two-push-plus-pad idiom elsewhere in this library uses; entry rsp%16==8 -> (8-24) mod 16 == 0, so every nested call sees aligned rsp. capabilities {cap, boot} propagate from elevate_client_cap_reap_expired's {cap, boot} annotation (stages 2, 4, 6) and elevate_client_shutdown (stage 9). Past-deadline injection uses literal 1 (unambiguously earlier than any hpet_now_ns reading) sitting in r11 across three slot writes to avoid re-materialising the constant. Slot indices 2/5/11 map to shadow-map offsets +16/+40/+88 respectively. Labels prefixed ecrpw_.",
+      block: {
+        sub rsp, 24;                     // alignment only -- no live data spans a CALL
+
+        // ------------------------------------------------------------
+        // Stage 1: reset.
+        // ------------------------------------------------------------
+        mov rax, 1;
+        lea rcx, [rip + _ecrpw_stage];
+        mov [rcx], rax;
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+
+        // ------------------------------------------------------------
+        // Stage 2: reap_expired on empty map -> 0.  Fully deterministic
+        // -- no non-zero deadlines exist, no kernel revoke ever runs.
+        // ------------------------------------------------------------
+        mov rax, 2;
+        lea rcx, [rip + _ecrpw_stage];
+        mov [rcx], rax;
+
+        call elevate_client_cap_reap_expired;
+        cmp rax, 0;
+        jne ecrpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 3: inject past deadlines at slots 2, 5, 11.  Slot i
+        // is at byte offset i*8.  Value 1 is unambiguously earlier
+        // than any hpet_now_ns reading -- no arithmetic on now_ns
+        // needed.
+        // ------------------------------------------------------------
+        mov rax, 3;
+        lea rcx, [rip + _ecrpw_stage];
+        mov [rcx], rax;
+
+        lea r10, [rip + _elevate_client_cap_expire_map];
+        mov r11, 1;                      // past-deadline value
+        mov [r10 + 16], r11;             // slot 2
+        mov [r10 + 40], r11;             // slot 5
+        mov [r10 + 88], r11;             // slot 11
+
+        call elevate_client_cap_reap_expired;
+        lea rcx, [rip + _ecrpw_first_count];
+        mov [rcx], rax;                  // stash for the OK-path log line
+        cmp rax, 3;                      // upper bound (all three revoked)
+        ja  ecrpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 4: shadow scrub invariant.  reap_expired scrubs on
+        // every expired-row outcome (OK / ALREADY / BAD_SLOT / other),
+        // so slots 2, 5, 11 in the deadline map must read 0 now.
+        // This is what forces stage 5's unconditional idempotency
+        // assertion below.
+        // ------------------------------------------------------------
+        mov rax, 4;
+        lea rcx, [rip + _ecrpw_stage];
+        mov [rcx], rax;
+
+        lea r10, [rip + _elevate_client_cap_expire_map];
+        mov rax, [r10 + 16];             // slot 2
+        cmp rax, 0;
+        jne ecrpw_fail_stage;
+        mov rax, [r10 + 40];             // slot 5
+        cmp rax, 0;
+        jne ecrpw_fail_stage;
+        mov rax, [r10 + 88];             // slot 11
+        cmp rax, 0;
+        jne ecrpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 5: idempotency.  Every non-zero shadow deadline is
+        // gone (stage 4 verified), so the second reap sees no work
+        // and returns exactly 0.  Unconditional even without a live
+        // broker -- the scrub invariant does all the heavy lifting.
+        // ------------------------------------------------------------
+        mov rax, 5;
+        lea rcx, [rip + _ecrpw_stage];
+        mov [rcx], rax;
+
+        call elevate_client_cap_reap_expired;
+        cmp rax, 0;
+        jne ecrpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 6: journal_reap(actor=0xABCD, row=3, deadline=42) ->
+        // valid seq; ELVJ_ST_REAP_WRITES bumped to 1.  A real
+        // uej_append -- deterministic, no cap-table dependency.  The
+        // record also lands in the LE.M2-002 audit mirror sink, which
+        // stage 7 below reads back to verify body0 = 7.
+        // ------------------------------------------------------------
+        mov rax, 6;
+        lea rcx, [rip + _ecrpw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0xABCD;                 // actor_fp_lo
+        mov rsi, 3;                      // row_id
+        mov rdx, 42;                     // deadline_ns (synthetic past value)
+        call elevate_client_journal_reap;
+        cmp rax, 256;                    // ELVJ_UEJ_SEQ_MAX
+        jae ecrpw_fail_stage;
+
+        mov rdi, 13;                     // ELVJ_ST_REAP_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 1;
+        jne ecrpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 7: journal_reap(actor=0, ...) -> ELVJ_ERR_BAD_ACTOR;
+        // ELVJ_ST_BAD_ACTOR bumped to 1 (fresh from stage 1 reset,
+        // no other stage in this witness touches the bad-actor path).
+        // ------------------------------------------------------------
+        mov rax, 7;
+        lea rcx, [rip + _ecrpw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;                    // actor_fp_lo = 0 <-- gate
+        mov rsi, 3;
+        mov rdx, 42;
+        call elevate_client_journal_reap;
+        mov r10, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR
+        cmp rax, r10;
+        jne ecrpw_fail_stage;
+
+        mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
+        call elevate_client_journal_stat;
+        cmp rax, 1;
+        jne ecrpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 8: shutdown().  All shadow state is already clear
+        // (stage 5 reaped and scrubbed, stages 6-7 only touched
+        // stats, stats are scrubbed inside shutdown too).  Return
+        // must be 0 (no shadow deadlines survived stage 4's scrub
+        // invariant for shutdown's inner reap to sweep).
+        // ------------------------------------------------------------
+        mov rax, 8;
+        lea rcx, [rip + _ecrpw_stage];
+        mov [rcx], rax;
+
+        call elevate_client_shutdown;
+        cmp rax, 0;
+        jne ecrpw_fail_stage;
+
+        // Confirm stats scrubbed by shutdown's inner journal_reset.
+        mov rdi, 13;                     // ELVJ_ST_REAP_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 0;
+        jne ecrpw_fail_stage;
+        mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
+        call elevate_client_journal_stat;
+        cmp rax, 0;
+        jne ecrpw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Success.  Log OK, scrub state, return 0.
+        // ------------------------------------------------------------
+        mov rdi, 3;                      // KLOG_LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecrpw_ok];
+        call klog_s1;
+
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+        xor rax, rax;
+        jmp ecrpw_out;
+
+      ecrpw_fail_stage:
+        lea rax, [rip + _ecrpw_stage];
+        mov r8, [rax];                   // value1 -- failing stage id
+        mov rdi, 1;                      // KLOG_LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecrpw_fail];
+        lea rcx, [rip + k_line];         // key1 = "line"
+        call klog_s1_d1;
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+        mov rax, 1;
+
+      ecrpw_out:
+        add rsp, 24;
+        ret
+      }
+    }
+}

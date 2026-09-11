@@ -10,7 +10,114 @@ covers.
 
 ## Unreleased
 
-### #29 — LE.M4-001 per-cap-mask duration ceilings on validator (2026-09-11)
+### #30 — LE.M4-002 elevate_client_cap_reap_expired idle-time sweep (2026-09-11)
+
+- Named gap closed: today the shadow deadline map at
+  `src/elevate_client_cap.pdx` (`_elevate_client_cap_expire_map`, 16
+  slots) is only consulted when a caller explicitly invokes
+  `elevate_client_cap_check_and_revoke(row_id)` or
+  `elevate_client_require(row_id, caps)`. A row minted and never
+  re-checked (caller returned early, caller crashed post-mint, caller
+  lost its `row_id` reference) stayed live in the kernel table until
+  its cap slot was reclaimed by other means. No idle-time sweep
+  existed.
+- New entry point in `src/elevate_client_cap.pdx`:
+  ```
+  elevate_client_cap_reap_expired() -> reaped_count : u64
+    !{mem} @{cap, boot}
+  ```
+  Walks all 16 shadow slots; for each slot whose deadline is non-zero
+  and past `hpet_now_ns()`, calls `elevate_channel_cap_revoke` and
+  scrubs the row's shadow state via `elevate_client_cap_scrub_row`.
+  Returns the count of rows freshly revoked this call (kernel
+  `ELVC_OK`).  Rows the kernel reports already revoked
+  (`ELVC_REVOKE_ALREADY`), or that never made it into the kernel
+  table (`ELVC_ERR_BAD_SLOT` / other refusal), are STILL scrubbed
+  so the shadow stays coherent, but are NOT counted and NOT audited
+  -- exactly the OK-vs-ALREADY discrimination
+  `elevate_client_cap_revoke_cascade` already runs.  Idempotent: a
+  back-to-back second call returns 0 by construction (every row the
+  first call touched has its deadline slot scrubbed to 0 regardless
+  of the kernel revoke's outcome, so the second pass skips it at the
+  "deadline == 0 -> not bound" gate before any kernel touch).
+- New optional teardown helper in the same file:
+  ```
+  elevate_client_shutdown() -> reaped_count : u64
+    !{mem} @{cap, boot}
+  ```
+  Composes `elevate_client_cap_reap_expired` +
+  `elevate_client_cap_reset` + `elevate_client_journal_reset` for
+  tools whose exit path is "just stop"; returns the reap count so a
+  caller can log "shut down with N grants reaped" without a separate
+  call.  Tools with their own explicit revoke discipline may skip
+  this helper and call `elevate_client_cap_reset` directly.
+- New audit event kind in `src/elevate_client_journal.pdx`:
+  `ELVJ_EVT_REAP = 7`.  Issue #30's AC text names this constant as
+  "= 5" -- an apparent slip: 5 is already firmly assigned to
+  `ELVJ_EVT_REVOKE_CASCADE` (LE.M7-001, #35) and 6 to
+  `ELVJ_EVT_CASCADE_ABORT` (#53).  Following #35's own precedent
+  exactly (#35's AC text named its constant "= 6" but landed at 5,
+  the next contiguous free slot at that time), REAP lands at 7, the
+  next contiguous free slot today.
+- New audit sink in the same file:
+  `elevate_client_journal_reap(actor_fp_lo, row_id, deadline_ns)
+   -> seq | ELVJ_ERR_*` (shape mirrors
+  `elevate_client_journal_revoke_cascade`; only `body0` and `body1/2`
+  meanings differ).  `body1 = row_id`, `body2 = deadline_ns` -- an
+  auditor can subtract wall-clock time on the surrounding uej seq
+  to learn how long the row lingered past its bound, which is the
+  "return early after mint" pattern issue #30 names as the reap's
+  motivating case.  Best-effort discipline: `reap_expired` ignores
+  the return, matching how `revoke_cascade` treats its own per-row
+  audit records.
+- New error code `ELVJ_ERR_REAP_JOURNAL_FAIL = 0xFFFFEA47` (slot 7
+  in the shared B4 band 0xFFFFEA40..4F).  Declared for completeness /
+  band coverage even though `reap_expired` deliberately ignores it.
+- Journal stats table widened from 13 to 15 slots for the two new
+  counters `ELVJ_ST_REAP_WRITES = 13` and `ELVJ_ST_REAP_FAILS = 14`.
+  `elevate_client_journal_reset` / `_note` / `_stat` bound updated
+  accordingly (13 -> 15 in all three loops / gates).  A healthy
+  long-running process shows the writes counter growing SLOWLY (a
+  fast-growing reap counter signals a caller that repeatedly leaks
+  grants past their deadline instead of revoking them itself).
+- `caps.decl` gains a stanza for the two new entry points:
+  `KIND_ELEVATE_CHANNEL(revoke, row_id) +
+   KIND_IPC_ENDPOINT(write, uej)`.  Union of `_check_and_revoke`'s
+  cap and the audit-fanout cap the other `journal_*` entries already
+  declare -- no new cap kind introduced.
+- New witness `tests/elevate_client_reap_test.pdx`, fingerprint
+  `LIBPDX-ELEVATE LE.M4 REAP OK`.  Eight stages: empty-map -> 0
+  (stage 2), 3 injected past-deadline rows accept a count in [0, 3]
+  in the boot environment (stage 3; same tolerant pattern
+  `elevate_client_revoke_cascade_test.pdx`'s stages 7-8 already
+  establish for their kernel-touching branch, because a boot witness
+  has no live broker and `elevate_channel_cap_revoke` typically
+  returns `ELVC_ERR_BAD_SLOT` for a never-minted row), shadow-scrub
+  invariant on those three slots (stage 4), unconditional
+  idempotency on the second call (stage 5, gated by the invariant),
+  `journal_reap` OK-path + stats bump (stage 6), `journal_reap`
+  bad-actor gate (stage 7), and `shutdown` clean teardown (stage 8).
+  Labels prefixed `ecrpw_`.  The `ELVJ_EVT_REAP == 7` constant is
+  verified by source inspection + this CHANGELOG entry rather than
+  by the witness; a runtime check would need the LE.M2-002 audit
+  sink, whose population depends on libpdx-audit's `audit_append_leaf`
+  being resolved at boot (a PENDING dep) -- deliberately kept out of
+  this witness so a boot regression in libpdx-audit does not mask a
+  genuine reap regression.
+- Scaffolding note for the "3 past-deadline rows" case: the witness
+  injects deadlines by direct `mov [_elevate_client_cap_expire_map +
+  N*8], 1` writes (value `1` sits unambiguously earlier than any
+  `hpet_now_ns` reading; no arithmetic on `now_ns` needed), sandwiched
+  between a full reset and the reap call.  Same idiom
+  `tests/elevate_client_revoke_cascade_test.pdx`'s stage 2 already
+  uses to poke non-zero values into the shadow maps.
+- No caller migration required: `reap_expired` / `shutdown` are
+  additive entry points.  A boot-idle wire-up (paideia-os boot
+  cascade calls `reap_expired` once every ~10 s in a low-priority
+  slot) is noted in this ticket for the kernel side but lives
+  outside this repo.
+
+
 
 - Named gap: `elevate_request_duration_valid` in
   `src/elevate_request.pdx` accepted any duration in `[1 s, 1 h]`

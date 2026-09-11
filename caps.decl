@@ -64,6 +64,18 @@
   # caller-supplied broker context). No union with elevate_client_cap_mint's
   # entry: this function never mints.
 
++entry elevate_client_cap_reap_expired
++entry elevate_client_shutdown
+  KIND_ELEVATE_CHANNEL(revoke, row_id)
+  KIND_IPC_ENDPOINT(write, uej)
+  # LE.M4-002 (#30): idle-time sweep of the 16-slot shadow deadline map
+  # (reap_expired) and its teardown-time composition with reset
+  # (shutdown = reap + reset). Union of _check_and_revoke's cap (revokes
+  # one kernel row per expired shadow slot) and the audit-fanout cap
+  # (per successful reap it emits one ELVJ_EVT_REAP record via
+  # elevate_client_journal_reap -- best-effort, but the cap must still
+  # be held for the write to succeed).
+
 +entry elevate_client_cap_drain_broker_exp
   KIND_IPC_ENDPOINT(read, reply_ep_id)
   KIND_ELEVATE_CHANNEL(revoke, row_id)

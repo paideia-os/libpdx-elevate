@@ -55,11 +55,10 @@ Source-breaking to a 3-arg caller of `_derive`; there are no working
 LE.M4, M6, M7 (issues #29-#30, #33-#36) — reap, audit sink,
 revoke-cascade — all DEFERRED to the follow-up wave; comment posted
 on each issue. LE.M5 (#31, #32, attestation), LE.M7-001/002 (#35,
-#36, revoke cascade), and LE.M4-001 (#29, per-cap-mask duration
-ceilings) have since landed — see below. LE.M4-002 (#30,
-`elevate_client_cap_reap_expired`) and LE.M6 (#33, #34, audit sink)
-remain deferred; #30 stays open by the reporter's own request even
-though revoke_cascade's landing removes its stated blocker.
+#36, revoke cascade), LE.M4-001 (#29, per-cap-mask duration
+ceilings), and LE.M4-002 (#30, `elevate_client_cap_reap_expired`)
+have since landed — see below. LE.M6 (#33, #34, audit sink) remains
+deferred.
 
 ## LE.M4-001 — per-cap-mask duration ceilings (landed, 2026-09-11)
 
@@ -103,6 +102,58 @@ caller reaches the ceiling gate via `elevate_request_write_frame`,
 which returns the new error unchanged.  A consumer that used to
 hold a destructive cap for > 60 s now fails at the packer instead
 of at the broker, matching issue #29's stated end-state.
+
+## LE.M4-002 — idle-time reap of the shadow deadline map (landed, 2026-09-11)
+
+`elevate_client_cap_reap_expired() -> reaped_count : u64`
+(`src/elevate_client_cap.pdx`, #30) walks the 16-slot shadow
+deadline map and, for each slot whose deadline is past
+`hpet_now_ns()`, calls `elevate_channel_cap_revoke` and scrubs the
+row's shadow state via `elevate_client_cap_scrub_row`.  Returns the
+count of rows freshly revoked (kernel `ELVC_OK`); rows the kernel
+reports `ELVC_REVOKE_ALREADY` or that never made it into the kernel
+table are still scrubbed to keep the shadow coherent, but are not
+counted / audited — same OK-vs-ALREADY discrimination
+`elevate_client_cap_revoke_cascade` already runs.  Idempotent by
+construction: every touched slot has its deadline scrubbed to 0
+regardless of the kernel revoke's outcome, so a back-to-back second
+call finds no non-zero deadlines and returns exactly 0 before any
+kernel round-trip.
+
+Per successfully-revoked row, one `ELVJ_EVT_REAP = 7` audit record
+lands via `elevate_client_journal_reap(actor_fp_lo, row_id,
+deadline_ns)`.  `body2 = deadline_ns` lets an auditor subtract
+wall-clock time on the surrounding uej seq to learn how long the row
+lingered past its bound — the "return early after mint" pattern
+issue #30 names as the reap's motivating case.  `ELVJ_EVT_REAP`
+lands at 7 (not the "= 5" the issue AC text names, which collided
+with `ELVJ_EVT_REVOKE_CASCADE`; same next-contiguous-free-slot
+convention #35's own AC text-vs-landed-value deviation established).
+
+An optional teardown helper `elevate_client_shutdown() ->
+reaped_count : u64` composes `reap_expired` + `elevate_client_cap_
+reset` + `elevate_client_journal_reset` for tools whose exit path
+is "just stop".  Tools with their own explicit revoke discipline
+may skip the helper.
+
+Witness `tests/elevate_client_reap_test.pdx` (fingerprint
+`LIBPDX-ELEVATE LE.M4 REAP OK`) covers: empty-map -> 0, 3-injected
+past-deadline rows accepting count in [0, 3] under the tolerant
+boot-witness pattern (kernel revoke branch is environment-dependent
+without a live broker), shadow-scrub invariant, unconditional
+idempotency on the second call, `journal_reap` OK-path,
+`journal_reap` bad-actor gate, and `shutdown` clean teardown.  The
+`ELVJ_EVT_REAP == 7` constant deviation is documented in the
+CHANGELOG + the constant's own header comment; verifying it at
+runtime would require the LE.M2-002 audit sink whose population
+depends on libpdx-audit's `audit_append_leaf` (a PENDING dep) --
+deliberately kept out of the witness so a boot regression in
+libpdx-audit cannot mask a reap regression.
+
+Consumer impact: none direct — housekeeping.  Consumers that leak
+grants no longer leak them indefinitely if a boot-idle callback (or
+their own exit path via `elevate_client_shutdown`) periodically
+sweeps.
 
 ## LE.M5 — attestation (M5-001/002 landed; M5-003+ not filed)
 

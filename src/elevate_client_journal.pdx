@@ -173,6 +173,21 @@
 //                                          missing marker is a thinner
 //                                          audit trail, not a live
 //                                          over-grant.
+//   0xFFFFEA47  ELVJ_ERR_REAP_JOURNAL_FAIL
+//                                       -- uej_append refused the REAP
+//                                          record (LE.M4-002, libpdx-
+//                                          elevate#30).  Emitted once per
+//                                          row elevate_client_cap_reap_
+//                                          expired successfully sweeps
+//                                          out of the shadow deadline
+//                                          map.  Same best-effort
+//                                          discipline as the two
+//                                          REVOKE_CASCADE codes above --
+//                                          reap is REMOVING authority,
+//                                          so a failed audit is a
+//                                          thinner trail, not a live
+//                                          over-grant.  Declared for
+//                                          completeness / band coverage.
 
 module ElevateClientJournal = structure {
 
@@ -261,6 +276,36 @@ module ElevateClientJournal = structure {
   //           return that triggered the abort)
   pub let ELVJ_EVT_CASCADE_ABORT : u64 = 6
 
+  // LE.M4-002 (libpdx-elevate#30): per-row reap discriminator.  Fires
+  // from elevate_client_cap_reap_expired (elevate_client_cap.pdx), once
+  // per shadow-map slot whose deadline it successfully sweeps out
+  // (revoked in the kernel + shadow scrubbed).  Chosen as 7 -- the next
+  // contiguous body0 slot after CASCADE_ABORT -- so the six
+  // discriminators still read as a chronological family: REQ, APR, OP,
+  // ATTEST, REVOKE_CASCADE, CASCADE_ABORT, REAP.
+  //
+  // Issue #30's own AC text names this constant as "= 5" -- an
+  // apparent slip: 5 is already firmly assigned to ELVJ_EVT_REVOKE_
+  // CASCADE above (which itself deviated from its own issue's literal
+  // "= 6", for the same next-contiguous-slot reason), and 6 is now
+  // assigned to ELVJ_EVT_CASCADE_ABORT.  Following #35's precedent
+  // exactly, this constant lands at the next FREE contiguous slot
+  // rather than colliding with an already-shipped discriminator.
+  //
+  // Body layout (mirrors journal_revoke_cascade's shape, differs only
+  // in what body1/body2 mean):
+  //
+  //   body0 = ELVJ_EVT_REAP (7)
+  //   body1 = row_id                     -- the row swept out this call
+  //   body2 = deadline_ns                -- the past deadline that made
+  //                                          the row eligible for reap;
+  //                                          an auditor can subtract
+  //                                          the wall-clock time on
+  //                                          the surrounding uej seq to
+  //                                          learn how long the row
+  //                                          lingered past its bound.
+  pub let ELVJ_EVT_REAP : u64 = 7
+
   // ---- Result codes / error band 0xFFFFEA40..0xFFFFEA4F ----
 
   pub let ELVJ_OK                      : u64 = 0
@@ -271,6 +316,7 @@ module ElevateClientJournal = structure {
   pub let ELVJ_ERR_ATTEST_JOURNAL_FAIL : u64 = 0xFFFFEA44
   pub let ELVJ_ERR_REVOKE_CASCADE_JOURNAL_FAIL : u64 = 0xFFFFEA45
   pub let ELVJ_ERR_CASCADE_ABORT_JOURNAL_FAIL  : u64 = 0xFFFFEA46
+  pub let ELVJ_ERR_REAP_JOURNAL_FAIL           : u64 = 0xFFFFEA47  // LE.M4-002 (#30)
 
   // Threshold used to discriminate uej_append return (seq | UEJ_ERR_*)
   // from a valid seq.  UEJ_MAX_RECORDS = 256 per user_events_journal.
@@ -316,8 +362,23 @@ module ElevateClientJournal = structure {
   //                   per-row REVOKE_CASCADE record above -- but the
   //                   counter is here so a health probe can spot a
   //                   journal that is silently dropping abort markers.
+  //   13 reap_writes    successful REAP journal appends (LE.M4-002,
+  //                   #30) -- one per row elevate_client_cap_reap_
+  //                   expired sweeps out of the shadow deadline map.
+  //                   A healthy long-running process shows this
+  //                   counter growing SLOWLY (a fast-growing reap
+  //                   counter signals a caller that repeatedly leaks
+  //                   grants past their deadline instead of revoking
+  //                   them itself, the "return early after mint"
+  //                   pattern #30's issue names as the target).
+  //   14 reap_fails     uej_append refused a REAP record.  Same
+  //                   best-effort discipline as REVOKE_CASCADE_FAILS
+  //                   and CASCADE_ABORT_FAILS above -- the caller
+  //                   (reap_expired) ignores the return; the counter
+  //                   is here so a health probe can spot a journal
+  //                   that is silently dropping reap markers.
 
-  pub let mut _elevate_client_journal_stats : [u64; 13] = uninit @align(64)
+  pub let mut _elevate_client_journal_stats : [u64; 15] = uninit @align(64)
 
   pub let ELVJ_ST_REQ_WRITES    : u64 = 0
   pub let ELVJ_ST_APR_WRITES    : u64 = 1
@@ -332,7 +393,9 @@ module ElevateClientJournal = structure {
   pub let ELVJ_ST_REVOKE_CASCADE_FAILS  : u64 = 10  // LE.M7-001 (#35)
   pub let ELVJ_ST_CASCADE_ABORT_WRITES  : u64 = 11  // #53
   pub let ELVJ_ST_CASCADE_ABORT_FAILS   : u64 = 12  // #53
-  pub let ELVJ_ST_MAX           : u64 = 13
+  pub let ELVJ_ST_REAP_WRITES           : u64 = 13  // LE.M4-002 (#30)
+  pub let ELVJ_ST_REAP_FAILS            : u64 = 14  // LE.M4-002 (#30)
+  pub let ELVJ_ST_MAX           : u64 = 15
 
   // ==========================================================================
   // libpdx-audit mirror plumbing (LE.M2-002, libpdx-elevate#38)
@@ -441,7 +504,7 @@ module ElevateClientJournal = structure {
   pub let elevate_client_journal_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M3-001 (#6), extended to 10 slots at LE.M5-001 (#31) for the ATTEST write/fail counters, extended again to 11 at LE.M7-001 (#35) for the REVOKE_CASCADE write counter, extended again to 13 at #53 for the CASCADE_ABORT write/fail counters: clear the journal stats table. Boot / teardown discipline; a live counter reset would race any concurrent journal_req / journal_apr call. Leaf; single loop. Labels prefixed elcj_rs_.",
+      justification: "libpdx-elevate.M3-001 (#6), extended to 10 slots at LE.M5-001 (#31) for the ATTEST write/fail counters, extended again to 11 at LE.M7-001 (#35) for the REVOKE_CASCADE write counter, extended again to 13 at #53 for the CASCADE_ABORT write/fail counters, widened again to 15 at LE.M4-002 (#30) for the REAP write/fail counters: clear the journal stats table. Boot / teardown discipline; a live counter reset would race any concurrent journal_req / journal_apr call. Leaf; single loop. Labels prefixed elcj_rs_.",
       block: {
         lea r10, [rip + _elevate_client_journal_stats];
         xor rax, rax;
@@ -449,7 +512,7 @@ module ElevateClientJournal = structure {
       elcj_rs_loop:
         mov [r10 + rcx * 8], rax;
         add rcx, 1;
-        cmp rcx, 13;
+        cmp rcx, 15;
         jb  elcj_rs_loop;
         ret
       }
@@ -458,9 +521,9 @@ module ElevateClientJournal = structure {
   pub let elevate_client_journal_note : (u64) -> () !{mem} @{} =
     fn (which: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M3-001 (#6), bound widened 8->10 at LE.M5-001 (#31), widened again 10->11 at LE.M7-001 (#35), widened again 11->13 at #53: bounded increment; out-of-range which is a no-op. Same shape as elevate_client_note (elevate_client.pdx L127). Labels prefixed elcj_nt_.",
+      justification: "libpdx-elevate.M3-001 (#6), bound widened 8->10 at LE.M5-001 (#31), widened again 10->11 at LE.M7-001 (#35), widened again 11->13 at #53, widened again 13->15 at LE.M4-002 (#30): bounded increment; out-of-range which is a no-op. Same shape as elevate_client_note (elevate_client.pdx L127). Labels prefixed elcj_nt_.",
       block: {
-        cmp rdi, 13;
+        cmp rdi, 15;
         jae elcj_nt_out;
         lea r10, [rip + _elevate_client_journal_stats];
         mov rax, [r10 + rdi * 8];
@@ -474,9 +537,9 @@ module ElevateClientJournal = structure {
   pub let elevate_client_journal_stat : (u64) -> u64 !{mem} @{} =
     fn (which: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-elevate.M3-001 (#6), bound widened 8->10 at LE.M5-001 (#31), widened again 10->11 at LE.M7-001 (#35), widened again 11->13 at #53: bounded read; out-of-range which returns 0 (0 is the correct answer for both 'never touched' and 'out of range' -- same convention as elevate_client_stat). Labels prefixed elcj_st_.",
+      justification: "libpdx-elevate.M3-001 (#6), bound widened 8->10 at LE.M5-001 (#31), widened again 10->11 at LE.M7-001 (#35), widened again 11->13 at #53, widened again 13->15 at LE.M4-002 (#30): bounded read; out-of-range which returns 0 (0 is the correct answer for both 'never touched' and 'out of range' -- same convention as elevate_client_stat). Labels prefixed elcj_st_.",
       block: {
-        cmp rdi, 13;
+        cmp rdi, 15;
         jae elcj_st_zero;
         lea r10, [rip + _elevate_client_journal_stats];
         mov rax, [r10 + rdi * 8];
@@ -1085,6 +1148,108 @@ module ElevateClientJournal = structure {
         ret;
 
       elcj_ca_bad_actor:
+        mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
+        call elevate_client_journal_note;
+        mov rax, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // elevate_client_journal_reap(actor_fp_lo, row_id, deadline_ns)
+  //   -> seq | ELVJ_ERR_*
+  //
+  // LE.M4-002 (libpdx-elevate#30).  Append a per-row REAP audit record:
+  // one call per row elevate_client_cap_reap_expired (elevate_client_
+  // cap.pdx) successfully sweeps out of the shadow deadline map (kernel
+  // revoke returned ELVC_OK -- the ALREADY / BAD_SLOT / other paths
+  // are scrubbed but NOT audited from here, same discriminator
+  // discipline elevate_client_cap_revoke_cascade already establishes:
+  // the audit trail counts rows this call REMOVED authority for, not
+  // rows that were already gone by other means).
+  //
+  // Shape mirrors elevate_client_journal_revoke_cascade exactly -- see
+  // that function's justification for the alignment / gate / mirror
+  // reasoning; the only differences are body0 = ELVJ_EVT_REAP (7) and
+  // body1/body2 = (row_id, deadline_ns) rather than (row_id, cascade_
+  // root_row_id). row_id is the row just reaped; deadline_ns is the
+  // past shadow deadline that made the row eligible for reap this
+  // call, so an auditor can subtract wall-clock time (recoverable from
+  // the surrounding uej seq's timestamp on the sink) to learn how
+  // long the row lingered past its bound -- the SAME "return early
+  // after mint" pattern issue #30 names as the reap's motivating case.
+  //
+  // The caller (reap_expired) treats this call as best-effort and
+  // ignores the return -- same discipline as journal_revoke_cascade
+  // (see its AUDIT + ACTOR section) and journal_cascade_abort: a reap
+  // is REMOVING authority, so a failed audit is a thinner trail, not
+  // a live over-grant.
+  //
+  // Register plan / alignment: identical shape to journal_revoke_
+  // cascade -- three callee-save pushes (r12=actor, r13=row_id,
+  // r14=deadline_ns) = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0,
+  // no pad needed for the mirror or uej_append CALLs.
+  // ==========================================================================
+
+  pub let elevate_client_journal_reap : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (actor_fp_lo: u64) (row_id: u64) (deadline_ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.LE.M4-002 (#30): append a per-row REAP audit record. Shape mirrors elevate_client_journal_revoke_cascade -- see that function's justification for the alignment / gate / mirror reasoning; the only differences are body0 = ELVJ_EVT_REAP (7) and body1/body2 = (row_id, deadline_ns) rather than (row_id, cascade_root_row_id). Three callee-save pushes (r12=actor, r13=row_id, r14=deadline_ns) = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0 so BOTH the LE.M2-002 mirror CALL (_elevate_client_audit_stage) AND the follow-up uej_append CALL see aligned rsp -- no additional pad. Gate order matches every sibling: actor_fp_lo != 0 first; the mirror is skipped on the bad-actor path. Failure normalises to ELVJ_ERR_REAP_JOURNAL_FAIL and bumps ELVJ_ST_REAP_FAILS; success bumps ELVJ_ST_REAP_WRITES. Labels prefixed elcj_rp_ (disjoint from elcj_rc_ / elcj_ca_ / every other elcj_* prefix in this file).",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                    // actor_fp_lo
+        mov r13, rsi;                    // row_id (just reaped)
+        mov r14, rdx;                    // deadline_ns (the past deadline)
+
+        cmp r12, 0;
+        je  elcj_rp_bad_actor;
+
+        // ---- LE.M2-002: mirror through libpdx-audit. --------------------
+        mov rdi, r12;                    // actor_fp_lo
+        mov rsi, 7;                      // body0 = ELVJ_EVT_REAP
+        mov rdx, r13;                    // body1 = row_id
+        mov rcx, r14;                    // body2 = deadline_ns
+        call _elevate_client_audit_stage;
+
+        mov rdi, 5;                      // ELVJ_UEJ_KIND_ELEVATE
+        mov rsi, r12;                    // actor_fp_lo
+        xor rdx, rdx;                    // subject_fp_lo = 0
+        mov rcx, 7;                      // ELVJ_EVT_REAP
+        mov r8,  r13;                    // row_id
+        mov r9,  r14;                    // deadline_ns
+        call uej_append;
+
+        cmp rax, 256;                    // ELVJ_UEJ_SEQ_MAX
+        jae elcj_rp_fail;
+
+        push rax;
+        sub rsp, 8;
+        mov rdi, 13;                     // ELVJ_ST_REAP_WRITES
+        call elevate_client_journal_note;
+        add rsp, 8;
+        pop rax;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcj_rp_fail:
+        mov rdi, 14;                     // ELVJ_ST_REAP_FAILS
+        call elevate_client_journal_note;
+        mov rax, 0xFFFFEA47;             // ELVJ_ERR_REAP_JOURNAL_FAIL
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      elcj_rp_bad_actor:
         mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
         call elevate_client_journal_note;
         mov rax, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR
