@@ -832,12 +832,24 @@ module ElevateClientSend = structure {
 
   // ==========================================================================
   // ELVC_CTX_* -- byte offsets into the explicit-context buffer
-  // consumed by elevate_client_request_ex_ctx (ENH-006, #17).
+  // consumed by elevate_client_request_ex_ctx (ENH-006, #17) and, at
+  // LE.M1-002 (#20), by the ctx twins of the three wrappers up the
+  // stack: elevate_client_request_ex_j_ctx (journal.pdx),
+  // elevate_client_request_ex_r_ctx (retry.pdx), and
+  // elevate_client_acquire_ctx (acquire.pdx). All four consumers agree
+  // on this SAME layout so a caller composing them (shell brokering N
+  // concurrent jobs -- the motivating case at #17 and #20) sees one
+  // ctx shape end-to-end. The three legacy globals-based entry points
+  // are preserved as THIN wrappers over the ctx variants via
+  // _elevate_client_build_default_ctx (below), which snapshots the
+  // process-global mutables into a stack-local ctx buffer.
   // ==========================================================================
   //
-  // 32 bytes, four u64 words. Every field is "0 = use the constant
-  // default", exactly the convention _elevate_client_human_timeout_ns
-  // / _elevate_client_fast_timeout_ns already use for THEIR mutable
+  // 40 bytes, five u64 words (grown at the #20 build-fix from 32 bytes
+  // / 4 words -- see the WHY SIX ARGS note on elevate_client_acquire_
+  // ctx in acquire.pdx). Every field with a 0-means-default sentinel
+  // uses the SAME convention _elevate_client_human_timeout_ns /
+  // _elevate_client_fast_timeout_ns already use for THEIR mutable
   // globals -- the difference is that these values live in a buffer
   // the CALLER owns per call, so two callers running concurrently each
   // supply their own without touching any process-wide state.
@@ -853,11 +865,79 @@ module ElevateClientSend = structure {
   //                                 directly regardless of the policy
   //                                 hit/miss classification (the
   //                                 consult still runs, for accounting)
+  //   [+32] mint_ctx_buf_ptr    -- ACQUIRE-ONLY. Pointer to the caller-
+  //                                 owned 40-byte mint_ctx buffer (see
+  //                                 acquire.pdx's file header for the
+  //                                 5-word mint layout). Read ONLY by
+  //                                 elevate_client_acquire_ctx; the
+  //                                 other three consumers (_ex_ctx,
+  //                                 _ex_j_ctx, _ex_r_ctx) never touch
+  //                                 this offset, so a caller that
+  //                                 composes only those three may pass
+  //                                 a 32-byte buffer and skip the slot.
+  //                                 A caller feeding _acquire_ctx MUST
+  //                                 own a 40-byte buffer and set this
+  //                                 slot to a non-zero mint_ctx pointer
+  //                                 (0 refuses ELCA_ERR_BAD_BUF).
+  //                                 Folded into the ctx at #20's build
+  //                                 fix (was a separate 7th argument to
+  //                                 acquire_ctx in the initial draft --
+  //                                 paideia-as's unsafe-body encoder
+  //                                 caps lambdas at 6 params, error
+  //                                 B1708; folding pointer into ctx
+  //                                 preserves the flow without demoting
+  //                                 the block to a safe body).
 
   pub let ELVC_CTX_TARGET_FP_LO_OFF     : u64 = 0
   pub let ELVC_CTX_FAST_TIMEOUT_OFF     : u64 = 8
   pub let ELVC_CTX_HUMAN_TIMEOUT_OFF    : u64 = 16
   pub let ELVC_CTX_EXPLICIT_TIMEOUT_OFF : u64 = 24
+  pub let ELVC_CTX_MINT_CTX_BUF_OFF     : u64 = 32
+
+  // ==========================================================================
+  // _elevate_client_build_default_ctx(ctx_buf_out, explicit_timeout_ns) -> ()
+  //
+  // LE.M1-002 (#20): shared "hidden default-context helper" used by the
+  // process-global-singleton wrappers around every ctx variant --
+  // elevate_client_request_ex_j (thin wrapper over _ex_j_ctx),
+  // elevate_client_request_ex_r (thin wrapper over _ex_r_ctx), and
+  // elevate_client_acquire (thin wrapper over _acquire_ctx). Snapshots
+  // the process-global `_elevate_client_target_fp_lo` into ctx_buf[+0]
+  // and zeros the fast/human timeout slots (0 == "use the constant
+  // default", identical to what the getters resolve on an unset
+  // mutable slot). The caller passes its own `timeout_ns` argument as
+  // `explicit_timeout_ns` (ctx_buf[+24]) so the wrapper's user-facing
+  // semantics are unchanged: 0 -> auto-select fast/human by policy,
+  // >0 -> use directly.
+  //
+  // Private-by-convention (leading underscore) rather than a bare `let`
+  // because the entire module's declarations use `pub let`; downstream
+  // tools should NOT call this directly -- the three wrappers above are
+  // the intended call sites. The helper's own frame is minimal: no
+  // callee-save writes, four qword stores plus one process-global
+  // read, one `ret`. capabilities: {} -- reads a bss global via lea+
+  // mov, mirroring elevate_client_get_target_fp_lo's own annotation.
+  //
+  // Args (SysV): rdi = ctx_buf_out (caller-owned 32-byte scratch,
+  // typically a stack buffer inside the wrapper's own frame),
+  // rsi = explicit_timeout_ns (raw caller value; 0 preserved).
+  // ==========================================================================
+
+  pub let _elevate_client_build_default_ctx : (u64, u64) -> () !{mem} @{} =
+    fn (ctx_buf_out: u64) (explicit_timeout_ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.LE.M1-002 (#20): shared 'hidden default-context helper' that snapshots the three process-global mutables (_elevate_client_target_fp_lo, plus 0-means-default sentinels for _elevate_client_fast_timeout_ns / _human_timeout_ns) into a caller-owned 32-byte ctx buffer. Callers are the three process-global-singleton WRAPPERS around the new ctx variants (elevate_client_request_ex_j, _ex_r, _acquire) -- their public signatures stay unchanged, they build a stack-local ctx here, and delegate to the corresponding _ctx entry point. The stored fast/human sentinels are 0 (not the resolved constants) because the ctx variant's own timeout-resolution path (see elevate_client_request_ex_ctx's elcx_rx_have_timeout block) already substitutes ELVC_FAST_TIMEOUT_DEFAULT_NS / ELVC_HUMAN_TIMEOUT_DEFAULT_NS for a 0 slot, matching the getter behaviour byte-for-byte. explicit_timeout_ns is the caller's own `timeout_ns` argument forwarded verbatim (0 preserved) so the wrapper's user-facing semantics are unchanged (0 -> auto-select fast/human by policy; >0 -> use directly). Leaf; four qword stores + one bss read. No callee-save writes. rax used as zero source for the two default-sentinel slots; r10 holds the &target_fp_lo pointer across the load. Alignment: no nested CALL, no stack adjustment required (caller's rsp discipline is unchanged). Labels prefixed elcs_bd_.",
+      block: {
+        lea r10, [rip + _elevate_client_target_fp_lo];
+        mov rax, [r10 + 0];
+        mov [rdi + 0], rax;              // ctx[+0]  = target_fp_lo (snapshot)
+        xor rax, rax;
+        mov [rdi + 8], rax;              // ctx[+8]  = 0 (fast timeout: default)
+        mov [rdi + 16], rax;             // ctx[+16] = 0 (human timeout: default)
+        mov [rdi + 24], rsi;             // ctx[+24] = explicit_timeout_ns
+        ret
+      }
+    }
 
   // ==========================================================================
   // elevate_client_request_ex_ctx(caps, dur, req_buf, reply_ep_id,

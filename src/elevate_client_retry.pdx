@@ -393,10 +393,44 @@ module ElevateClientRetry = structure {
   // direct `cmp rax, 0xFFFFEA0F` illegal).
   // ==========================================================================
 
-  pub let elevate_client_request_ex_r : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{boot} =
-    fn (caps: u64) (dur: u64) (req_buf: u64) (reply_ep_id: u64) (reply_buf: u64) (timeout_ns: u64) -> unsafe {
+  // ==========================================================================
+  // elevate_client_request_ex_r_ctx(caps, dur, req_buf, reply_ep_id,
+  //                                 reply_buf, ctx_buf)
+  //   -> ELVC_* | ELVJ_ERR_* | ELVR_ERR_*
+  //
+  // LE.M1-002 (#20).  Explicit-context twin of elevate_client_request_
+  // ex_r.  Byte-for-byte the same retry loop as the legacy variant,
+  // with ONE swap: every attempt fires through elevate_client_request_
+  // ex_j_ctx (the ctx-carrying audit-wrapped flow) instead of
+  // elevate_client_request_ex_j (which reads from process globals).
+  // Actor identity and timeouts stay stable across retries because
+  // ctx_buf is caller-owned and lives across the whole call.
+  //
+  // ctx_buf == 0 gate returns ELVC_ERR_BAD_CTX (0xFFFFEA06) before the
+  // loop ever runs and before any retry-stat increment.
+  //
+  // The legacy singleton entry point elevate_client_request_ex_r is
+  // preserved as a THIN WRAPPER over this function (see below) via
+  // _elevate_client_build_default_ctx.
+  //
+  // Register plan mirrors elevate_client_request_ex_r exactly (see that
+  // function's justification for the alignment / stash reasoning): six
+  // callee-save pushes + one 8-byte pad slot at [rsp+0] doubling as
+  // the 1-indexed attempt counter.
+  //
+  //   rbx = caps          (passed through to _ex_j_ctx each attempt)
+  //   r12 = dur           (passed through)
+  //   r13 = req_buf       (passed through)
+  //   r14 = reply_ep_id   (passed through)
+  //   r15 = reply_buf     (passed through)
+  //   rbp = ctx_buf       (passed through as 6th arg to _ex_j_ctx)
+  //   [rsp+0] = attempt   (1-indexed, initially 0)
+  // ==========================================================================
+
+  pub let elevate_client_request_ex_r_ctx : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{boot} =
+    fn (caps: u64) (dur: u64) (req_buf: u64) (reply_ep_id: u64) (reply_buf: u64) (ctx_buf: u64) -> unsafe {
       effects: {mem}, capabilities: {boot},
-      justification: "libpdx-elevate.M3-002 (#7): retry-wrapped full-flow entry point. Six callee-save pushes (rbx=caps, r12=dur, r13=req_buf, r14=reply_ep_id, r15=reply_buf, rbp=timeout_ns) + one 8-byte alignment pad = 56 bytes; entry rsp%16==8 -> (8-56) mod 16 == 0 across every nested call (elevate_client_request_ex_j, get/set/note helpers, elevate_client_retry_delay). The pad slot at [rsp+0] holds the 1-indexed attempt counter (0 pre-loop, pre-incremented at loop top). Retriable set is exactly {ELVC_ERR_TIMEOUT (0xFFFFEA01), ELVC_ERR_SEND_FAIL (0xFFFFEA0D), ELVC_ERR_LOOKUP_FAIL (0xFFFFEA0F)}; every other return (ELVC_OK, ELVJ_ERR_*, any other ELVC_ERR_*, any ELCP_ERR_*) passes through unchanged. Retriable-code compares stage the constant into r11 first per paideia-as compliance rule (imm32 sign-extend forbids direct `cmp rax, 0xFFFFEA0F`). The retry loop always calls elevate_client_request_ex_j -- not the M2 elevate_client_request_ex -- so every attempt writes its own REQ audit record and the eventual success writes its APR record, satisfying the M3 'audit trail integration' + 'per-op consent re-consulted' requirements at r49-r50-plan.md §5.14. ELVR_ERR_EXHAUSTED fires only when max_attempts is reached AND the final attempt was retriable (i.e. we ran out of budget on a broker-side symptom, not on a client-side gate). capability {boot} propagates from elevate_client_request_ex_j and elevate_client_retry_delay. Labels prefixed elcr_rx_.",
+      justification: "libpdx-elevate.LE.M1-002 (#20): explicit-context twin of elevate_client_request_ex_r. Same six callee-save pushes + one 8-byte alignment/attempt-counter pad = 56 bytes; entry rsp%16==8 -> (8-56) mod 16 == 0 across every nested call (elevate_client_request_ex_j_ctx, get/set/note helpers, elevate_client_retry_delay) -- shape mirrors the legacy _ex_r exactly. ONE swap vs. legacy: every attempt fires through elevate_client_request_ex_j_ctx instead of elevate_client_request_ex_j, so the same ctx_buf carries actor identity + timeout classification across every retry. rbp holds ctx_buf for the whole call (never overwritten). ctx_buf==0 gate returns ELVC_ERR_BAD_CTX (0xFFFFEA06) BEFORE the retry loop even starts and BEFORE any stat increment -- an entirely bad-arg call must not count against the retry budget. Retriable-set discriminator (TIMEOUT / SEND_FAIL / LOOKUP_FAIL) is identical to the legacy variant (staged via r11 per paideia-as compliance -- imm32 sign-extend forbids direct `cmp rax, 0xFFFFEA0F`). ELVR_ERR_EXHAUSTED fires only when max_attempts is reached AND the final attempt returned a retriable code. capability {boot} propagates from the nested _ex_j_ctx (which pulls it through _ex_ctx -> recv_reply -> hpet_now_ns) and from retry_delay. Labels prefixed elcr_xc_ (disjoint from elcr_rx_ used by the legacy _ex_r wrapper below).",
       block: {
         push rbx;
         push r12;
@@ -406,18 +440,21 @@ module ElevateClientRetry = structure {
         push rbp;
         sub rsp, 8;                      // align + slot for attempt counter
 
+        cmp r9, 0;
+        je  elcr_xc_bad_ctx;
+
         mov rbx, rdi;                    // caps
         mov r12, rsi;                    // dur
         mov r13, rdx;                    // req_buf
         mov r14, rcx;                    // reply_ep_id
         mov r15, r8;                     // reply_buf
-        mov rbp, r9;                     // timeout_ns
+        mov rbp, r9;                     // ctx_buf
 
         // attempt counter <- 0 (pre-incremented in the loop).
         xor rax, rax;
         mov [rsp + 0], rax;
 
-      elcr_rx_loop:
+      elcr_xc_loop:
         // Bump attempt counter -- 1-indexed inside the loop body.
         mov rax, [rsp + 0];
         add rax, 1;
@@ -427,54 +464,51 @@ module ElevateClientRetry = structure {
         mov rdi, 0;                      // ELVR_ST_ATTEMPTS
         call elevate_client_retry_note;
 
-        // Fire the audit-wrapped elevate.
+        // Fire the ctx-wrapped audit + elevate flow.
         mov rdi, rbx;
         mov rsi, r12;
         mov rdx, r13;
         mov rcx, r14;
         mov r8,  r15;
-        mov r9,  rbp;
-        call elevate_client_request_ex_j;
+        mov r9,  rbp;                    // ctx_buf
+        call elevate_client_request_ex_j_ctx;
 
         // Success?
         cmp rax, 0;
-        je  elcr_rx_success;
+        je  elcr_xc_success;
 
         // Retriable?  Three-way discriminator via staged constants.
         mov r11, 0xFFFFEA01;             // ELVC_ERR_TIMEOUT
         cmp rax, r11;
-        je  elcr_rx_retriable;
+        je  elcr_xc_retriable;
         mov r11, 0xFFFFEA0D;             // ELVC_ERR_SEND_FAIL
         cmp rax, r11;
-        je  elcr_rx_retriable;
+        je  elcr_xc_retriable;
         mov r11, 0xFFFFEA0F;             // ELVC_ERR_LOOKUP_FAIL
         cmp rax, r11;
-        je  elcr_rx_retriable;
+        je  elcr_xc_retriable;
 
-        // Non-retriable -- pass through.  Bump ELVR_ST_PASSTHROUGHS
-        // for observability; the caller's rax survives across the
-        // note bump because elevate_client_retry_note preserves rax
-        // (it only touches r10, its own arg, and its scratch load).
-        // Save rax anyway to be defensive against a future note
-        // implementation that clobbers rax.
+        // Non-retriable -- pass through.  Same rax-preservation
+        // discipline as the legacy _ex_r (push/pad/pop around the
+        // note bump; retry_note preserves rax today but we stay
+        // defensive against a future clobber).
         push rax;
         sub rsp, 8;                      // realign
         mov rdi, 4;                      // ELVR_ST_PASSTHROUGHS
         call elevate_client_retry_note;
         add rsp, 8;
         pop rax;
-        jmp elcr_rx_out;
+        jmp elcr_xc_out;
 
-      elcr_rx_retriable:
+      elcr_xc_retriable:
         // Check budget: attempt >= max_attempts -> exhausted.
         call elevate_client_retry_get_max_attempts;
         mov r11, rax;                    // max
         mov rax, [rsp + 0];              // current attempt (1-indexed)
         cmp rax, r11;
-        jae elcr_rx_exhausted;
+        jae elcr_xc_exhausted;
 
-        // Backoff before the next attempt.  Table lookup indexed by
-        // the current attempt (i.e. delay AFTER this attempt failed).
+        // Backoff before the next attempt.
         mov rdi, rax;                    // attempt (1-indexed)
         call elevate_client_retry_backoff_ns_for_attempt;
         mov rdi, rax;                    // dur_ns
@@ -483,21 +517,78 @@ module ElevateClientRetry = structure {
         // Bump ELVR_ST_RETRIES and loop.
         mov rdi, 2;                      // ELVR_ST_RETRIES
         call elevate_client_retry_note;
-        jmp elcr_rx_loop;
+        jmp elcr_xc_loop;
 
-      elcr_rx_success:
+      elcr_xc_success:
         mov rdi, 1;                      // ELVR_ST_SUCCESSES
         call elevate_client_retry_note;
         xor rax, rax;                    // ELVC_OK
-        jmp elcr_rx_out;
+        jmp elcr_xc_out;
 
-      elcr_rx_exhausted:
+      elcr_xc_exhausted:
         mov rdi, 3;                      // ELVR_ST_EXHAUSTED
         call elevate_client_retry_note;
         mov rax, 0xFFFFEA20;             // ELVR_ERR_EXHAUSTED
 
-      elcr_rx_out:
+      elcr_xc_out:
         add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcr_xc_bad_ctx:
+        mov rax, 0xFFFFEA06;             // ELVC_ERR_BAD_CTX
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let elevate_client_request_ex_r : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{boot} =
+    fn (caps: u64) (dur: u64) (req_buf: u64) (reply_ep_id: u64) (reply_buf: u64) (timeout_ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {boot},
+      justification: "libpdx-elevate.M3-002 (#7) refactored at LE.M1-002 (#20) into a THIN WRAPPER over elevate_client_request_ex_r_ctx: snapshots the three process-global mutables via _elevate_client_build_default_ctx into a stack-local 32-byte ctx buffer, then delegates. Public signature unchanged (no source break). `timeout_ns` semantics preserved -- 0 auto-selects fast/human by policy classification, >0 uses directly -- because the ctx variant's own timeout-resolution block (elevate_client_request_ex_ctx's elcx_rx_have_timeout) substitutes the identical defaults for a 0 slot. Byte-identical to the pre-refactor behaviour in the single-threaded-of-intent case (retry stats, journal records, cap grant). Six callee-save pushes + sub rsp, 40 for a 32-byte stack ctx at [rsp+0..+32) and an 8-byte alignment pad at [rsp+32..+40); total 88 bytes off entry rsp, so pre-CALL rsp%16 == 0 -- aligned for both the build helper and _ex_r_ctx. Labels prefixed elcr_rx_ (retained from pre-refactor for continuity; disjoint from elcr_xc_ which the ctx twin uses).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 40;                     // 32-byte ctx at [rsp+0..+32) + 8-byte pad
+
+        mov rbx, rdi;                    // caps
+        mov r12, rsi;                    // dur
+        mov r13, rdx;                    // req_buf
+        mov r14, rcx;                    // reply_ep_id
+        mov r15, r8;                     // reply_buf
+        mov rbp, r9;                     // timeout_ns
+
+        // ---- Build a stack-local ctx snapshot from the globals. ----
+        lea rdi, [rsp + 0];              // ctx_buf_out
+        mov rsi, rbp;                    // explicit_timeout_ns = caller's timeout_ns
+        call _elevate_client_build_default_ctx;
+
+        // ---- Delegate to the ctx twin. ----
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        mov rcx, r14;
+        mov r8,  r15;
+        lea r9,  [rsp + 0];              // ctx_buf
+        call elevate_client_request_ex_r_ctx;
+        // rax carries the delegated return.
+
+        add rsp, 40;
         pop rbp;
         pop r15;
         pop r14;

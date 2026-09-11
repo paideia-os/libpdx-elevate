@@ -181,10 +181,78 @@ module ElevateClientAcquire = structure {
   // -- same shape as elevate_client_request_ex_j / _ex_r.
   // ==========================================================================
 
-  pub let elevate_client_acquire : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{boot, cap} =
-    fn (caps: u64) (dur: u64) (req_buf: u64) (reply_ep_id: u64) (reply_buf: u64) (mint_ctx_buf: u64) -> unsafe {
+  // ==========================================================================
+  // elevate_client_acquire_ctx(caps, dur, req_buf, reply_ep_id, reply_buf,
+  //                            ctx_buf)
+  //   -> row_id | ELVC_*/ELVJ_*/ELVR_*/ELCC_*/ELCA_*
+  //
+  // LE.M1-002 (#20).  Explicit-context twin of elevate_client_acquire.
+  // Byte-for-byte the same composed flow (request_ex_r -> cap_mint ->
+  // bind_expire_abs -> bind_grant) with ONE swap: step 2 dispatches
+  // through elevate_client_request_ex_r_ctx (which itself threads the
+  // ctx_buf through _ex_j_ctx and _ex_ctx) instead of elevate_client_
+  // request_ex_r. The mint and shadow-bind steps are UNCHANGED in
+  // spirit: the mint reads from a caller-owned 40-byte mint_ctx buffer
+  // (same 5-word layout it always used, described in this file's
+  // header block), and the two shadow-binds read only from reply_buf.
+  //
+  // WHY SIX ARGS (was seven in the initial LE.M1-002 draft):
+  //
+  // paideia-as's unsafe-body encoder caps lambda parameters at 6 --
+  // the hard limit is B1708 "@no_frame (or unsafe-bodied) lambda
+  // cannot accept more than 6 parameters". SAFE-bodied lambdas do
+  // support 7+ args (7th at [rsp+8] on callee entry, per crates/
+  // paideia-as tests/build-emit/sysv_x64_7arg_callee_stack_read.pdx),
+  // but every asm block in this library uses `unsafe { ... }` -- the
+  // whole point of these entry points is the inline-asm composed
+  // flow, so demoting one function to a safe body to escape the cap
+  // would be architecturally wrong. Instead we fold mint_ctx_buf's
+  // pointer INTO the ctx_buf at [+32]: ctx_buf grows from 4 words /
+  // 32 bytes (ENH-006 layout) to 5 words / 40 bytes. See the
+  // ELVC_CTX_*_OFF authoritative layout in elevate_client_send.pdx.
+  // _ex_j_ctx and _ex_r_ctx are UNCHANGED -- they never read [+32],
+  // so the extra slot is invisible to them; a caller composing only
+  // those two entry points may keep passing a 32-byte buffer.
+  //
+  // Gate order (matches acquire's own layout):
+  //   (1)  ctx_buf == 0        -> ELVC_ERR_BAD_CTX (from send module's
+  //                                extension band)
+  //   (2)  mint_ctx_buf == 0   -> ELCA_ERR_BAD_BUF   (mint_ctx_buf is
+  //                                read from [ctx_buf + 32] once gate 1
+  //                                has passed; a 0 there means the
+  //                                caller supplied a ctx but forgot to
+  //                                populate the mint slot)
+  //   (3)  reply_buf == 0      -> ELCA_ERR_BAD_REPLY_BUF
+  //
+  // ctx_buf is gated FIRST because it is the widest surface: an unset
+  // ctx would poison the entire downstream chain (target_fp_lo == 0
+  // triggers ELVJ_ERR_BAD_ACTOR at journal_req; the caller sees an
+  // opaque ELVJ_ code rather than a diagnostic pointing at the bad
+  // arg). mint_ctx_buf and reply_buf gates keep their relative order
+  // from elevate_client_acquire (mint_ctx_buf wins on both-bad; here
+  // reachable only when gate 1 has already passed).
+  //
+  // Register plan:
+  //   rbx = caps            (arg to _ex_r_ctx)
+  //   r12 = dur, then reused post-mint as row_id (dur dead after
+  //         _ex_r_ctx, mirroring acquire's own r12 reuse discipline)
+  //   r13 = req_buf         (arg to _ex_r_ctx)
+  //   r14 = reply_ep_id     (arg to _ex_r_ctx)
+  //   r15 = reply_buf       (read at [+8]/[+16] after a grant)
+  //   rbp = ctx_buf         (6th arg; [rbp+32] holds mint_ctx_buf ptr,
+  //                          loaded once at step 3 into r10 for the
+  //                          mint arg-marshalling)
+  //
+  // Six callee-save pushes + one 8-byte alignment pad = 56 bytes;
+  // entry rsp%16==8 -> (8-56) mod 16 == 0 across every nested call,
+  // matching acquire's own shape. No stack-passed arg (was 7-arg in
+  // the initial draft; see WHY SIX ARGS above).
+  // ==========================================================================
+
+  pub let elevate_client_acquire_ctx : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{boot, cap} =
+    fn (caps: u64) (dur: u64) (req_buf: u64) (reply_ep_id: u64) (reply_buf: u64) (ctx_buf: u64) -> unsafe {
       effects: {mem}, capabilities: {boot, cap},
-      justification: "libpdx-elevate.ENH-001 (#11): composed acquire -- request_ex_r (retry+journal+dispatch) then mint + shadow-bind, returning a row_id HANDLE instead of a bare status. Six callee-save pushes (rbx=caps, r12=dur/row_id, r13=req_buf, r14=reply_ep_id, r15=reply_buf, rbp=mint_ctx_buf) + one 8-byte alignment pad = 56 bytes; entry rsp%16==8 -> (8-56) mod 16 == 0 across every nested call, matching elevate_client_request_ex_j / _ex_r. r12 is reused as the row_id stash post-mint because `dur` is dead once request_ex_r has run -- this avoids a seventh callee-save. mint_ctx_buf fields are read directly into the SysV arg registers immediately before the elevate_client_cap_mint CALL (rbp itself is never overwritten, so the buffer stays valid for the whole function). The elevate channel's OWN rights are fixed at ELCC_RIGHTS_ALL (0x418, fits imm32, loaded directly) rather than read from the ctx buffer -- narrowing is stubbed until libpdx-cap.M2 (see elevate_client_cap_narrow_stub). capabilities {boot, cap} are the exact union of the two capability-bearing callees (elevate_client_request_ex_r needs {boot} via its own hpet_now_ns chain; elevate_client_cap_mint needs {cap}); the two shadow-bind calls need neither. Every failure path passes the callee's OWN return code straight through (no re-wrap), so the original error band identifies which layer refused -- only the mint_ctx_buf==0 gate produces a code owned by this file (ELCA_ERR_BAD_BUF). Labels prefixed elca_aq_.",
+      justification: "libpdx-elevate.LE.M1-002 (#20): explicit-context twin of elevate_client_acquire. SIX arguments -- reduced from an initial 7-arg draft after paideia-as's unsafe-body encoder refused >6 params (error B1708: @no_frame or unsafe-bodied lambdas cap at 6 register args; SAFE-bodied lambdas support 7+ via stack-passed 7th at [rsp+8] on entry, but every asm block in this library uses `unsafe { ... }`). Fix folds mint_ctx_buf into ctx_buf at [+32]: ctx_buf grows to 5 words / 40 bytes (see the ELVC_CTX_*_OFF header block in elevate_client_send.pdx for the authoritative layout). Frame shape mirrors acquire exactly: six callee-save pushes (rbx=caps, r12=dur/row_id, r13=req_buf, r14=reply_ep_id, r15=reply_buf, rbp=ctx_buf) + one 8-byte alignment pad = 56 bytes; entry rsp%16==8 -> (8-56) mod 16 == 0 across every nested call. Gate order: ctx_buf==0 FIRST (widest surface -- an unset ctx would silently poison the whole chain via ELVJ_ERR_BAD_ACTOR at journal_req), then mint_ctx_buf==0 (loaded from [rbp+32]) via ELCA_ERR_BAD_BUF, then reply_buf==0 via ELCA_ERR_BAD_REPLY_BUF -- same relative priority as elevate_client_acquire's own (mint_ctx_buf wins on both-bad; reachable only when ctx is good). ctx_buf==0 returns ELVC_ERR_BAD_CTX (0xFFFFEA06) from the send module's extension band -- the same code elevate_client_request_ex_ctx and _ex_j_ctx / _ex_r_ctx use, so a caller sees ONE code across every ctx entry point. ONE swap vs. acquire's own step 2: dispatch through elevate_client_request_ex_r_ctx (which threads ctx through _ex_j_ctx and _ex_ctx) instead of _ex_r. Steps 3-5 are copied verbatim from acquire (mint from mint_ctx_buf loaded via [rbp+32] into r10 -- r10 is caller-saved and never overwritten between the load and the six arg-marshal moves that follow it; then bind_expire_abs and bind_grant from reply_buf). r12 is reused as the row_id stash post-mint because dur is dead once _ex_r_ctx has run -- matches acquire's own r12 reuse. capabilities {boot, cap} match the exact union of the two capability-bearing callees (unchanged from acquire). Labels prefixed elca_aqc_ (disjoint from acquire's elca_aq_). Every error immediate (0xFFFFEA06, 0xFFFFEA50, 0xFFFFEA51) exceeds imm32 for a `mov rax, imm32`, so is written as `mov rax, imm64` (paideia-as sign-extends `mov rax, imm32`; a raw immediate compare would drift into the negative half of the signed range).",
       block: {
         push rbx;
         push r12;
@@ -199,71 +267,133 @@ module ElevateClientAcquire = structure {
         mov r13, rdx;                    // req_buf
         mov r14, rcx;                    // reply_ep_id
         mov r15, r8;                     // reply_buf
-        mov rbp, r9;                     // mint_ctx_buf
+        mov rbp, r9;                     // ctx_buf
 
+        // ---- Gate 1: ctx_buf != 0 (widest surface) ----
         cmp rbp, 0;
-        je  elca_aq_bad_buf;
-        // LE.M2-hardening G9 (#52): null gate on reply_buf too.
-        // Steps 4-5 dereference [r15+8] and [r15+16]; a null r15 here
-        // is a caller programming defect that must surface as a
-        // diagnostic (ELCA_ERR_BAD_REPLY_BUF) rather than a #PF the
-        // consumer cannot classify.  Placed right after the
-        // mint_ctx_buf gate so the two "bad pointer" refusals sit
-        // together and no state is touched before either fires.
-        cmp r15, 0;
-        je  elca_aq_bad_reply_buf;
+        je  elca_aqc_bad_ctx;
 
-        // ---- Step 2: full retry+journal+dispatch flow ----
+        // ---- Gate 2: mint_ctx_buf (at [ctx+32]) != 0 ----
+        mov rax, [rbp + 32];
+        cmp rax, 0;
+        je  elca_aqc_bad_buf;
+
+        // ---- Gate 3: reply_buf != 0 (LE.M2-hardening G9 discipline) ----
+        cmp r15, 0;
+        je  elca_aqc_bad_reply_buf;
+
+        // ---- Step 2: full retry+journal+dispatch flow (ctx twin) ----
         mov rdi, rbx;                    // caps
         mov rsi, r12;                    // dur
         mov rdx, r13;                    // req_buf
         mov rcx, r14;                    // reply_ep_id
         mov r8,  r15;                    // reply_buf
-        xor r9,  r9;                     // timeout_ns = 0 (auto-select)
-        call elevate_client_request_ex_r;
+        mov r9,  rbp;                    // ctx_buf
+        call elevate_client_request_ex_r_ctx;
         cmp rax, 0;
-        jne elca_aq_out;                 // ELVC_*/ELVJ_ERR_*/ELVR_ERR_* passthrough
+        jne elca_aqc_out;                // ELVC_*/ELVJ_*/ELVR_* passthrough
 
         // ---- Step 3: mint the elevate channel cap ----
-        mov rdi, [rbp + 0];              // parent_ep_slot
+        // mint_ctx_buf pointer lives at [ctx+32]; load once into r10
+        // (caller-saved, untouched by the six arg-marshal moves below)
+        // and index off it for the mint arg-marshalling.
+        mov r10, [rbp + 32];             // r10 = mint_ctx_buf
+        mov rdi, [r10 + 0];              // parent_ep_slot
         mov rsi, 0x418;                  // ELCC_RIGHTS_ALL
-        mov rdx, [rbp + 8];              // request_id
-        mov rcx, [rbp + 16];             // requester_pid
-        mov r8,  [rbp + 24];             // target_cap_kind
-        mov r9,  [rbp + 32];             // target_cap_rights
+        mov rdx, [r10 + 8];              // request_id
+        mov rcx, [r10 + 16];             // requester_pid
+        mov r8,  [r10 + 24];             // target_cap_kind
+        mov r9,  [r10 + 32];             // target_cap_rights
         call elevate_client_cap_mint;
         cmp rax, 16;
-        jae elca_aq_out;                 // ELCC_ERR_MINT_FAIL passthrough
+        jae elca_aqc_out;                // ELCC_ERR_MINT_FAIL passthrough
 
         mov r12, rax;                    // row_id (dur no longer live)
 
         // ---- Step 4: shadow the broker's absolute expire_ns ----
         mov rdi, r12;
-        mov rsi, [r15 + 16];             // expire_ns, validated non-zero by recv
+        mov rsi, [r15 + 16];
         call elevate_client_cap_bind_expire_abs;
         cmp rax, 0;
-        jne elca_aq_out;                 // defensive passthrough (row_id already < 16)
+        jne elca_aqc_out;
 
         // ---- Step 5: shadow the granted_caps ----
         mov rdi, r12;
-        mov rsi, [r15 + 8];              // granted_caps, validated subset by recv
+        mov rsi, [r15 + 8];
         call elevate_client_cap_bind_grant;
         cmp rax, 0;
-        jne elca_aq_out;                 // defensive passthrough
+        jne elca_aqc_out;
 
         // ---- Step 6: the handle IS the row_id ----
         mov rax, r12;
-        jmp elca_aq_out;
+        jmp elca_aqc_out;
 
-      elca_aq_bad_buf:
+      elca_aqc_bad_ctx:
+        mov rax, 0xFFFFEA06;             // ELVC_ERR_BAD_CTX
+        jmp elca_aqc_out;
+
+      elca_aqc_bad_buf:
         mov rax, 0xFFFFEA50;             // ELCA_ERR_BAD_BUF
-        jmp elca_aq_out;
+        jmp elca_aqc_out;
 
-      elca_aq_bad_reply_buf:
+      elca_aqc_bad_reply_buf:
         mov rax, 0xFFFFEA51;             // ELCA_ERR_BAD_REPLY_BUF
 
-      elca_aq_out:
+      elca_aqc_out:
         add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let elevate_client_acquire : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{boot, cap} =
+    fn (caps: u64) (dur: u64) (req_buf: u64) (reply_ep_id: u64) (reply_buf: u64) (mint_ctx_buf: u64) -> unsafe {
+      effects: {mem}, capabilities: {boot, cap},
+      justification: "libpdx-elevate.ENH-001 (#11) refactored at LE.M1-002 (#20) into a THIN WRAPPER over elevate_client_acquire_ctx (6-arg call): snapshots the three process-global mutables via _elevate_client_build_default_ctx into a stack-local 40-byte ctx buffer with explicit_timeout=0 (acquire always used timeout=0 internally, so a 0 explicit_timeout preserves the auto-select-fast/human policy), stores the caller's mint_ctx_buf pointer at [ctx+32] (the acquire-only 5th ctx slot), then delegates. Public 6-arg signature unchanged (no source break); byte-identical to the pre-refactor behaviour in the single-threaded-of-intent case (retry stats, journal records, cap grant, shadow binds all identical). Six callee-save pushes to preserve args across get_target_fp_lo + sub rsp, 40 for the 40-byte stack ctx at [rsp+0..+40). Total 88 bytes off entry rsp; entry rsp%16==8 -> (8-88) mod 16 == 0 (88 mod 16 == 8) -- pre-CALL rsp aligned for both _elevate_client_build_default_ctx and the 6-arg call to _acquire_ctx. _elevate_client_build_default_ctx writes 32 bytes (words 0..3); word 4 (the mint_ctx_buf slot) is populated inline here immediately after the build call, so the ctx is fully valid before _acquire_ctx is entered. Labels prefixed elca_aq_ (retained from pre-refactor for continuity; disjoint from elca_aqc_ which the ctx twin uses).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 40;                     // 40-byte ctx at [rsp+0..+40)
+
+        mov rbx, rdi;                    // caps
+        mov r12, rsi;                    // dur
+        mov r13, rdx;                    // req_buf
+        mov r14, rcx;                    // reply_ep_id
+        mov r15, r8;                     // reply_buf
+        mov rbp, r9;                     // mint_ctx_buf
+
+        // ---- Build a stack-local ctx snapshot from the globals. ----
+        // acquire has always dispatched with timeout_ns=0 (auto-select
+        // fast/human), so explicit_timeout=0 preserves that discipline.
+        // _elevate_client_build_default_ctx writes 32 bytes (words 0..3);
+        // word 4 is populated below.
+        lea rdi, [rsp + 0];              // ctx_buf_out (40-byte buffer)
+        xor rsi, rsi;                    // explicit_timeout_ns = 0
+        call _elevate_client_build_default_ctx;
+
+        // ---- Populate the acquire-only 5th slot: mint_ctx_buf ptr. ----
+        mov [rsp + 32], rbp;
+
+        // ---- Delegate to the ctx twin (6-arg SysV call). ----
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        mov rcx, r14;
+        mov r8,  r15;
+        lea r9,  [rsp + 0];              // ctx_buf
+        call elevate_client_acquire_ctx;
+        // rax carries the delegated return.
+
+        add rsp, 40;
         pop rbp;
         pop r15;
         pop r14;

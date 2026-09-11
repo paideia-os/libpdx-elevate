@@ -1141,10 +1141,55 @@ module ElevateClientJournal = structure {
   //   [rsp+0] = actor_fp_lo  (stashed after step 1)
   // ==========================================================================
 
-  pub let elevate_client_request_ex_j : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{boot} =
-    fn (caps: u64) (dur: u64) (req_buf: u64) (reply_ep_id: u64) (reply_buf: u64) (timeout_ns: u64) -> unsafe {
+  // ==========================================================================
+  // elevate_client_request_ex_j_ctx(caps, dur, req_buf, reply_ep_id,
+  //                                 reply_buf, ctx_buf)
+  //   -> ELVC_* | ELVJ_ERR_*
+  //
+  // LE.M1-002 (#20).  Explicit-context twin of elevate_client_request_
+  // ex_j.  BYTE-FOR-BYTE the same flow (fetch actor -> journal REQ ->
+  // dispatch -> journal APR) with two coupled swaps:
+  //
+  //   (1) actor_fp_lo is read from ctx_buf[+0] (ELVC_CTX_TARGET_FP_LO_
+  //       OFF) rather than the process-global slot
+  //       _elevate_client_target_fp_lo (via its getter).
+  //   (2) Step 3 dispatches through elevate_client_request_ex_ctx
+  //       (ENH-006, #17) rather than elevate_client_request_ex, so the
+  //       same ctx_buf carries the target_fp_lo / fast / human /
+  //       explicit_timeout snapshot end-to-end -- the policy consult
+  //       + timeout resolution both see the caller's own context, not
+  //       any process-wide mutable.
+  //
+  // ctx_buf == 0 gate returns ELVC_ERR_BAD_CTX (0xFFFFEA06) before any
+  // journaling, mirroring elevate_client_request_ex_ctx's own gate.
+  //
+  // The legacy singleton entry point elevate_client_request_ex_j is
+  // preserved as a THIN WRAPPER over this function (see below) via
+  // _elevate_client_build_default_ctx -- snapshots the three
+  // process-global mutables into a stack-local ctx buffer and delegates
+  // here; behaviour is byte-identical for a single-threaded-of-intent
+  // process (the common case). A shell brokering N concurrent jobs
+  // gets a per-job ctx buffer and races nothing.
+  //
+  // Register plan matches elevate_client_request_ex_j exactly (see that
+  // function's justification for the alignment / stash reasoning): six
+  // callee-save pushes + one 8-byte pad slot at [rsp+0] doubling as
+  // the actor_fp_lo stash.
+  //
+  //   rbx = caps            (needed by journal_req)
+  //   r12 = dur             (needed by journal_req)
+  //   r13 = req_buf         (passed to request_ex_ctx)
+  //   r14 = reply_ep_id     (passed to request_ex_ctx)
+  //   r15 = reply_buf       (read at [+8]/[+16] after a successful APR)
+  //   rbp = ctx_buf         (passed to request_ex_ctx; ctx[0] already
+  //                          consumed for actor_fp_lo)
+  //   [rsp+0] = actor_fp_lo (stashed after step 1)
+  // ==========================================================================
+
+  pub let elevate_client_request_ex_j_ctx : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{boot} =
+    fn (caps: u64) (dur: u64) (req_buf: u64) (reply_ep_id: u64) (reply_buf: u64) (ctx_buf: u64) -> unsafe {
       effects: {mem}, capabilities: {boot},
-      justification: "libpdx-elevate.M3-001 (#6): audit-wrapped full-flow entry point. Six callee-save pushes (rbx, r12, r13, r14, r15, rbp) + one 8-byte alignment pad = 56 bytes; entry rsp%16==8 -> (8-56) mod 16 == 0 so every nested call (get_target_fp_lo, journal_req, elevate_client_request_ex, journal_apr) sees aligned rsp. The pad slot at [rsp+0] doubles as the stash for actor_fp_lo (avoids a seventh callee-save push). Audit-first D3 discipline: journal_req failure aborts before the wire hop (no operation without an audit record). APR-journal failure after a successful elevate returns ELVJ_ERR_APR_JOURNAL_FAIL so the caller knows to revoke the freshly-granted cap. reply_buf granted_caps at [+8] and expire_ns at [+16] match the ElevateChannel wire spec at src/kernel/core/ipc/elevate_channel.pdx §1. Capability {boot} propagates from the nested elevate_client_request_ex (which pulls it from elevate_client_recv_reply's hpet_now_ns). ELVJ_ERR_* codes exceed imm32 so any equality compare against them stages the constant into r10 first; we only need one such compare here (in the APR-journal failure branch) so it is written inline. Labels prefixed elcj_rx_.",
+      justification: "libpdx-elevate.LE.M1-002 (#20): explicit-context twin of elevate_client_request_ex_j. Same six callee-save pushes + one 8-byte alignment/stash pad = 56 bytes; entry rsp%16==8 -> (8-56) mod 16 == 0 across every nested call (journal_req, elevate_client_request_ex_ctx, journal_apr) -- shape mirrors the legacy _ex_j exactly. TWO swaps vs. legacy: (1) actor_fp_lo comes from ctx_buf[+0] (ELVC_CTX_TARGET_FP_LO_OFF) not the process-global getter; (2) step 3 dispatches through elevate_client_request_ex_ctx (ENH-006, #17) not request_ex, so ctx_buf carries the target_fp_lo / fast / human / explicit_timeout snapshot end-to-end through the policy consult + timeout resolution. ctx_buf==0 gated first as ELVC_ERR_BAD_CTX (0xFFFFEA06), same shape as elevate_client_request_ex_ctx's own gate. rbp holds ctx_buf across the whole flow (unchanged from step 1 to step 3, where it becomes the 6th arg r9 to request_ex_ctx). Audit-first D3 discipline is preserved verbatim -- journal_req failure aborts before the wire hop; APR-journal failure after a successful elevate returns ELVJ_ERR_APR_JOURNAL_FAIL so the caller knows to revoke. Capability {boot} propagates from the nested elevate_client_request_ex_ctx (which pulls it from elevate_client_recv_reply's hpet_now_ns). ELVC_ERR_BAD_CTX (0xFFFFEA06) exceeds imm32 -> staged in r10 before compare on the bad-ctx return arm (paideia-as compliance: a direct `cmp rax, imm32` sign-extends). Labels prefixed elcj_xc_ (disjoint from elcj_rx_ used by the legacy _ex_j wrapper below).",
       block: {
         push rbx;
         push r12;
@@ -1154,15 +1199,18 @@ module ElevateClientJournal = structure {
         push rbp;
         sub rsp, 8;                      // align + stash slot for actor_fp_lo
 
+        cmp r9, 0;
+        je  elcj_xc_bad_ctx;
+
         mov rbx, rdi;                    // caps
         mov r12, rsi;                    // dur
         mov r13, rdx;                    // req_buf
         mov r14, rcx;                    // reply_ep_id
         mov r15, r8;                     // reply_buf
-        mov rbp, r9;                     // timeout_ns
+        mov rbp, r9;                     // ctx_buf
 
-        // ---- Step 1: fetch actor_fp_lo from the process-global ----
-        call elevate_client_get_target_fp_lo;
+        // ---- Step 1: fetch actor_fp_lo from ctx_buf[+0] ----
+        mov rax, [rbp + 0];              // target_fp_lo (ctx, not global)
         mov [rsp + 0], rax;              // stash actor_fp_lo
 
         // ---- Step 2: journal the REQ (audit-first gate) ----
@@ -1170,44 +1218,93 @@ module ElevateClientJournal = structure {
         mov rsi, rbx;                    // caps
         mov rdx, r12;                    // dur_ns
         call elevate_client_journal_req;
-        // rax >= 256 means ELVJ_ERR_* -- pass through.
         cmp rax, 256;
-        jb  elcj_rx_journaled;
-        // Journal refused -> abort before the wire hop.  rax already
-        // holds the ELVJ_ERR_REQ_JOURNAL_FAIL / ELVJ_ERR_BAD_ACTOR code.
-        jmp elcj_rx_out;
+        jb  elcj_xc_journaled;
+        jmp elcj_xc_out;
 
-      elcj_rx_journaled:
-        // ---- Step 3: do the elevate ----
+      elcj_xc_journaled:
+        // ---- Step 3: do the elevate via the ctx twin ----
         mov rdi, rbx;                    // caps
         mov rsi, r12;                    // dur
         mov rdx, r13;                    // req_buf
         mov rcx, r14;                    // reply_ep_id
         mov r8,  r15;                    // reply_buf
-        mov r9,  rbp;                    // timeout_ns
-        call elevate_client_request_ex;
+        mov r9,  rbp;                    // ctx_buf
+        call elevate_client_request_ex_ctx;
         cmp rax, 0;
-        jne elcj_rx_out;                 // ELVC_ERR_* -> pass through
+        jne elcj_xc_out;
 
         // ---- Step 4: journal the APR (audit chain closer) ----
         mov rdi, [rsp + 0];              // actor_fp_lo
         mov rsi, [r15 + 8];              // granted_caps
         mov rdx, [r15 + 16];             // expire_ns
         call elevate_client_journal_apr;
-        // Success (rax < 256) collapses to ELVC_OK; failure (rax in
-        // 0xFFFFEA4* band) surfaces as-is so the caller knows the
-        // grant is not audit-covered.
         cmp rax, 256;
-        jb  elcj_rx_success;
-        // APR-journal failure -- pass the ELVJ_ERR_APR_JOURNAL_FAIL /
-        // ELVJ_ERR_BAD_ACTOR back to the caller.
-        jmp elcj_rx_out;
+        jb  elcj_xc_success;
+        jmp elcj_xc_out;
 
-      elcj_rx_success:
+      elcj_xc_success:
         xor rax, rax;                    // ELVC_OK
 
-      elcj_rx_out:
+      elcj_xc_out:
         add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elcj_xc_bad_ctx:
+        mov rax, 0xFFFFEA06;             // ELVC_ERR_BAD_CTX
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let elevate_client_request_ex_j : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{boot} =
+    fn (caps: u64) (dur: u64) (req_buf: u64) (reply_ep_id: u64) (reply_buf: u64) (timeout_ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {boot},
+      justification: "libpdx-elevate.M3-001 (#6) refactored at LE.M1-002 (#20) into a THIN WRAPPER over elevate_client_request_ex_j_ctx: snapshots the three process-global mutables (_elevate_client_target_fp_lo, plus 0-means-default sentinels for fast/human timeout globals) into a stack-local 32-byte ctx buffer via _elevate_client_build_default_ctx, then delegates. This preserves the entry point's public signature exactly (no source break: `timeout_ns` semantics -- 0 auto-selects, >0 uses directly -- are preserved because the ctx variant's own timeout-resolution block substitutes the same defaults for 0 slots), matches today's globals-based behaviour byte-for-byte in the single-threaded-of-intent case (audit journal, wire hop, and cap grant are all identical), and does NOT introduce a race for concurrent callers because the snapshot is taken into stack-local storage -- each concurrent flow gets its own ctx buffer even though they read from the same global slot. Six callee-save pushes (rbx=caps, r12=dur, r13=req_buf, r14=reply_ep_id, r15=reply_buf, rbp=timeout_ns) + sub rsp, 40 for a 32-byte stack ctx at [rsp+0..+32) and an 8-byte alignment pad at [rsp+32..+40); total 88 bytes off entry rsp (16k+8), so pre-CALL rsp = 16(k-5) = 0 mod 16 -- aligned for BOTH _elevate_client_build_default_ctx AND elevate_client_request_ex_j_ctx. The build helper is a leaf (no CALL of its own, no callee-save writes) so pushing 6 callee-saves BEFORE the build call is safe. After the build, args are restored to rdi..r8 from callee-saves and r9 = lea [rsp+0] for the ctx buffer. Labels prefixed elcj_rx_ -- retained from the pre-refactor implementation for continuity, disjoint from elcj_xc_ (the ctx twin's prefix) and from every other elcj_* prefix in this file.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 40;                     // 32-byte ctx at [rsp+0..+32) + 8-byte pad
+
+        mov rbx, rdi;                    // caps
+        mov r12, rsi;                    // dur
+        mov r13, rdx;                    // req_buf
+        mov r14, rcx;                    // reply_ep_id
+        mov r15, r8;                     // reply_buf
+        mov rbp, r9;                     // timeout_ns
+
+        // ---- Build a stack-local ctx snapshot from the globals. ----
+        lea rdi, [rsp + 0];              // ctx_buf_out
+        mov rsi, rbp;                    // explicit_timeout_ns = caller's timeout_ns
+        call _elevate_client_build_default_ctx;
+
+        // ---- Delegate to the ctx twin. ----
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        mov rcx, r14;
+        mov r8,  r15;
+        lea r9,  [rsp + 0];              // ctx_buf
+        call elevate_client_request_ex_j_ctx;
+        // rax already carries the delegated return -- fall through.
+
+        add rsp, 40;
         pop rbp;
         pop r15;
         pop r14;

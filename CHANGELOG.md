@@ -10,6 +10,120 @@ covers.
 
 ## Unreleased
 
+### #20 — LE.M1-002 explicit-context (ctx) variants for `_ex_j`, `_ex_r`, `acquire`
+
+- Three new ctx-carrying entry points -- structural extension of the
+  ENH-006 (#17) discipline (which had scoped `elevate_client_request_
+  ex_ctx` to the core primitive only) up through the whole audit +
+  retry + acquire stack:
+  - `elevate_client_request_ex_j_ctx(caps, dur, req_buf, reply_ep_id,
+    reply_buf, ctx_buf) -> u64 !{mem} @{boot}`
+    (`src/elevate_client_journal.pdx`). Byte-for-byte the same
+    audit-first flow as `_ex_j` (journal REQ → dispatch → journal APR)
+    with two coupled swaps: actor_fp_lo read from `ctx_buf[+0]`
+    instead of the process-global via `elevate_client_get_target_fp_
+    lo`, and step 3 dispatches through `elevate_client_request_ex_ctx`
+    so the same ctx carries `target_fp_lo` / fast / human /
+    explicit_timeout end-to-end. Labels prefixed `elcj_xc_`.
+  - `elevate_client_request_ex_r_ctx(caps, dur, req_buf, reply_ep_id,
+    reply_buf, ctx_buf) -> u64 !{mem} @{boot}`
+    (`src/elevate_client_retry.pdx`). Same retry loop as `_ex_r`; each
+    attempt fires through `_ex_j_ctx` instead of `_ex_j` so actor
+    identity + timeout classification stay stable across retries.
+    Labels prefixed `elcr_xc_`.
+  - `elevate_client_acquire_ctx(caps, dur, req_buf, reply_ep_id,
+    reply_buf, ctx_buf) -> u64 !{mem} @{boot, cap}`
+    (`src/elevate_client_acquire.pdx`). SIX-argument SysV call --
+    initially drafted as a 7-arg call (targeting paideia-as's
+    stack-passed 7th-arg support in `tests/build-emit/sysv_x64_
+    7arg_callee_stack_read.pdx`), but paideia-as's unsafe-body encoder
+    refused at build time with `error[B1708]: a @no_frame (or unsafe-
+    bodied) lambda cannot accept more than 6 parameters` -- the 7-arg
+    support applies to SAFE lambdas only; every asm block in this
+    library uses `unsafe { ... }` and demoting one function to a safe
+    body would break the inline-asm composed flow. Fix folds
+    `mint_ctx_buf` into `ctx_buf` at `[+32]`: the ctx buffer grows
+    from 4 words / 32 bytes (ENH-006 layout) to 5 words / 40 bytes.
+    `_ex_ctx`, `_ex_j_ctx`, and `_ex_r_ctx` never read `[+32]` and
+    are unchanged -- a caller composing only those may pass a 32-byte
+    buffer; a caller feeding `_acquire_ctx` MUST own a 40-byte buffer
+    with a non-zero mint_ctx pointer at `[+32]`. Same composed acquire
+    flow as `_acquire` with step 2 dispatched through `_ex_r_ctx`.
+    Gate priority: `ctx_buf==0` fires FIRST (widest surface), then
+    `[ctx_buf+32]==0` (mint_ctx_buf) via `ELCA_ERR_BAD_BUF`, then
+    `reply_buf==0` via `ELCA_ERR_BAD_REPLY_BUF`. Labels prefixed
+    `elca_aqc_`.
+- Every ctx variant returns `ELVC_ERR_BAD_CTX (0xFFFFEA06)` on
+  `ctx_buf == 0`, before any state mutation -- the same code
+  `elevate_client_request_ex_ctx` already uses, so a caller sees
+  ONE band-B2 code across all four ctx entry points.
+- Three process-global-singleton legacy entry points (`_ex_j`,
+  `_ex_r`, `_acquire`) are REFACTORED into THIN WRAPPERS over the ctx
+  twins via a shared helper:
+  - New private-by-convention helper `_elevate_client_build_default_
+    ctx(ctx_buf_out, explicit_timeout_ns) -> ()`
+    (`src/elevate_client_send.pdx`, near the `ELVC_CTX_*_OFF`
+    constants). Snapshots the three process-global mutables
+    (`_elevate_client_target_fp_lo`, plus 0-means-default sentinels
+    for `_fast_timeout_ns` / `_human_timeout_ns` -- the ctx variant's
+    own timeout-resolution block already substitutes the constant
+    defaults for a 0 slot, matching the getter behaviour byte-for-
+    byte) into a caller-owned 32-byte ctx buffer (writes words 0..3;
+    the acquire-only 5th slot at `[+32]` is unwritten by the helper
+    and is populated inline by `_acquire`'s wrapper after the build
+    call). Leaf; four qword stores + one bss read. `!{mem} @{}`.
+  - `_ex_j` / `_ex_r` wrappers: 6 callee-save pushes to preserve args
+    across the build helper + `sub rsp, 40` (32-byte stack-local ctx
+    at `[rsp+0..+32)` + 8-byte alignment pad) + build call + delegate
+    call to their ctx twin.
+  - `_acquire` wrapper: 6 callee-save pushes + `sub rsp, 40` for a
+    40-byte stack-local ctx at `[rsp+0..+40)` (5 words -- the full
+    LE.M1-002-build-fix layout). Build helper writes words 0..3; the
+    wrapper writes `[rsp+32] = rbp` (the caller's mint_ctx_buf
+    pointer) itself, then calls `_acquire_ctx` (6-arg) with r9=ctx.
+    Total frame is still 88 bytes off entry rsp -- pre-CALL alignment
+    unchanged. No stack-passed 7th arg (was one in the initial
+    draft; removed alongside the `_acquire_ctx` cap change).
+  - Byte-identity in the single-threaded-of-intent case (the common
+    case): audit journal, wire hop, cap grant, shadow binds are all
+    identical to the pre-refactor implementations. Public signatures
+    unchanged: no source break for any downstream caller (rm, pkg,
+    mkfs.pdxfs, umount.pdxfs, mount.pdxfs).
+- File-header note in `src/elevate_client_send.pdx` above the
+  `ELVC_CTX_*_OFF` constants now records that FOUR consumers agree
+  on the ctx layout (40 bytes / 5 words after the build-fix; the 5th
+  slot at `[+32]` is acquire-only and unused by the other three):
+  the ENH-006 primitive plus the three LE.M1-002 twins. New public
+  layout constant `ELVC_CTX_MINT_CTX_BUF_OFF = 32`. The three legacy
+  globals-based entry points are documented as thin wrappers over
+  the ctx variants via `_elevate_client_build_default_ctx`.
+- Regression witness: `tests/elevate_client_ctx_expansion_test.pdx`
+  (8 stages, fingerprint `LIBPDX-ELEVATE LE.M1 CTX-EXPANSION OK`,
+  label prefix `ecxw_`). Covers: `_elevate_client_build_default_ctx`
+  byte layout (`ctx[+0]=target_fp_lo`, `+8`=`+16`=0, `+24`=explicit_
+  timeout_ns; the acquire-only `+32` slot is NOT written by the
+  helper and is not part of this stage's byte-identity check);
+  `_ex_j_ctx(ctx_buf=0)` → `ELVC_ERR_BAD_CTX` with no journal side-
+  effect (`ELVJ_ST_REQ_WRITES` stays 0); `_ex_r_ctx(ctx_buf=0)` →
+  same code with no retry-budget charge (`ELVR_ST_ATTEMPTS` stays
+  0); `_acquire_ctx(ctx_buf=0)` → `ELVC_ERR_BAD_CTX` via the 6-arg
+  SysV call (no more hand-marshalled 7th arg after the build-fix
+  reduced the arity); `_acquire_ctx` second-gate coverage --
+  ctx_buf points to a REAL 40-byte buffer with `[ctx+32]=0` →
+  `ELCA_ERR_BAD_BUF` (0xFFFFEA50), proves the mint-slot gate fires
+  when a caller composes `_acquire_ctx` without populating the 5th
+  ctx slot; `_ex_j` (legacy wrapper) audit-first invariant preserved
+  (`ELVJ_ST_REQ_WRITES == 1` after a 1ns-timeout call, matching pre-
+  refactor `_ex_j` behaviour); `ELVC_ERR_BAD_CTX` sits in band B2.
+- Stretch AC deferred (per issue #20): the "two concurrent flows
+  under a single-threaded scheduler" witness requires user-space
+  threading scaffolding this library does not expose today. Filed as
+  follow-up; the byte-identity regression witness (above) plus the
+  ctx==0 gate coverage lands the load-bearing structural checks.
+- `caps.decl` updated: `_ex_j_ctx` and `_ex_r_ctx` grouped with
+  `_request_ex_ctx` under the same cap-set entry (they compose the
+  same three underlying ops); `_acquire_ctx` grouped with `_acquire`.
+
 ### #19 — LE.M1-001 unit tests for send/acquire/journal/retry modules
 
 - Four new witness files under `tests/`, closing the named gap that

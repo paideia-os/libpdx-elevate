@@ -102,6 +102,8 @@
   # beyond what elevate_client_require itself already needs.
 
 +entry elevate_client_request_ex_ctx
++entry elevate_client_request_ex_j_ctx
++entry elevate_client_request_ex_r_ctx
   KIND_IPC_ENDPOINT(read, "svc.elevate-broker")
   KIND_IPC_ENDPOINT(mint,  reply)
   KIND_IPC_ENDPOINT(write, broker_ep_id)
@@ -110,14 +112,27 @@
   # cap set as that entry -- only the source of target_fp_lo/timeouts
   # differs (a caller-owned ctx_buf instead of process globals), which
   # carries no capability implications.
+  #
+  # LE.M1-002 (#20): _ex_j_ctx / _ex_r_ctx extend the same discipline up
+  # through the audit-wrapped (journal) and retry-wrapped stack levels
+  # respectively.  _ex_j_ctx dispatches through _ex_ctx (same caps as
+  # above) after journalling REQ; _ex_r_ctx dispatches through _ex_j_ctx
+  # (identical cap set) on each retry.  The retry variant may loop up to
+  # elevate_client_retry_get_max_attempts() times per invocation; the cap
+  # set does not grow with retries -- same discipline as the legacy _ex_r.
 
 +entry elevate_client_acquire
++entry elevate_client_acquire_ctx
   KIND_IPC_ENDPOINT(read, "svc.elevate-broker")
   KIND_IPC_ENDPOINT(mint,  reply)
   KIND_IPC_ENDPOINT(write, broker_ep_id)
   KIND_IPC_ENDPOINT(read,  reply_ep_id)
   KIND_IPC_ENDPOINT(write, uej)
   KIND_ELEVATE_CHANNEL(mint, row_id)
+  # LE.M1-002 (#20): _acquire_ctx is the 7-arg ctx-carrying twin of the
+  # 6-arg _acquire.  Same cap set (the ctx swap threads through _ex_r_ctx
+  # rather than _ex_r; mint + shadow-bind are unchanged).
+  #
   # ENH-001 (#11): composed request_ex_r + mint + shadow-bind returning a
   # row_id handle.  Union of every entry it reaches, PLUS the caller's own
   # pre-existing KIND_IPC_ENDPOINT cap over the broker at the cap-table slot

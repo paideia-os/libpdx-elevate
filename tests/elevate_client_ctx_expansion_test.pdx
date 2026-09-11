@@ -1,0 +1,362 @@
+// tests/elevate_client_ctx_expansion_test.pdx --
+//                                    libpdx-elevate.LE.M1-002
+//                                    (paideia-os/libpdx-elevate#20)
+//
+// Boot witness for the LE.M1-002 explicit-context expansion: three new
+// ctx-carrying entry points -- elevate_client_request_ex_j_ctx (journal.
+// pdx), elevate_client_request_ex_r_ctx (retry.pdx), and elevate_client_
+// acquire_ctx (acquire.pdx) -- plus their process-global-singleton legacy
+// twins refactored into thin wrappers over _elevate_client_build_default_
+// ctx (send.pdx). ENH-006 (#17) landed elevate_client_request_ex_ctx for
+// the core primitive; this witness proves the same discipline now
+// extends up through the whole stack.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// This is the ISOLATED UNIT-TEST scope (matching every other tests/*_
+// test.pdx in this repo): no stubbed broker, no live sys_ipc_* path,
+// only the client-side gates + delegation shape. The stretch "two
+// concurrent flows under a single-threaded scheduler" AC named in #20
+// requires user-space threading scaffolding this library does not yet
+// expose and is deferred to a follow-up (see STATUS.md).
+//
+// Eight stages exercise the load-bearing surface:
+//
+//   1.  Reset -- cap shadow + journal stats + retry stats scrubbed.
+//   2.  _elevate_client_build_default_ctx: with target_fp_lo set to
+//       0xC0DE and explicit_timeout_ns=1234, the 32-byte ctx buffer
+//       reads back as (0xC0DE, 0, 0, 1234) at offsets +0/+8/+16/+24.
+//       This is the shared helper both the ctx variants (as their
+//       consumers) and the wrapper legacy paths (as their producer)
+//       cover as their sole "does the ctx layout match?" pivot; a
+//       byte drift here is the single point that would silently break
+//       the byte-identity guarantee.
+//   3.  _ex_j_ctx(ctx_buf=0) -> ELVC_ERR_BAD_CTX (0xFFFFEA06). Client-
+//       side gate fires before any journal append, so ELVJ_ST_REQ_
+//       WRITES stays 0 after the call (checked). Identical shape to
+//       _ex_ctx's own gate stage 11 in elevate_client_send_test.pdx.
+//   4.  _ex_r_ctx(ctx_buf=0) -> ELVC_ERR_BAD_CTX (0xFFFFEA06). Client-
+//       side gate fires before any retry-stat increment, so ELVR_ST_
+//       ATTEMPTS stays 0 after the call (checked). Proves the gate
+//       does NOT charge a bad-arg call against the caller's retry
+//       budget.
+//   5.  _acquire_ctx(ctx_buf=0) -> ELVC_ERR_BAD_CTX (0xFFFFEA06). Gate
+//       priority: ctx_buf==0 fires FIRST, before the pre-existing
+//       mint_ctx_buf and reply_buf gates (both non-null here). This
+//       is the widest-surface gate: an unset ctx would silently
+//       poison the whole downstream chain via ELVJ_ERR_BAD_ACTOR.
+//       Six-arg SysV call (was 7-arg in the initial LE.M1-002 draft;
+//       reduced at #20's build-fix -- see elevate_client_acquire.pdx
+//       WHY SIX ARGS for the encoder cap on unsafe-body lambdas).
+//   6.  _acquire_ctx with a REAL 40-byte ctx whose [+32] (mint_ctx_
+//       buf_ptr, the acquire-only 5th slot) is 0 -> ELCA_ERR_BAD_BUF
+//       (0xFFFFEA50). Proves the SECOND gate fires once the first
+//       passes and that a caller composing _acquire_ctx must populate
+//       the 5th slot (a 32-byte legacy ctx buffer is refused by this
+//       gate). Replaces the pre-#20-fix "ctx_buf=0 AND mint_ctx_buf=0
+//       both -> ELVC_ERR_BAD_CTX wins" gate-priority stage: mint_ctx_
+//       buf is no longer a separate argument, so that particular
+//       both-bad shape is unreachable by construction.
+//   7.  _ex_j (legacy wrapper) with target_fp_lo set: still runs the
+//       full audit-first flow. After a tiny (1 ns) timeout call:
+//       ELVJ_ST_REQ_WRITES == 1 (REQ journaled before wire hop, same
+//       audit-first D3 invariant as pre-refactor). Proves the
+//       delegate-to-ctx-twin path preserves the observable behaviour.
+//       The specific request_ex_j return is not asserted (depends on
+//       broker registration state).
+//   8.  Band audit: ELVC_ERR_BAD_CTX (0xFFFFEA06) sits in the send
+//       module's own band B2 [0xFFFFEA00..0F] -- the four consumers
+//       (elevate_client_request_ex_ctx from ENH-006 plus the three
+//       new LE.M1-002 variants) all return this same constant, so
+//       the band invariant is load-bearing across the four call sites.
+//
+// =============================================================================
+// FINGERPRINT: LIBPDX-ELEVATE LE.M1 CTX-EXPANSION OK
+// =============================================================================
+//
+// Labels prefixed ecxw_ (elevate client ctx-expansion witness) --
+// disjoint from every existing ec*w_ prefix.
+
+module ElevateClientCtxExpansionTest = structure {
+
+  pub let mut _ecxw_stage : u64 = 0
+
+  // 40-byte ctx buffer (5 words; the extended LE.M1-002 build-fix
+  // layout with the acquire-only mint_ctx_buf_ptr slot at [+32]).
+  // Stage 2's build-helper only writes words 0..3 (matching
+  // _elevate_client_build_default_ctx's 32-byte write), so the [+32]
+  // slot stays at whatever the .bss init leaves it (undefined, per
+  // @uninit); stage 6 explicitly populates [+32] to exercise the
+  // second gate on _acquire_ctx.
+  pub let mut _ecxw_ctx : [u64; 5] = uninit @align(64)
+
+  // 32-byte REQ / reply-frame scratch used by the ex_j full-flow
+  // invocation in stage 7. Contents are not load-bearing; only
+  // NON-NULL address is.
+  pub let mut _ecxw_req_buf   : [u64; 4] = uninit @align(32)
+  pub let mut _ecxw_reply_buf : [u64; 4] = uninit @align(32)
+
+  // 40-byte mint_ctx scratch. Retained (though unreferenced by the
+  // present stages 5 and 6 after the #20 build-fix folded mint_ctx_
+  // buf_ptr into the ctx buffer at [+32]) as scaffolding for a future
+  // "happy-path _acquire_ctx" stage that pokes a real mint_ctx address
+  // into _ecxw_ctx[+32]; the compose-shell stretch AC named in the file
+  // header is the natural landing point for that. Keeping the buffer
+  // declared here avoids re-adding + re-aligning a bss slot when that
+  // stage lands. Its address is stable across boots.
+  pub let mut _ecxw_mint_ctx : [u64; 5] = uninit @align(64)
+
+  pub let ecxw_ok   : [u8; 38] = "LIBPDX-ELEVATE LE.M1 CTX-EXPANSION OK\0"
+  pub let ecxw_fail : [u8; 40] = "LIBPDX-ELEVATE LE.M1 CTX-EXPANSION FAIL\0"
+
+  pub let elevate_client_ctx_expansion_witness : () -> u64 !{sysreg, mem} @{boot, cap} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot, cap},
+      justification: "libpdx-elevate.LE.M1-002 (#20): boot witness for the LE.M1-002 explicit-context expansion (three new _ctx variants of _ex_j / _ex_r / _acquire plus their thin-wrapper refactor over _elevate_client_build_default_ctx). Every stage reloads its rdi/rsi/rdx/rcx arguments as fresh immediates or lea's; the stage id is recorded to memory (_ecxw_stage) for the fail path so no live value spans a nested CALL. Base scratch = sub rsp, 24 (same idiom as every other tests/*_test.pdx in this repo); entry rsp%16==8 -> (8-24) mod 16 == 0 so every 6-arg nested call sees aligned rsp. Stages 5 and 6 invoke elevate_client_acquire_ctx via a 6-arg SysV call -- pre-#20-build-fix this function was 7-arg (7th on stack) but paideia-as's unsafe-body encoder refused >6 params (B1708), and the fix folds mint_ctx_buf into ctx_buf at [+32]. No extra frame growth is now needed around these two stages: the base 24-byte scratch is sufficient and aligned for a 6-arg call. Stage 6 pokes ctx[+32]=0 into the 40-byte module-level _ecxw_ctx and asserts ELCA_ERR_BAD_BUF (0xFFFFEA50), exercising the second gate. capabilities {boot, cap} propagate from elevate_client_acquire_ctx's own {boot, cap} annotation (the widest of every ctx entry point exercised here). ELVC_ERR_BAD_CTX (0xFFFFEA06) and ELCA_ERR_BAD_BUF (0xFFFFEA50) exceed imm32 so are staged in r10 before any compare (paideia-as compliance: direct `cmp rax, imm32` sign-extends). Stage 2's build-helper byte-identity is the single-point-of-truth for the ctx layout -- if the first four words drift, every wrapper flow's byte-identity guarantee breaks silently, so this stage is deliberately positioned before every wrapper-covering stage; the acquire-only 5th slot at [+32] is not part of the build helper's write and is not asserted here (stage 6 populates it directly). Labels prefixed ecxw_.",
+      block: {
+        sub rsp, 24;                     // alignment only
+
+        // ------------------------------------------------------------
+        // Stage 1: reset -- cap shadow + journal stats + retry stats.
+        // ------------------------------------------------------------
+        mov rax, 1;
+        lea rcx, [rip + _ecxw_stage];
+        mov [rcx], rax;
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+        call elevate_client_retry_reset;
+
+        // ------------------------------------------------------------
+        // Stage 2: build-helper byte-identity.  Set target_fp_lo to
+        // 0xC0DE, call _elevate_client_build_default_ctx with
+        // explicit_timeout=1234, then read back ctx[+0..+24] and
+        // check every offset.  This is the single-point-of-truth for
+        // the ctx layout every wrapper depends on.
+        // ------------------------------------------------------------
+        mov rax, 2;
+        lea rcx, [rip + _ecxw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0xC0DE;
+        call elevate_client_set_target_fp_lo;
+
+        lea rdi, [rip + _ecxw_ctx];
+        mov rsi, 1234;                   // explicit_timeout_ns
+        call _elevate_client_build_default_ctx;
+
+        // ctx[+0] == 0xC0DE (target_fp_lo snapshot)
+        lea r10, [rip + _ecxw_ctx];
+        mov rax, [r10 + 0];
+        mov r11, 0xC0DE;
+        cmp rax, r11;
+        jne ecxw_fail_stage;
+
+        // ctx[+8] == 0 (fast timeout default sentinel)
+        mov rax, [r10 + 8];
+        cmp rax, 0;
+        jne ecxw_fail_stage;
+
+        // ctx[+16] == 0 (human timeout default sentinel)
+        mov rax, [r10 + 16];
+        cmp rax, 0;
+        jne ecxw_fail_stage;
+
+        // ctx[+24] == 1234 (explicit_timeout_ns forwarded verbatim)
+        mov rax, [r10 + 24];
+        cmp rax, 1234;
+        jne ecxw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 3: _ex_j_ctx(ctx_buf=0) -> ELVC_ERR_BAD_CTX.
+        // ------------------------------------------------------------
+        mov rax, 3;
+        lea rcx, [rip + _ecxw_stage];
+        mov [rcx], rax;
+
+        call elevate_client_journal_reset;
+
+        xor rdi, rdi;                    // caps = 0
+        xor rsi, rsi;                    // dur = 0
+        lea rdx, [rip + _ecxw_req_buf];
+        mov rcx, 1;                      // reply_ep_id
+        lea r8,  [rip + _ecxw_reply_buf];
+        xor r9,  r9;                     // ctx_buf = 0  <-- gate
+        call elevate_client_request_ex_j_ctx;
+        mov r10, 0xFFFFEA06;             // ELVC_ERR_BAD_CTX
+        cmp rax, r10;
+        jne ecxw_fail_stage;
+
+        // ELVJ_ST_REQ_WRITES must still be 0 -- gate fires before any
+        // journal append.
+        mov rdi, 0;                      // ELVJ_ST_REQ_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 0;
+        jne ecxw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 4: _ex_r_ctx(ctx_buf=0) -> ELVC_ERR_BAD_CTX; retry
+        // budget MUST NOT be charged.
+        // ------------------------------------------------------------
+        mov rax, 4;
+        lea rcx, [rip + _ecxw_stage];
+        mov [rcx], rax;
+
+        call elevate_client_retry_reset;
+
+        xor rdi, rdi;
+        xor rsi, rsi;
+        lea rdx, [rip + _ecxw_req_buf];
+        mov rcx, 1;
+        lea r8,  [rip + _ecxw_reply_buf];
+        xor r9,  r9;                     // ctx_buf = 0  <-- gate
+        call elevate_client_request_ex_r_ctx;
+        mov r10, 0xFFFFEA06;             // ELVC_ERR_BAD_CTX
+        cmp rax, r10;
+        jne ecxw_fail_stage;
+
+        mov rdi, 0;                      // ELVR_ST_ATTEMPTS
+        call elevate_client_retry_stat;
+        cmp rax, 0;
+        jne ecxw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 5: _acquire_ctx(ctx_buf=0) -> ELVC_ERR_BAD_CTX.
+        // Six-arg SysV call (was 7-arg in the initial LE.M1-002 draft;
+        // reduced at the #20 build-fix -- see elevate_client_acquire.
+        // pdx's WHY SIX ARGS block for the encoder cap).
+        // ------------------------------------------------------------
+        mov rax, 5;
+        lea rcx, [rip + _ecxw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0x01;                   // caps
+        mov rsi, 1000000000;             // dur = 1s
+        lea rdx, [rip + _ecxw_req_buf];
+        mov rcx, 1;                      // reply_ep_id
+        lea r8,  [rip + _ecxw_reply_buf];// reply_buf (non-null; ctx gate fires first)
+        xor r9,  r9;                     // ctx_buf = 0  <-- gate
+        call elevate_client_acquire_ctx;
+        mov r10, 0xFFFFEA06;             // ELVC_ERR_BAD_CTX
+        cmp rax, r10;
+        jne ecxw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 6: _acquire_ctx with a REAL 40-byte ctx whose [+32]
+        // (mint_ctx_buf_ptr) is 0 -> ELCA_ERR_BAD_BUF (0xFFFFEA50).
+        // Proves the SECOND gate fires when the first passes -- ctx
+        // present but the acquire-only mint slot unpopulated. Also
+        // proves gate PRIORITY: ctx_buf!=0 lets the flow reach the
+        // mint-slot gate, and _acquire_ctx does NOT accept an unset
+        // [ctx+32] (a caller composing _acquire_ctx MUST populate the
+        // 5th slot per the layout header in elevate_client_send.pdx).
+        // We reuse _ecxw_ctx (already 40 bytes / 5 words); target_fp_
+        // lo from stage 2 lives at [+0], irrelevant to this gate. We
+        // explicitly zero [+32] here rather than trusting @uninit.
+        // ------------------------------------------------------------
+        mov rax, 6;
+        lea rcx, [rip + _ecxw_stage];
+        mov [rcx], rax;
+
+        // Zero out [_ecxw_ctx + 32] (the mint_ctx_buf_ptr slot).
+        lea r10, [rip + _ecxw_ctx];
+        xor rax, rax;
+        mov [r10 + 32], rax;
+
+        mov rdi, 0x01;
+        mov rsi, 1000000000;
+        lea rdx, [rip + _ecxw_req_buf];
+        mov rcx, 1;
+        lea r8,  [rip + _ecxw_reply_buf];
+        lea r9,  [rip + _ecxw_ctx];      // ctx_buf non-null, [+32]==0
+        call elevate_client_acquire_ctx;
+        mov r10, 0xFFFFEA50;             // ELCA_ERR_BAD_BUF
+        cmp rax, r10;
+        jne ecxw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 7: _ex_j (legacy wrapper) audit-first invariant.
+        // Reset journal stats, keep target_fp_lo=0xC0DE from stage 2,
+        // fire _ex_j with a tiny (1 ns) timeout.  Post-call: REQ_
+        // WRITES == 1 (journaled before wire hop -- audit-first D3
+        // invariant preserved through the wrapper).  Return value
+        // not asserted (depends on broker registration state).
+        // ------------------------------------------------------------
+        mov rax, 7;
+        lea rcx, [rip + _ecxw_stage];
+        mov [rcx], rax;
+
+        call elevate_client_journal_reset;
+        // target_fp_lo still 0xC0DE from stage 2; the resets do not
+        // touch it.
+        call elevate_client_get_target_fp_lo;
+        mov r10, 0xC0DE;
+        cmp rax, r10;
+        jne ecxw_fail_stage;
+
+        mov rdi, 0x03;                   // caps
+        mov rsi, 1000000000;             // dur = 1s
+        lea rdx, [rip + _ecxw_req_buf];
+        mov rcx, 127;                    // reply_ep_id (unmapped, max valid)
+        lea r8,  [rip + _ecxw_reply_buf];
+        mov r9,  1;                      // timeout_ns = 1 ns
+        call elevate_client_request_ex_j;
+        // Return value not asserted.
+
+        mov rdi, 0;                      // ELVJ_ST_REQ_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 1;                      // audit-first: REQ journaled before wire
+        jne ecxw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 8: band-membership audit -- ELVC_ERR_BAD_CTX in B2
+        // [0xFFFFEA00..0F]. All four consumers (elevate_client_
+        // request_ex_ctx from ENH-006 plus the three LE.M1-002 twins)
+        // return this same constant.
+        // ------------------------------------------------------------
+        mov rax, 8;
+        lea rcx, [rip + _ecxw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA06;             // ELVC_ERR_BAD_CTX
+        mov r11, 0xFFFFEA00;
+        cmp r10, r11;
+        jb  ecxw_fail_stage;
+        mov r11, 0xFFFFEA0F;
+        cmp r10, r11;
+        ja  ecxw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Success.  Log OK, scrub state, return 0.
+        // ------------------------------------------------------------
+        mov rdi, 3;                      // KLOG_LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecxw_ok];
+        call klog_s1;
+
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+        call elevate_client_retry_reset;
+        xor rax, rax;
+        jmp ecxw_out;
+
+      ecxw_fail_stage:
+        lea rax, [rip + _ecxw_stage];
+        mov r8, [rax];                   // value1 -- failing stage id
+        mov rdi, 1;                      // KLOG_LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecxw_fail];
+        lea rcx, [rip + k_line];         // key1 = "line"
+        call klog_s1_d1;
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+        call elevate_client_retry_reset;
+        mov rax, 1;
+
+      ecxw_out:
+        add rsp, 24;
+        ret
+      }
+    }
+}

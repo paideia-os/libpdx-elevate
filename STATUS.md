@@ -159,15 +159,50 @@ existing status-shaped one.
   explicit timeout via a caller-owned `ctx_buf` instead of the three
   process-global mutable slots, so concurrent flows in one process do
   not race. Scoped deliberately: only the core full-flow primitive
-  gets a ctx variant this release; `elevate_client_request_ex_j` /
-  `_ex_r` / `elevate_client_acquire` and the underlying globals
-  themselves are UNCHANGED and remain the right choice for the
-  common single-flow-per-process case. Full singleton retirement
-  (ctx variants threaded all the way through the retry/journal/
-  acquire stack) is deferred to a follow-up once a real concurrent
-  consumer (shell) actually needs it — see the enhancement plan §4's
-  own framing: "worth fixing before shell links, not before shell
-  exists."
+  gets a ctx variant this release; the extension of the ctx discipline
+  up through the journal/retry/acquire stack landed at LE.M1-002 (#20,
+  below).
+- **LE.M1-002 (#20, LANDED):** three new ctx-carrying entry points
+  extending ENH-006 up the whole stack —
+  `elevate_client_request_ex_j_ctx` (`elevate_client_journal.pdx`),
+  `elevate_client_request_ex_r_ctx` (`elevate_client_retry.pdx`), and
+  `elevate_client_acquire_ctx` (`elevate_client_acquire.pdx`). All
+  three are 6-arg SysV calls -- `_acquire_ctx` was initially drafted
+  as 7-arg (targeting paideia-as's stack-passed 7th-arg support in
+  `tests/build-emit/sysv_x64_7arg_callee_stack_read.pdx`) but the
+  build refused with `error[B1708]: a @no_frame (or unsafe-bodied)
+  lambda cannot accept more than 6 parameters` -- 7-arg support is
+  scoped to SAFE lambdas only, and every asm block in this library
+  uses `unsafe { ... }`. The build-fix folds `mint_ctx_buf` into
+  `ctx_buf` at `[+32]`: the ctx buffer grows from 4 words / 32 bytes
+  (ENH-006 layout) to 5 words / 40 bytes; the 5th slot is
+  ACQUIRE-ONLY (see the `ELVC_CTX_*_OFF` header block in
+  `src/elevate_client_send.pdx` for the authoritative layout). Each
+  ctx variant reads target_fp_lo/timeouts from `ctx_buf[+0..+32)` and
+  dispatches through the next-level ctx twin so the same buffer
+  threads through the whole audit + retry + acquire chain; `_ex_j_ctx`
+  and `_ex_r_ctx` never read `[+32]`, so a caller composing only
+  those two entry points may keep passing a 32-byte buffer. The three
+  process-global-singleton legacy twins (`_ex_j`, `_ex_r`, `_acquire`)
+  are refactored into thin wrappers over the ctx variants via a shared
+  private helper `_elevate_client_build_default_ctx` — public
+  signatures unchanged, byte-identical to the pre-refactor behaviour
+  in the single-threaded-of-intent case (audit journal + retry stats +
+  cap grant all identical). The `_acquire` wrapper allocates a
+  40-byte stack ctx, lets the helper write words 0..3, then writes
+  its own `mint_ctx_buf` argument to `[ctx+32]` before delegating to
+  `_acquire_ctx`. `ELVC_ERR_BAD_CTX (0xFFFFEA06)` is the same B2 code
+  every ctx entry point already returned; `_acquire_ctx` also raises
+  `ELCA_ERR_BAD_BUF (0xFFFFEA50)` when `[ctx+32]` is 0 (a caller
+  supplied ctx but forgot the acquire-only mint slot). A caller sees
+  ONE band-B2 code across all four ctx call sites. Regression witness:
+  `tests/elevate_client_ctx_expansion_test.pdx` (8 stages, fingerprint
+  `LIBPDX-ELEVATE LE.M1 CTX-EXPANSION OK`; stage 6 covers the new
+  `ELCA_ERR_BAD_BUF` gate on `[ctx+32]==0`). Stretch AC deferred: the
+  "two concurrent flows under a single-threaded scheduler" witness
+  requires user-space threading scaffolding this library does not
+  expose today — filed as follow-up alongside a real concurrent
+  consumer (shell).
 
 ## Milestone rollup
 
@@ -519,7 +554,8 @@ adds, in one place:
 | ENH-002 (#13) | `elevate_client_require` — cheap per-op re-assert, no broker hop. |
 | ENH-004 (#16) | `elevate_client_journal_op` / `elevate_client_require_j` — per-op audit trail. |
 | ENH-003 (#15) | `elevate_client_require_scoped` — opaque scope + exhaustible op budget on a handle. |
-| ENH-006 (#17) | `elevate_client_request_ex_ctx` — explicit-context variant of the core primitive (scoped; not threaded through the whole stack yet). |
+| ENH-006 (#17) | `elevate_client_request_ex_ctx` — explicit-context variant of the core primitive. |
+| LE.M1-002 (#20) | `elevate_client_request_ex_j_ctx` / `_ex_r_ctx` / `elevate_client_acquire_ctx` — extension of the ENH-006 ctx discipline through the whole audit/retry/acquire stack, plus refactor of the three legacy globals-based entry points into thin wrappers over the ctx twins via `_elevate_client_build_default_ctx`. Public signatures unchanged. |
 | ENH-007 (#14) | This pass: README/STATUS accuracy — retired the "`ELVC_OK` or `ELVC_STUB` both mean proceed" example, marked `rm`/`pkg` as needing migration, added the v1.1.0 credential-shaped example. |
 
 **What is still true and still deferred** (unchanged by M6, restated
@@ -552,7 +588,10 @@ Followup: v1.1.0+ lands the two PENDING dep swaps (libpdx-cap
 signatures unchanged; only status codes retire (`ELCC_NOTE_NO_NARROW`).
 
 Also open: `rm` and `pkg` migrating off the retired
-`elevate_client_request` name (ENH-005, their own repos/issues); full
-singleton retirement across `_ex_j` / `_ex_r` / `elevate_client_acquire`
-if/when shell (or another concurrent consumer) actually links this
-library (ENH-006 follow-up).
+`elevate_client_request` name (ENH-005, their own repos/issues). The
+LE.M1-002 (#20) landing above closes the ENH-006 follow-up "ctx
+variants threaded all the way through the retry/journal/acquire
+stack"; a shell-scale concurrent witness that drives two flows under
+a single-threaded scheduler is the remaining stretch AC and is filed
+as a follow-up (requires user-space threading scaffolding this
+library does not yet expose).
