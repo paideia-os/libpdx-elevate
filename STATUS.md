@@ -57,8 +57,10 @@ revoke-cascade — all DEFERRED to the follow-up wave; comment posted
 on each issue. LE.M5 (#31, #32, attestation), LE.M7-001/002 (#35,
 #36, revoke cascade), LE.M4-001 (#29, per-cap-mask duration
 ceilings), and LE.M4-002 (#30, `elevate_client_cap_reap_expired`)
-have since landed — see below. LE.M6 (#33, #34, audit sink) remains
-deferred.
+have since landed — see below. LE.M6-001 (#33, `/system/audit/
+elevate.log` file sink) has landed as a STUB (four call sites wired,
+body no-ops) pending libpdx-audit#32 (`audit_file_append`); issue
+stays OPEN. LE.M6-002 (#34) remains deferred.
 
 ## LE.M4-001 — per-cap-mask duration ceilings (landed, 2026-09-11)
 
@@ -154,6 +156,51 @@ Consumer impact: none direct — housekeeping.  Consumers that leak
 grants no longer leak them indefinitely if a boot-idle callback (or
 their own exit path via `elevate_client_shutdown`) periodically
 sweeps.
+
+## LE.M6-001 — `/system/audit/elevate.log` file sink (STUB landed, 2026-09-11)
+
+Four call sites wired in `src/elevate_client_journal.pdx`
+(`elevate_client_journal_req/_apr/_op` + `elevate_client_cap_attest`);
+each invokes the new private helper `_elevate_client_audit_file_
+append(seq, actor_fp_lo, body0, body1, body2)` in its post-`uej_
+append` success block, using the live seq (stashed under the
+alignment pad at `[rsp+8]`) plus the actor + three body words the
+matching `uej_append` call already received.  The helper body is a
+bare `ret` today — **fail-CLOSED** (no line written; no fabricated
+line placed on disk under `LE_AUDIT_SINK_PATH`).
+
+Dep: `libpdx-audit#32` filed 2026-09-11, not yet resolved.  The
+proposed `audit_file_append(path_ptr, path_len, line_ptr, line_len)
+-> u64` does not exist at any `libpdx-audit` version.  When it
+lands, the stub swap is one function body (the four call sites are
+the only stable surface).
+
+Effect posture preserved: helper declares `!{mem} @{}` matching the
+four calling bodies, so this landing does NOT widen any downstream
+effect signature — the same discipline LE.M2-002 (#38) established
+by adopting `audit_append_leaf`'s leaf over the `audit_begin/_
+record_output/_commit` trio's wider tail.
+
+Path constant: `LE_AUDIT_SINK_PATH : [u8; 26] = "/system/audit/
+elevate.log\0"` (25 chars + `\0`), reserved for the swap's first arg.
+
+Line format (documented; deferred to the swap for actual marshalling):
+`<seq>  <kind>  <actor_fp_lo:016x>  <body0:016x>  <body1:016x>
+<body2:016x>` — six whitespace-delimited fields.  `<kind>` is
+UEJ_KIND_ELEVATE (5) hardcoded inside the helper.  `<body0>` is
+the ELVJ_EVT_* discriminator (REQ=1, APR=2, OP=3, ATTEST=4).
+
+Witness `tests/elevate_client_audit_sink_test.pdx` (fingerprint
+`LIBPDX-ELEVATE LE.M6 AUDIT-SINK OK`) verifies the seq-return
+contract of the three re-instrumented journal_* bodies -- proves the
+stub call site does not break the caller-visible return.  Actual
+file-line inspection + `awk '{print NF}' == 6` verification (issue
+#33's runtime AC) is deferred to the follow-up ticket alongside the
+stub swap.
+
+**Issue #33 stays OPEN.**  This landing wires the four call sites
+so the follow-up is a one-function-body swap.  LE.M6-002 (#34)
+remains deferred.
 
 ## LE.M5 — attestation (M5-001/002 landed; M5-003+ not filed)
 

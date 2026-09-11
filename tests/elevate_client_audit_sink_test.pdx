@@ -1,0 +1,178 @@
+// tests/elevate_client_audit_sink_test.pdx -- libpdx-elevate.LE.M6-001
+//                                              (paideia-os/libpdx-elevate#33)
+//
+// Boot witness for the LE.M6-001 /system/audit/elevate.log file-sink
+// stub wiring.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// STUB-ONLY witness.  Issue #33's runtime AC ("after a REQ+APR pair
+// /system/audit/elevate.log has two new lines; awk '{print NF}' == 6")
+// is NOT actionable today because libpdx-audit#32 (audit_file_append)
+// has not yet resolved -- the file-sink helper this witness would need
+// to observe is a bare `ret` STUB in src/elevate_client_journal.pdx
+// (see the LE.M6-001 header block there for the swap plan and the
+// STUB(libpdx-audit#32) reference).  Landing a witness that would
+// exercise the sink today would give the appearance of a wired sink
+// without the actual sink transport.
+//
+// What this witness DOES verify (four stages):
+//
+//   1. Reset + set actor_fp_lo (mirrors elevate_client_journal_test's
+//      stage 1) so subsequent journal calls survive the actor gate.
+//
+//   2. journal_req(actor=0xABCD, caps=0x03, dur=1s) -> seq < 256.  Proves
+//      the LE.M6-001 stub call site the wire-up added inside journal_
+//      req's success block does NOT break the caller-visible seq return
+//      contract (which is the load-bearing property until libpdx-audit#32
+//      lands -- fail-closed means "no line written", NOT "seq path
+//      broken").  ELVJ_ST_REQ_WRITES bumped to 1 as a positive control
+//      that we reached the post-stub tail.
+//
+//   3. journal_apr(actor=0xABCD, granted=0x03, expire=1000000000000) ->
+//      seq < 256.  Same discipline as stage 2 for the APR call site.
+//      ELVJ_ST_APR_WRITES bumped to 1.
+//
+//   4. journal_op(actor=0xABCD, row_id=0, needed_caps=0x03) -> seq < 256.
+//      Same discipline as stage 2 for the OP call site.  ELVJ_ST_OP_
+//      WRITES bumped to 1.
+//
+// The fourth call site (elevate_client_cap_attest) is exercised by
+// tests/elevate_client_attest_test.pdx already and its stub wiring
+// follows the same shape; a duplicate stage here would re-run the same
+// no-op stub without adding a distinct assertion (attest's own witness
+// verifies the seq path + row-stamp half; the stub is transparent to
+// both).  When libpdx-audit#32 lands and the swap is landed under
+// LE.M6-001's follow-up, THIS witness gets stages 5-8 added to observe
+// the actual file lines (four ELVJ_EVT_* cases + awk '{print NF}' == 6).
+//
+// =============================================================================
+// FINGERPRINT: LIBPDX-ELEVATE LE.M6 AUDIT-SINK OK
+// =============================================================================
+//
+// Labels prefixed ecask_ (elevate client audit-sink witness) -- disjoint
+// from ecjw_ / eatw_ / eaqw_ / ecrpw_ / em3w_ / every other elc*_
+// prefix in this library.
+
+module ElevateClientAuditSinkTest = structure {
+
+  pub let mut _ecask_stage : u64 = 0
+
+  pub let ecask_ok   : [u8; 35] = "LIBPDX-ELEVATE LE.M6 AUDIT-SINK OK\0"
+  pub let ecask_fail : [u8; 37] = "LIBPDX-ELEVATE LE.M6 AUDIT-SINK FAIL\0"
+
+  // ==========================================================================
+  // elevate_client_audit_sink_witness() -- LE.M6-001 (#33)
+  // ==========================================================================
+
+  pub let elevate_client_audit_sink_witness : () -> u64 !{sysreg, mem} @{boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "libpdx-elevate.LE.M6-001 (paideia-os/libpdx-elevate#33): boot witness for the /system/audit/elevate.log file-sink STUB wire-up. Four stages: reset + set target_fp_lo, then one call per elevate_client_journal_req/_apr/_op site with the same actor_fp_lo (0xABCD) and payload shape tests/elevate_client_journal_test.pdx already establishes as the boot-safe pattern. Every stage reloads its rdi/rsi/rdx arguments as fresh immediates, and the only value that must survive across a CALL (the seq returned by each journal_* body) is compared inline against 256 without needing to stash across further CALLs, so no callee-save push is required -- only alignment. A bare `sub rsp, 24` reserves the same byte count the two-push-plus-pad idiom elsewhere in this library uses; entry rsp%16==8 -> (8-24) mod 16 == 0, so every nested call (elevate_client_journal_reset / _stat, elevate_client_stats_reset, elevate_client_set_target_fp_lo, elevate_client_journal_req/_apr/_op, klog_s1 / klog_s1_d1) sees aligned rsp. capabilities {boot} propagates from klog_s1 / klog_s1_d1 only; the three journal bodies plus _elevate_client_audit_file_append (the stub site under test here) all declare !{mem} @{} so this witness would need no {cap} at all if it did not klog its own OK/FAIL line. Stage 4 uses row_id=0 to keep the OP shape trivially valid (no shadow map lookup); the LE.M6-001 stub is transparent to row semantics -- what it verifies is only that the seq-return path survives the additional call site. The four-arg attest site (elevate_client_cap_attest) is deliberately NOT re-exercised here (see the file header for why); LE.M5's own witness already covers the attest seq path and this stub is transparent to it. Labels prefixed ecask_.",
+      block: {
+        sub rsp, 24;                     // alignment only -- no live data spans a CALL
+
+        // ------------------------------------------------------------
+        // Stage 1: reset + set actor_fp_lo.
+        // ------------------------------------------------------------
+        mov rax, 1;
+        lea rcx, [rip + _ecask_stage];
+        mov [rcx], rax;
+        call elevate_client_journal_reset;
+        call elevate_client_stats_reset;
+        mov rdi, 0xABCD;                 // actor_fp_lo
+        call elevate_client_set_target_fp_lo;
+
+        mov rdi, 0;                      // ELVJ_ST_REQ_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 0;
+        jne ecask_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 2: journal_req -> seq < 256; stub call site transparent.
+        // ------------------------------------------------------------
+        mov rax, 2;
+        lea rcx, [rip + _ecask_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0xABCD;                 // actor_fp_lo
+        mov rsi, 3;                      // caps = 0x03
+        mov rdx, 1000000000;             // dur_ns = 1 s
+        call elevate_client_journal_req;
+        cmp rax, 256;                    // ELVJ_UEJ_SEQ_MAX
+        jae ecask_fail_stage;
+
+        mov rdi, 0;                      // ELVJ_ST_REQ_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 1;
+        jne ecask_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 3: journal_apr -> seq < 256; stub call site transparent.
+        // ------------------------------------------------------------
+        mov rax, 3;
+        lea rcx, [rip + _ecask_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0xABCD;                 // actor_fp_lo
+        mov rsi, 3;                      // granted_caps = 0x03
+        mov rdx, 1000000000000;          // expire_ns
+        call elevate_client_journal_apr;
+        cmp rax, 256;
+        jae ecask_fail_stage;
+
+        mov rdi, 1;                      // ELVJ_ST_APR_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 1;
+        jne ecask_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 4: journal_op -> seq < 256; stub call site transparent.
+        // ------------------------------------------------------------
+        mov rax, 4;
+        lea rcx, [rip + _ecask_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0xABCD;                 // actor_fp_lo
+        xor rsi, rsi;                    // row_id = 0
+        mov rdx, 3;                      // needed_caps = 0x03
+        call elevate_client_journal_op;
+        cmp rax, 256;
+        jae ecask_fail_stage;
+
+        mov rdi, 5;                      // ELVJ_ST_OP_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 1;
+        jne ecask_fail_stage;
+
+        // ------------------------------------------------------------
+        // Success. Log OK, scrub state, return 0.
+        // ------------------------------------------------------------
+        mov rdi, 3;                      // KLOG_LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecask_ok];
+        call klog_s1;
+
+        call elevate_client_journal_reset;
+        xor rax, rax;
+        jmp ecask_out;
+
+      ecask_fail_stage:
+        lea rax, [rip + _ecask_stage];
+        mov r8, [rax];                   // value1 -- failing stage id
+        mov rdi, 1;                      // KLOG_LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecask_fail];
+        lea rcx, [rip + k_line];         // key1 = "line"
+        call klog_s1_d1;
+        call elevate_client_journal_reset;
+        mov rax, 1;
+
+      ecask_out:
+        add rsp, 24;
+        ret
+      }
+    }
+}

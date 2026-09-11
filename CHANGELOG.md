@@ -10,6 +10,88 @@ covers.
 
 ## Unreleased
 
+### #33 — LE.M6-001 signed audit sink to `/system/audit/elevate.log` (PARTIAL, STUB — 2026-09-11)
+
+- Named gap partially closed: every audit record today flows via
+  `uej_append(UEJ_KIND_ELEVATE=5, ...)` into the kernel user-events
+  journal, and (since LE.M2-002 / #38) additionally mirrors through
+  `libpdx-audit`'s in-memory `audit_append_leaf`.  Neither path
+  produces a userspace-file-form of the audit trail -- a tool like
+  `cat /system/audit/elevate.log` cannot enumerate historical grants.
+  The R90-XREPO.011 wave established `/system/audit/*.log` as the
+  canonical userspace-visible sink; issue #33 wires this sink into
+  the four elevate audit-emitting sites (`elevate_client_journal_
+  req/_apr/_op` + `elevate_client_cap_attest`).
+- **Dep status: `libpdx-audit#32` filed (2026-09-11), not yet resolved.**
+  The proposed `audit_file_append(path_ptr, path_len, line_ptr,
+  line_len) -> u64` does not exist at any `libpdx-audit` version --
+  see the newly-added first `libpdx-audit >= 1.2.0` PENDING line in
+  `deps.list` for the cascade note.
+- **STUB body landed** in `src/elevate_client_journal.pdx`:
+  ```
+  _elevate_client_audit_file_append : (u64, u64, u64, u64, u64) -> ()
+    !{mem} @{}
+    // STUB(libpdx-audit#32).  Bare `ret`.  Fail-CLOSED.
+  ```
+  Five params (seq, actor_fp_lo, body0, body1, body2); kind is
+  hardcoded to `UEJ_KIND_ELEVATE` (5) inside the helper when the swap
+  lands, staying at 5 params to reserve headroom under the paideia-as
+  0.36+ 6-param unsafe-body cap.  Effect tail `!{mem} @{}` matches
+  the four calling bodies precisely so this stub's presence does NOT
+  widen any downstream effect signature -- exactly the property
+  LE.M2-002 (#38) landed by adopting `audit_append_leaf`'s
+  `!{mem} @{}` leaf over the `audit_begin/_record_output/_commit`
+  trio's wider tail.
+- **Four call sites wired** (STUB is invoked at each; no line reaches
+  disk today):
+    - `elevate_client_journal_req` (body0 = `ELVJ_EVT_REQ` = 1)
+    - `elevate_client_journal_apr` (body0 = `ELVJ_EVT_APR` = 2)
+    - `elevate_client_journal_op`  (body0 = `ELVJ_EVT_OP`  = 3)
+    - `elevate_client_cap_attest`  (body0 = `ELVJ_EVT_ATTEST` = 4)
+  Each site inserts the stub call inside its existing post-`uej_
+  append` success block, using the live seq (stashed under the
+  alignment pad at `[rsp+8]`) + the actor + the three body words the
+  matching `uej_append` call already received.
+- **Path constant** landed:
+  `LE_AUDIT_SINK_PATH : [u8; 26] = "/system/audit/elevate.log\0"`
+  (25 chars + `\0`).  Reserved for the swap's first arg to
+  `audit_file_append`.
+- **Line format** (documented in the source header, deferred to the
+  swap for actual marshalling):
+  ```
+  <seq>  <kind>  <actor_fp_lo:016x>  <body0:016x>  <body1:016x>  <body2:016x>
+  ```
+  Six whitespace-delimited fields, one line per record.
+  `awk '{print NF}' == 6` verification (issue #33 AC) becomes
+  actionable once the swap lands; the four call sites are in place
+  today so no caller-side wire-up is needed at the swap.
+- New witness `tests/elevate_client_audit_sink_test.pdx`, fingerprint
+  `LIBPDX-ELEVATE LE.M6 AUDIT-SINK OK`.  Four stages verify the
+  seq-return contract of `journal_req/_apr/_op` under the newly-wired
+  stub call site (proves fail-closed = "no line written" NOT
+  "seq path broken").  The four-arg attest site is transparent to the
+  stub and its seq path is already exercised by
+  `tests/elevate_client_attest_test.pdx`; a duplicate stage here
+  would re-run the same no-op stub without adding a distinct
+  assertion.  Stages 5-8 (actual line inspection + `awk` verification)
+  land alongside the stub-to-real swap under the LE.M6-001 follow-up.
+- `caps.decl` unchanged today (the stub body writes nothing).  When
+  `libpdx-audit#32` resolves, a `KIND_PDXFS(write, "/system/audit/
+  elevate.log")` line (or whatever cap-kind `libpdx-audit#32` settles
+  on) is added under each of the four wired entries in one edit.
+  The manifest change is documented in the file for reviewer clarity.
+- **Issue #33 stays OPEN.**  This landing wires the four call sites
+  (fail-closed) so the follow-up ticket is a one-function-body swap
+  rather than a repo-wide grep.  The runtime AC ("REQ+APR pair
+  produces two new lines; `awk '{print NF}' == 6`") is unmet until
+  the swap lands.
+
+Semver posture: patch (`1.1.2` -> `1.1.3`). Purely additive -- no
+existing signature, effect set, wire header, or payload byte moves.
+The five-arg helper `_elevate_client_audit_file_append` is
+private-by-convention (leading underscore) and is not a caller-visible
+API surface.
+
 ### #30 — LE.M4-002 elevate_client_cap_reap_expired idle-time sweep (2026-09-11)
 
 - Named gap closed: today the shadow deadline map at

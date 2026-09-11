@@ -434,6 +434,102 @@ module ElevateClientJournal = structure {
   pub let mut _elevate_client_audit_sink  : [u8; 256] = uninit @align(8)
 
   // ==========================================================================
+  // LE.M6-001 (paideia-os/libpdx-elevate#33): canonical text-form sink to
+  // /system/audit/elevate.log via libpdx-audit's (yet-to-land) file-sink API.
+  //
+  // Dep status: libpdx-audit#32 (audit_file_append) has been FILED but is not
+  // yet resolved.  As of this landing, no `audit_file_append` symbol exists
+  // in libpdx-audit at any version.  Per the cross-repo cascade discipline
+  // -- land the four call sites here as a STUB, do NOT close #33 -- this
+  // module ships:
+  //
+  //   * LE_AUDIT_SINK_PATH             -- the canonical sink path constant,
+  //                                       reserved for the real API's first
+  //                                       arg.  25 chars + \0 = 26 bytes.
+  //   * _elevate_client_audit_file_append(seq, actor_fp_lo, body0, body1,
+  //                                       body2) -> ()  !{mem} @{}
+  //                                    -- STUB.  Reserved slot at every one
+  //                                       of the four call sites listed in
+  //                                       the issue AC (REQ / APR / OP /
+  //                                       ATTEST).  Today it is a bare `ret`
+  //                                       -- fail-CLOSED (no line written,
+  //                                       and no fabricated line placed on
+  //                                       disk under this path either).
+  //                                       When libpdx-audit#32 lands, the
+  //                                       body swaps to marshal the 6-field
+  //                                       line (see LINE FORMAT below) into
+  //                                       a caller-owned scratch and invoke
+  //                                       audit_file_append(LE_AUDIT_SINK_
+  //                                       PATH, 25, scratch, line_len) --
+  //                                       the FOUR call sites do NOT move,
+  //                                       so the swap is one function body,
+  //                                       not a repo-wide grep.
+  //
+  // Effect posture is preserved.  The stub declares !{mem} @{} to match
+  // the four calling bodies (elevate_client_journal_req/_apr/_op/_attest),
+  // which are all !{mem} @{}.  When the real API arrives with its
+  // !{mem, sysreg} @{cap} effect tail, LE.M6-001's follow-up ticket will
+  // choose one of: (a) adopt the leaf variant of audit_file_append that
+  // stages into a bounded ring and defers the sysreg/cap syscall to a
+  // separate flush caller (preserves !{mem} @{}); or (b) take the v2.0
+  // wire break in a coordinated cascade bump.  Either way, the stub-to-real
+  // swap happens INSIDE this helper -- callers of the helper (the four
+  // journal bodies) are unaffected.
+  //
+  // LINE FORMAT (per issue #33 AC):
+  //
+  //     <seq>  <kind>  <actor_fp_lo:016x>  <body0:016x>  <body1:016x>  <body2:016x>
+  //
+  // Six whitespace-delimited fields, one line per record.  <kind> is the
+  // uej record kind (UEJ_KIND_ELEVATE = 5) -- always 5 for every record
+  // this module emits, so the helper hardcodes it rather than plumbing it
+  // through a sixth parameter (staying at 5 params keeps the helper safely
+  // under the paideia-as 0.36+ unsafe-body 6-param cap with room for a
+  // future arg without a signature bump).  <body0> is the ELVJ_EVT_*
+  // discriminator (REQ=1, APR=2, OP=3, ATTEST=4).  <body1>/<body2>
+  // carry the event-specific payload words per journal_req/_apr/_op's
+  // header table above.
+  //
+  // Marshalling helper (print_u64_hex-16digits form) is deferred with the
+  // stub swap -- landing it now with a no-op sink would give the appearance
+  // of a wired sink without the actual sink transport.  awk '{print NF}'
+  // == 6 verification (issue #33 AC) becomes actionable once the swap
+  // lands; the four call sites are in place TODAY so no caller-side wire-up
+  // is needed at the swap.
+
+  pub let LE_AUDIT_SINK_PATH : [u8; 26] = "/system/audit/elevate.log\0"
+
+  // ==========================================================================
+  // _elevate_client_audit_file_append(seq, actor_fp_lo, body0, body1, body2)
+  //   -> ()
+  //
+  // STUB(libpdx-audit#32).  Pure no-op today.  See the LE.M6-001 block
+  // above for the swap plan.  Kept private-by-convention (leading
+  // underscore) so downstream tools cannot come to depend on the stub
+  // shape before the real API lands.
+  //
+  // Alignment: every caller invokes this at rsp%16 == 0 (post three
+  // callee-save pushes + `push rax; sub rsp, 8` = 40 bytes; entry
+  // rsp%16 == 8 -> (8-40) mod 16 == 0).  A bare `ret` needs no
+  // alignment maintenance; when the swap lands, the real body will
+  // pad or push per audit_file_append's own alignment obligation.
+  //
+  // Effect tail: !{mem} @{} matches the four calling bodies so no
+  // signature ripple.  When the real API's effect tail widens, this
+  // helper (and only this helper) reopens -- see the choice-of-two
+  // options in the LE.M6-001 block above.
+  // ==========================================================================
+
+  pub let _elevate_client_audit_file_append : (u64, u64, u64, u64, u64) -> () !{mem} @{} =
+    fn (seq: u64) (actor_fp_lo: u64) (body0: u64) (body1: u64) (body2: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-elevate.LE.M6-001 (paideia-os/libpdx-elevate#33): STUB. Awaits libpdx-audit#32 audit_file_append(path, path_len, line, line_len). Body is a bare `ret` -- fail-CLOSED (no line written; no fabricated line placed on disk under LE_AUDIT_SINK_PATH either). The five arguments are declared today so the four call sites (elevate_client_journal_req/_apr/_op and elevate_client_cap_attest) can plumb their live values through without a signature bump when the real API lands: seq comes from the successful uej_append return (stashed under the alignment pad at [rsp+8] in every caller), actor_fp_lo from r13 (or r12 in journal_req/apr/op), body0 is the caller's ELVJ_EVT_* discriminator (REQ=1, APR=2, OP=3, ATTEST=4), body1/body2 mirror what uej_append itself received. Kind is HARDCODED to UEJ_KIND_ELEVATE (5) inside this helper when the swap lands (all four sites are elevate-kind), staying at 5 params to reserve headroom under the paideia-as 0.36+ 6-param cap. Effect tail !{mem} @{} matches the four calling bodies precisely so this stub's presence does NOT widen any downstream effect signature -- exactly the property LE.M2-002 (#38) landed by adopting audit_append_leaf's !{mem} @{} leaf over the audit_begin/_record_output/_commit trio's !{mem, sysreg} @{cap, sched} tail. When libpdx-audit#32 lands, the follow-up swap picks between: (a) a _leaf variant that stages into a bounded ring + defers sysreg/cap syscall to a separate flush caller (preserves the effect posture), or (b) coordinated v2.0 wire break. Either way, the swap is one function body and NOT a repo-wide grep -- the four call sites are the only stable surface. Leaf; single `ret`. Labels prefixed elcs_fa_ (disjoint from every other elcj_/elcs_ prefix in this file).",
+      block: {
+        ret
+      }
+    }
+
+  // ==========================================================================
   // _elevate_client_audit_stage(actor_fp_lo, body0_disc, body1, body2) -> ()
   //
   // Shared staging helper: compose a 256-byte PdxAuditRecord@0.2 in
@@ -619,6 +715,18 @@ module ElevateClientJournal = structure {
         sub rsp, 8;                      // realign
         mov rdi, 0;                      // ELVJ_ST_REQ_WRITES
         call elevate_client_journal_note;
+
+        // ---- LE.M6-001 (#33): file-sink append stub. Passes the live
+        //      seq (stashed under the pad) + the three body words. Return
+        //      is void; today the callee is a bare `ret` (STUB awaiting
+        //      libpdx-audit#32) so no error surface leaks up. -------------
+        mov rdi, [rsp + 8];              // seq (stashed just under the pad)
+        mov rsi, r12;                    // actor_fp_lo
+        mov rdx, 1;                      // body0 = ELVJ_EVT_REQ
+        mov rcx, r13;                    // body1 = caps
+        mov r8,  r14;                    // body2 = dur_ns
+        call _elevate_client_audit_file_append;
+
         add rsp, 8;
         pop rax;                         // restore seq
 
@@ -707,6 +815,16 @@ module ElevateClientJournal = structure {
         sub rsp, 8;
         mov rdi, 1;                      // ELVJ_ST_APR_WRITES
         call elevate_client_journal_note;
+
+        // ---- LE.M6-001 (#33): file-sink append stub. See journal_req's
+        //      matching block above for the argument-plumbing rationale. --
+        mov rdi, [rsp + 8];              // seq
+        mov rsi, r12;                    // actor_fp_lo
+        mov rdx, 2;                      // body0 = ELVJ_EVT_APR
+        mov rcx, r13;                    // body1 = granted_caps
+        mov r8,  r14;                    // body2 = expire_ns
+        call _elevate_client_audit_file_append;
+
         add rsp, 8;
         pop rax;
 
@@ -800,6 +918,16 @@ module ElevateClientJournal = structure {
         sub rsp, 8;
         mov rdi, 5;                      // ELVJ_ST_OP_WRITES
         call elevate_client_journal_note;
+
+        // ---- LE.M6-001 (#33): file-sink append stub. See journal_req's
+        //      matching block above for the argument-plumbing rationale. --
+        mov rdi, [rsp + 8];              // seq
+        mov rsi, r12;                    // actor_fp_lo
+        mov rdx, 3;                      // body0 = ELVJ_EVT_OP
+        mov rcx, r13;                    // body1 = row_id
+        mov r8,  r14;                    // body2 = needed_caps
+        call _elevate_client_audit_file_append;
+
         add rsp, 8;
         pop rax;
 
@@ -925,6 +1053,19 @@ module ElevateClientJournal = structure {
 
         mov rdi, 7;                      // ELVJ_ST_ATTEST_WRITES
         call elevate_client_journal_note;
+
+        // ---- LE.M6-001 (#33): file-sink append stub. actor_fp_lo lives
+        //      in r13 here (not r12 as in journal_req/apr/op -- see this
+        //      function's register plan above); body1 DUPLICATES the actor
+        //      per the ATTEST convention (matches the uej_append + mirror
+        //      arg shape) so an auditor reading only the file line still
+        //      learns who attested. ------------------------------------------
+        mov rdi, [rsp + 8];              // seq
+        mov rsi, r13;                    // actor_fp_lo
+        mov rdx, 4;                      // body0 = ELVJ_EVT_ATTEST
+        mov rcx, r13;                    // body1 = actor_fp_lo (duplicated)
+        mov r8,  r14;                    // body2 = reason_fp_lo
+        call _elevate_client_audit_file_append;
 
         add rsp, 8;
         pop rax;                         // restore seq

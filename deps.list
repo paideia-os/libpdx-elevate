@@ -21,6 +21,23 @@ libpdx-cap        >=0.2.0   PENDING   elevate_client_cap_narrow_stub swap
                                      the ELCC_NOTE_NO_NARROW status code
                                      retires.
 
+libpdx-audit      >=1.2.0   PENDING   LE.M6-001 (paideia-os/libpdx-elevate
+                                     #33): file-sink API cascade.  libpdx-
+                                     audit#32 (filed 2026-09-11) proposes
+                                     audit_file_append(path_ptr, path_len,
+                                     line_ptr, line_len) -> u64 for the
+                                     canonical /system/audit/*.log sink.
+                                     Not yet resolved.  Meanwhile libpdx-
+                                     elevate ships a STUB helper (_elevate_
+                                     client_audit_file_append) at each of
+                                     the four LE.M6-001 call sites (journal
+                                     _req/_apr/_op + cap_attest); helper
+                                     body is a bare `ret` (fail-closed --
+                                     no line written, no fabricated line
+                                     placed on disk under LE_AUDIT_SINK_
+                                     PATH).  Swap is one function body
+                                     when libpdx-audit#32 lands.
+
 libpdx-audit      >=1.1.2   PENDING   elevate_client_journal_req/_apr/_op
                                      (plus elevate_client_cap_attest and
                                      elevate_client_journal_revoke_cascade)

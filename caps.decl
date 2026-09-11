@@ -39,6 +39,17 @@
   # uej_append (UEJ_KIND_ELEVATE=5) fans out to /system/audit/user-events/.
   # M3-001 wires directly to the kernel primitive; when libpdx-audit.M2
   # lands the caller may substitute a libpdx-audit cap for this line.
+  #
+  # LE.M6-001 (#33) note: the four call sites (journal_req/_apr/_op and
+  # cap_attest below) now additionally invoke _elevate_client_audit_file_
+  # append, a STUB helper reserving the file-sink call slot for the
+  # /system/audit/elevate.log line write.  The stub body is currently a
+  # bare `ret` so no additional cap is required TODAY.  When libpdx-audit
+  # #32's audit_file_append lands and the stub swaps to a real transport,
+  # one new line will be added under each of these four entries:
+  #     KIND_PDXFS(write, "/system/audit/elevate.log")
+  # (or whatever cap-kind libpdx-audit#32 settles on).  Adding it now
+  # would document a cap the shipping code never exercises.
 
 +entry elevate_client_cap_attest
   KIND_IPC_ENDPOINT(write, uej)
