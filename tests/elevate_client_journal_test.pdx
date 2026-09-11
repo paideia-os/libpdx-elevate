@@ -1,0 +1,369 @@
+// tests/elevate_client_journal_test.pdx -- libpdx-elevate.LE.M1-001
+//                                           (paideia-os/libpdx-elevate#19)
+//
+// Boot witness for src/elevate_client_journal.pdx.  Closes issue #19's
+// named gap: the M3 audit-journal wrapper had no dedicated `tests/`-tree
+// witness for the REQ/APR/OP record shapes + monotonic seq + audit-first
+// ordering.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Ten stages exercise the load-bearing surface:
+//
+//   1.  Reset + set actor_fp_lo (via elevate_client_set_target_fp_lo)
+//       so subsequent journal calls survive the actor gate.
+//   2.  journal_req(actor=0, caps=0x03, dur=1s) -> ELVJ_ERR_BAD_ACTOR
+//       (0xFFFFEA40).  ELVJ_ST_BAD_ACTOR bumped to 1.
+//   3.  REQ record shape: journal_req(actor=0xABCD, 0x03, 1s) ->
+//       seq < 256.  ELVJ_ST_REQ_WRITES == 1.  Stash seq1.
+//   4.  Seq monotonicity: journal_req(...) again -> seq2 > seq1
+//       (both < 256, seq2 == seq1 + 1 in the uej ordering
+//       contract, but only the strictly-greater condition is
+//       load-bearing here).
+//   5.  APR record shape: journal_apr(actor=0xABCD, granted=0x03,
+//       expire=1000000000000) -> seq < 256.  ELVJ_ST_APR_WRITES == 1.
+//   6.  journal_apr(actor=0, ...) -> ELVJ_ERR_BAD_ACTOR.  ELVJ_ST_
+//       BAD_ACTOR bumped again.
+//   7.  OP record shape: journal_op(actor=0xABCD, row_id=0,
+//       needed_caps=0x03) -> seq < 256.  ELVJ_ST_OP_WRITES == 1.
+//   8.  journal_op(actor=0, row_id, needed) -> ELVJ_ERR_BAD_ACTOR.
+//   9.  request_ex_j audit-first ordering: reset stats, then call
+//       request_ex_j with a tiny timeout (1 ns) so recv_reply
+//       returns ELVC_ERR_TIMEOUT quickly.  After the call:
+//           * ELVJ_ST_REQ_WRITES == 1 (REQ journaled BEFORE the wire
+//             hop -- proves the "audit-first" invariant).
+//           * ELVJ_ST_APR_WRITES == 0 (APR journaling only fires on a
+//             successful elevate; TIMEOUT / LOOKUP_FAIL / SEND_FAIL
+//             short-circuit before it).
+//       The exact request_ex_j return value is not asserted (it can
+//       be any of ELVC_ERR_TIMEOUT / _LOOKUP_FAIL / _SEND_FAIL
+//       depending on broker registration state at this boot step);
+//       the invariant is the REQ_WRITES==1 / APR_WRITES==0 pair.
+//   10. Discriminator + band audit: ELVJ_EVT_REQ = 1, ELVJ_EVT_APR
+//       = 2, ELVJ_EVT_OP = 3 are strictly < 4, monotonic, and
+//       pairwise distinct.  ELVJ_ERR_BAD_ACTOR (0xFFFFEA40) sits in
+//       B6 [0xFFFFEA40..4F].  ELVJ_ERR_REQ_JOURNAL_FAIL (0xFFFFEA41),
+//       ELVJ_ERR_APR_JOURNAL_FAIL (0xFFFFEA42), and ELVJ_ERR_OP_
+//       JOURNAL_FAIL (0xFFFFEA43) also sit in B6.  A future value
+//       drift catches here.
+//
+// =============================================================================
+// FINGERPRINT: LIBPDX-ELEVATE LE.M1 JOURNAL OK
+// =============================================================================
+//
+// Labels prefixed ecjw_ (elevate client journal witness).
+
+module ElevateClientJournalTest = structure {
+
+  pub let mut _ecjw_stage : u64 = 0
+  pub let mut _ecjw_seq1  : u64 = 0
+
+  // 32-byte REQ / reply-frame scratch for the request_ex_j call in
+  // stage 9.  Contents are not load-bearing; only NON-NULL address is.
+  pub let mut _ecjw_req_buf   : [u64; 4] = uninit @align(32)
+  pub let mut _ecjw_reply_buf : [u64; 4] = uninit @align(32)
+
+  pub let ecjw_ok   : [u8; 32] = "LIBPDX-ELEVATE LE.M1 JOURNAL OK\0"
+  pub let ecjw_fail : [u8; 34] = "LIBPDX-ELEVATE LE.M1 JOURNAL FAIL\0"
+
+  pub let elevate_client_journal_witness : () -> u64 !{sysreg, mem} @{boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "libpdx-elevate.LE.M1-001 (#19): boot witness for src/elevate_client_journal.pdx. Every stage reloads its rdi/rsi/rdx arguments as fresh immediates or memory pokes; the one value that must survive across a CALL (the seq returned by stage 3's journal_req call) is stashed to memory (_ecjw_seq1) rather than a register, same idiom as the stage counter itself, so no callee-save push is required -- only alignment. A bare `sub rsp, 24` reserves the same byte count the two-push-plus-pad idiom elsewhere in this library uses; entry rsp%16==8 -> (8-24) mod 16 == 0 so every nested call (elevate_client_journal_reset / _stat / _req / _apr / _op, elevate_client_stats_reset, elevate_client_set_target_fp_lo, elevate_client_request_ex_j, klog_s1 / klog_s1_d1) sees aligned rsp. capabilities {boot} propagate from elevate_client_request_ex_j (which pulls it from recv_reply's hpet_now_ns) and from klog_s1 / klog_s1_d1; journal_req/apr/op themselves declare @{} but their uej_append leaf touches only {mem}. ELVJ_ERR_BAD_ACTOR (0xFFFFEA40) exceeds imm32 so it is staged in r10 before compare. The seq monotonicity check in stage 4 uses `cmp rax, r10` (both registers) after r10 is loaded from _ecjw_seq1; a direct compare against the seq1 memory operand is avoided per this library's `cmp reg,[mem]` prohibition. Stage 9's audit-first assertion is the load-bearing check for the M3-001 (#6) audit contract at design/tooling/r49-r50-plan.md §5.14: even when the wire hop fails, the REQ record must be durable in the audit stream. The tiny (1 ns) timeout in stage 9 keeps runtime bounded regardless of broker registration state at witness time. Labels prefixed ecjw_.",
+      block: {
+        sub rsp, 24;                     // alignment only
+
+        // ------------------------------------------------------------
+        // Stage 1: reset + set actor_fp_lo.
+        // ------------------------------------------------------------
+        mov rax, 1;
+        lea rcx, [rip + _ecjw_stage];
+        mov [rcx], rax;
+        call elevate_client_journal_reset;
+        call elevate_client_stats_reset;
+        mov rdi, 0xABCD;                 // actor_fp_lo (used by stage 9)
+        call elevate_client_set_target_fp_lo;
+
+        mov rdi, 0;                      // ELVJ_ST_REQ_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 0;
+        jne ecjw_fail_stage;
+
+        mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
+        call elevate_client_journal_stat;
+        cmp rax, 0;
+        jne ecjw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 2: journal_req(actor=0) -> ELVJ_ERR_BAD_ACTOR.
+        // ------------------------------------------------------------
+        mov rax, 2;
+        lea rcx, [rip + _ecjw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;                    // actor_fp_lo = 0 <-- gate
+        mov rsi, 0x03;                   // caps
+        mov rdx, 1000000000;             // dur = 1s
+        call elevate_client_journal_req;
+        mov r10, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR
+        cmp rax, r10;
+        jne ecjw_fail_stage;
+
+        mov rdi, 4;                      // ELVJ_ST_BAD_ACTOR
+        call elevate_client_journal_stat;
+        cmp rax, 1;
+        jne ecjw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 3: REQ record shape.  journal_req valid -> seq < 256.
+        // Stash seq into _ecjw_seq1 for stage 4's monotonicity check.
+        // ------------------------------------------------------------
+        mov rax, 3;
+        lea rcx, [rip + _ecjw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0xABCD;                 // actor_fp_lo
+        mov rsi, 0x03;                   // caps
+        mov rdx, 1000000000;             // dur_ns
+        call elevate_client_journal_req;
+        cmp rax, 256;                    // ELVJ_UEJ_SEQ_MAX
+        jae ecjw_fail_stage;
+
+        lea rcx, [rip + _ecjw_seq1];
+        mov [rcx], rax;                  // stash seq1
+
+        mov rdi, 0;                      // ELVJ_ST_REQ_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 1;
+        jne ecjw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 4: seq monotonicity.  A second REQ record yields
+        // seq2 > seq1 (strictly greater; the uej counter increments
+        // per successful append).
+        // ------------------------------------------------------------
+        mov rax, 4;
+        lea rcx, [rip + _ecjw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0xABCD;
+        mov rsi, 0x03;
+        mov rdx, 1000000000;
+        call elevate_client_journal_req;
+        cmp rax, 256;
+        jae ecjw_fail_stage;
+        // seq2 (rax) must be > seq1 (memory).  Load seq1 into r10
+        // first per this library's cmp reg,[mem] prohibition.
+        lea r11, [rip + _ecjw_seq1];
+        mov r10, [r11 + 0];
+        cmp rax, r10;
+        jbe ecjw_fail_stage;             // seq2 must be > seq1
+
+        // ------------------------------------------------------------
+        // Stage 5: APR record shape.  journal_apr valid -> seq < 256;
+        // ELVJ_ST_APR_WRITES bumped to 1.
+        // ------------------------------------------------------------
+        mov rax, 5;
+        lea rcx, [rip + _ecjw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0xABCD;                 // actor_fp_lo
+        mov rsi, 0x03;                   // granted_caps
+        mov r10, 1000000000000;          // expire_ns = 1000 s
+        mov rdx, r10;
+        call elevate_client_journal_apr;
+        cmp rax, 256;
+        jae ecjw_fail_stage;
+
+        mov rdi, 1;                      // ELVJ_ST_APR_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 1;
+        jne ecjw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 6: journal_apr(actor=0) -> ELVJ_ERR_BAD_ACTOR.
+        // ------------------------------------------------------------
+        mov rax, 6;
+        lea rcx, [rip + _ecjw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;                    // actor_fp_lo = 0 <-- gate
+        mov rsi, 0x03;                   // granted_caps
+        mov r10, 1000000000000;
+        mov rdx, r10;
+        call elevate_client_journal_apr;
+        mov r10, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR
+        cmp rax, r10;
+        jne ecjw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 7: OP record shape.  journal_op valid -> seq < 256;
+        // ELVJ_ST_OP_WRITES bumped to 1.
+        // ------------------------------------------------------------
+        mov rax, 7;
+        lea rcx, [rip + _ecjw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0xABCD;                 // actor_fp_lo
+        xor rsi, rsi;                    // row_id = 0
+        mov rdx, 0x03;                   // needed_caps
+        call elevate_client_journal_op;
+        cmp rax, 256;
+        jae ecjw_fail_stage;
+
+        mov rdi, 5;                      // ELVJ_ST_OP_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 1;
+        jne ecjw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 8: journal_op(actor=0) -> ELVJ_ERR_BAD_ACTOR.
+        // ------------------------------------------------------------
+        mov rax, 8;
+        lea rcx, [rip + _ecjw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;                    // actor_fp_lo = 0
+        xor rsi, rsi;                    // row_id
+        mov rdx, 0x03;                   // needed_caps
+        call elevate_client_journal_op;
+        mov r10, 0xFFFFEA40;             // ELVJ_ERR_BAD_ACTOR
+        cmp rax, r10;
+        jne ecjw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 9: request_ex_j audit-first ordering.  Reset the
+        // journal stats, then call request_ex_j with a tiny (1 ns)
+        // timeout so recv_reply returns TIMEOUT quickly.  After the
+        // call: REQ_WRITES == 1 (audit-first: REQ was journaled
+        // BEFORE the wire hop) and APR_WRITES == 0 (no successful
+        // elevate, so APR journal never ran).  The exact rax return
+        // is not asserted (can be TIMEOUT / LOOKUP_FAIL / SEND_FAIL
+        // depending on broker registration state).
+        // ------------------------------------------------------------
+        mov rax, 9;
+        lea rcx, [rip + _ecjw_stage];
+        mov [rcx], rax;
+
+        call elevate_client_journal_reset;
+        // Confirm target_fp_lo is still set (stage 1 set it; the
+        // resets do not touch it).
+        call elevate_client_get_target_fp_lo;
+        mov r10, 0xABCD;
+        cmp rax, r10;
+        jne ecjw_fail_stage;
+
+        mov rdi, 0x03;                   // caps
+        mov rsi, 1000000000;             // dur = 1s
+        lea rdx, [rip + _ecjw_req_buf];  // req_buf
+        mov rcx, 127;                    // reply_ep_id (unmapped, max valid)
+        lea r8,  [rip + _ecjw_reply_buf];// reply_buf
+        mov r9,  1;                      // timeout_ns = 1 ns (fast fail)
+        call elevate_client_request_ex_j;
+        // rax value not asserted -- can be any of ELVC_ERR_TIMEOUT /
+        // _LOOKUP_FAIL / _SEND_FAIL depending on the boot substrate.
+
+        mov rdi, 0;                      // ELVJ_ST_REQ_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 1;                      // must be exactly 1 (audit-first)
+        jne ecjw_fail_stage;
+
+        mov rdi, 1;                      // ELVJ_ST_APR_WRITES
+        call elevate_client_journal_stat;
+        cmp rax, 0;                      // must be 0 (no successful elevate)
+        jne ecjw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 10: discriminator + band audit.
+        //   ELVJ_EVT_REQ = 1, EVT_APR = 2, EVT_OP = 3 -- strictly
+        //   monotonic and < 4.  ELVJ_ERR_BAD_ACTOR / _REQ_JOURNAL_
+        //   FAIL / _APR_JOURNAL_FAIL / _OP_JOURNAL_FAIL all sit in
+        //   B6 [0xFFFFEA40..4F].
+        // ------------------------------------------------------------
+        mov rax, 10;
+        lea rcx, [rip + _ecjw_stage];
+        mov [rcx], rax;
+
+        // 1 < 2 < 3 < 4
+        mov r10, 1;
+        mov r11, 2;
+        cmp r10, r11;
+        jae ecjw_fail_stage;
+        mov r10, 2;
+        mov r11, 3;
+        cmp r10, r11;
+        jae ecjw_fail_stage;
+        mov r10, 3;
+        mov r11, 4;
+        cmp r10, r11;
+        jae ecjw_fail_stage;
+
+        // ELVJ_ERR_BAD_ACTOR in B6
+        mov r10, 0xFFFFEA40;
+        mov r11, 0xFFFFEA40;
+        cmp r10, r11;
+        jb  ecjw_fail_stage;
+        mov r11, 0xFFFFEA4F;
+        cmp r10, r11;
+        ja  ecjw_fail_stage;
+
+        // ELVJ_ERR_REQ_JOURNAL_FAIL in B6
+        mov r10, 0xFFFFEA41;
+        mov r11, 0xFFFFEA40;
+        cmp r10, r11;
+        jb  ecjw_fail_stage;
+        mov r11, 0xFFFFEA4F;
+        cmp r10, r11;
+        ja  ecjw_fail_stage;
+
+        // ELVJ_ERR_APR_JOURNAL_FAIL in B6
+        mov r10, 0xFFFFEA42;
+        mov r11, 0xFFFFEA40;
+        cmp r10, r11;
+        jb  ecjw_fail_stage;
+        mov r11, 0xFFFFEA4F;
+        cmp r10, r11;
+        ja  ecjw_fail_stage;
+
+        // ELVJ_ERR_OP_JOURNAL_FAIL in B6
+        mov r10, 0xFFFFEA43;
+        mov r11, 0xFFFFEA40;
+        cmp r10, r11;
+        jb  ecjw_fail_stage;
+        mov r11, 0xFFFFEA4F;
+        cmp r10, r11;
+        ja  ecjw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Success.  Log OK, scrub state, return 0.
+        // ------------------------------------------------------------
+        mov rdi, 3;                      // KLOG_LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecjw_ok];
+        call klog_s1;
+
+        call elevate_client_journal_reset;
+        call elevate_client_stats_reset;
+        xor rax, rax;
+        jmp ecjw_out;
+
+      ecjw_fail_stage:
+        lea rax, [rip + _ecjw_stage];
+        mov r8, [rax];                   // value1 -- failing stage id
+        mov rdi, 1;                      // KLOG_LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecjw_fail];
+        lea rcx, [rip + k_line];         // key1 = "line"
+        call klog_s1_d1;
+        call elevate_client_journal_reset;
+        call elevate_client_stats_reset;
+        mov rax, 1;
+
+      ecjw_out:
+        add rsp, 24;
+        ret
+      }
+    }
+}

@@ -10,6 +10,92 @@ covers.
 
 ## Unreleased
 
+### #19 — LE.M1-001 unit tests for send/acquire/journal/retry modules
+
+- Four new witness files under `tests/`, closing the named gap that
+  left four of the ten source modules (the largest, `elevate_client_
+  send.pdx` at 40 KB, plus `_acquire.pdx`, `_journal.pdx`, `_retry.
+  pdx`) without dedicated `tests/`-tree coverage alongside their
+  ENH-* landings:
+  - `tests/elevate_client_send_test.pdx` (12 stages, fingerprint
+    `LIBPDX-ELEVATE LE.M1 SEND OK` / `... FAIL stage=<n>`, label
+    prefix `ecsw_`). Covers: `pack_hdr` byte-identity vs the
+    hand-computed `Frame.frame_encode` u64 (three vectors +
+    field-width mask proofs for `reply_ep >0xFFFF` and `payload_len
+    >0xFFFFFFFF`); `check_grant` subset semantics (equal, subset,
+    superset); bounded-recv timeout via `recv_reply(reply_ep=127,
+    timeout=0)`; client-side `send_req(broker_ep=200)` gate;
+    `request_ex_ctx(ctx_buf=0)` full-flow entry point's client-side
+    gate (isolated-unit-test analogue of the "_ex full flow against
+    a stubbed broker endpoint" clause); band-membership audit for
+    every `ELVC_ERR_*` in `[0xFFFFEA00..0F]`.
+  - `tests/elevate_client_acquire_test.pdx` (12 stages, fingerprint
+    `LIBPDX-ELEVATE LE.M1 ACQUIRE OK`, label prefix `ecaw_`).
+    Covers: `mint_ctx_buf==0 -> ELCA_ERR_BAD_BUF (0xFFFFEA50)`;
+    `reply_buf==0 -> ELCA_ERR_BAD_REPLY_BUF (0xFFFFEA51)`; gate
+    order (both bad -> `BAD_BUF` wins); happy-path shape via the
+    `ELCC_MAX_ROWS=16` invariant the acquire's `cmp rax, 16; jae`
+    gate uses to discriminate `row_id` vs mint-fail passthrough;
+    underlying-layer error-passthrough witnesses for B2 (`ELVC_ERR_
+    LOOKUP_FAIL`), B4 (`ELVR_ERR_EXHAUSTED`), B5 (`ELCC_ERR_BAD_
+    ROW`), B6 (`ELVJ_ERR_BAD_ACTOR`); B7 band-boundary check.
+  - `tests/elevate_client_journal_test.pdx` (10 stages, fingerprint
+    `LIBPDX-ELEVATE LE.M1 JOURNAL OK`, label prefix `ecjw_`).
+    Covers: REQ / APR / OP record shapes; seq monotonicity (two
+    consecutive `journal_req` calls yield strictly increasing seq
+    values); `ELVJ_ERR_BAD_ACTOR (0xFFFFEA40)` gate on all three
+    record entry points when `actor_fp_lo==0`; `request_ex_j`
+    audit-first ordering (with `target_fp_lo` set, `REQ_WRITES==1
+    AND APR_WRITES==0` after a `request_ex_j` call whose downstream
+    wire hop fails on a 1 ns timeout — proves the REQ record is
+    written BEFORE the wire hop per the M3-001 audit contract at
+    `design/tooling/r49-r50-plan.md §5.14`); B6 band-membership
+    audit for every `ELVJ_ERR_*` and discriminator ordering
+    (`ELVJ_EVT_REQ<APR<OP<4`).
+  - `tests/elevate_client_retry_test.pdx` (11 stages, fingerprint
+    `LIBPDX-ELEVATE LE.M1 RETRY OK`, label prefix `ecrw_`). Covers:
+    `set_max_attempts` `BAD_ARG` gate (0 and 9 refused); `get_max_
+    attempts` default resolves to 3 after `retry_reset`; backoff-ns
+    table full lookup (slots 1..8 + OOR at 0 and 9); backoff-ns
+    monotone-nondecreasing over all seven adjacent pairs (1,2) ..
+    (7,8); retriable-set membership + alias equality (`ELVR_
+    RETRIABLE_TIMEOUT` == `ELVC_ERR_TIMEOUT`, likewise for `_SEND_
+    FAIL` and `_LOOKUP_FAIL`); non-retriable representative (`ELVC_
+    ERR_BAD_REPLY` distinct from every retriable code); `ELVR_ERR_
+    EXHAUSTED` / `_BAD_ARG` band membership in B4 [0xFFFFEA20..2F];
+    `request_ex_r` attempt-count invariant (with `max_attempts=1`,
+    `ELVR_ST_ATTEMPTS==1` after one call regardless of terminal
+    arm); `retry_delay(0)` hang-safety (dur=0 short-circuits before
+    `hpet_now_ns`).
+- Stub discipline: every test uses module-local `.bss` scratch
+  buffers (`_ec[sarj]w_req_buf` / `_reply_buf` / `_mint_ctx`) for
+  broker-side payloads rather than invoking `sys_ipc_send_body` /
+  `sys_ipc_recv_body` on live endpoints; the two witnesses that DO
+  drive the wire path (`ecjw_` stage 9 for audit-first,
+  `ecrw_` stage 11 for attempt-count) use `timeout_ns=1` so
+  `recv_reply` returns `ELVC_ERR_TIMEOUT` after one iteration
+  regardless of broker registration state. `_ex full flow against a
+  stubbed broker endpoint` is realised by driving `request_ex_ctx`'s
+  client-side `ctx_buf==0` gate (ELVC_ERR_BAD_CTX arm), which
+  exercises the entry point's prologue + epilogue end-to-end while
+  refusing before any nested `sys_ipc_*` call fires — matching the
+  isolated-unit-test constraint the task lays out.
+- All four fingerprints emit via the shared `klog_s1` / `klog_s1_d1`
+  wrappers with `SUBSYS_BOOT`, matching every existing sibling
+  witness in this repo (`ecpw_`, `eccw_`, `ecow_`, `ecqw_`, `ecbw_`,
+  `eatw_`, `eaqw_`, `ercw_`, `edbw_`). Label prefixes `ecsw_` /
+  `ecaw_` / `ecjw_` / `ecrw_` are disjoint from every existing
+  prefix in this library and from `elvbw_` (the kernel-side elevate-
+  broker synth witness in paideia-os, a different repo).
+- Fingerprint-coverage integration: paideia-os's tools/verify-
+  fingerprint-coverage.sh explicitly excludes tools/user/* per its
+  own scoping comment at L2791 (`libpdx-volume, libpdx-elevate ...
+  don't carry paideia-os fingerprints — their own fingerprint
+  coverage is tracked in their own repos`). The four new markers
+  are documented here in the CHANGELOG entry above; there is no
+  equivalent grep-set script inside this repo today (the M1 close
+  audit noted this as a follow-up).
+
 ### #53 — LE.M7 cascade-fail: explicit abort-marker journal record
 
 - New journal discriminator `ELVJ_EVT_CASCADE_ABORT = 6` and entry

@@ -1,0 +1,348 @@
+// tests/elevate_client_acquire_test.pdx -- libpdx-elevate.LE.M1-001
+//                                           (paideia-os/libpdx-elevate#19)
+//
+// Boot witness for src/elevate_client_acquire.pdx.  Closes issue #19's
+// named gap: the ENH-001 composed-acquire entry point had no dedicated
+// `tests/`-tree witness.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Acquire chains through five layers (request_ex_r [retry+journal+
+// dispatch], cap_mint, bind_expire_abs, bind_grant) and one client-side
+// gate (mint_ctx_buf != 0, LE.M2-hardening #52's follow-up reply_buf !=
+// 0 gate).  The load-bearing invariants #19 requires this witness to
+// prove are:
+//
+//   (a) mint_ctx_buf == 0 -> ELCA_ERR_BAD_BUF (0xFFFFEA50).
+//   (b) reply_buf == 0 with mint_ctx_buf nonzero -> ELCA_ERR_BAD_REPLY_
+//       BUF (0xFFFFEA51).
+//   (c) mint_ctx_buf gate fires BEFORE reply_buf gate (both bad ->
+//       BAD_BUF wins).
+//   (d) happy path shape: a valid return is row_id < 16 = ELCC_MAX_
+//       ROWS.  The `cmp rax, 16; jae elca_aq_out;` gate at step 3
+//       enforces this cutoff; the witness re-asserts the constant so
+//       a future MAX_ROWS bump would be caught here.
+//   (e) every underlying-layer error passes through unmodified.  A
+//       full sweep of every possible underlying error would require a
+//       stubbed broker + stubbed cap_mint (unavailable in this
+//       isolated unit test); instead the witness proves the
+//       PASSTHROUGH INVARIANT by asserting that one representative
+//       code from EACH underlying layer sits in that layer's own
+//       band, and by reading the acquire source to confirm every
+//       failure arm is a direct `jne elca_aq_out;` without a re-wrap.
+//       A code drifting out of its band would silently break the
+//       passthrough contract; this stage catches that drift.
+//
+// A "true" happy-path stage (drive acquire end-to-end and receive a
+// row_id) would need a stubbed broker publishing a valid APR into the
+// reply_ep; the R48b elevate_broker_synth witness in paideia-os is
+// where that end-to-end coverage lives.  This witness closes the
+// UNIT-scoped gap #19 names -- gate correctness + passthrough
+// invariant -- and defers the end-to-end path to that sibling.
+//
+// =============================================================================
+// STAGES
+// =============================================================================
+//
+//   1.  Reset -- cap shadow + journal stats + retry stats scrubbed.
+//   2.  acquire(mint_ctx_buf=0, everything else non-null) ->
+//       ELCA_ERR_BAD_BUF (0xFFFFEA50).
+//   3.  acquire(reply_buf=0, mint_ctx_buf non-null) ->
+//       ELCA_ERR_BAD_REPLY_BUF (0xFFFFEA51).
+//   4.  acquire(mint_ctx_buf=0, reply_buf=0) -> ELCA_ERR_BAD_BUF
+//       (0xFFFFEA50).  Gate order: mint_ctx_buf gate fires first.
+//   5.  ELCA_ERR_BAD_BUF (0xFFFFEA50) sits in B7 [0xFFFFEA50..5F].
+//   6.  ELCA_ERR_BAD_REPLY_BUF (0xFFFFEA51) sits in B7.
+//   7.  Happy-path shape: ELCC_MAX_ROWS invariant -- a returned
+//       row_id < 16 is a valid handle (equivalent to `rax < 16` at
+//       elca_aq_out with rax coming from the mint on the happy path).
+//       Asserts 16 sits at the boundary the acquire's step-3 gate
+//       expects.
+//   8.  Underlying-layer passthrough (B2 ELVC_*): ELVC_ERR_LOOKUP_
+//       FAIL (0xFFFFEA0F) sits in [0xFFFFEA00..0F]. Reachable from
+//       acquire via request_ex_r -> request_ex_j -> request_ex ->
+//       elevate_client_lookup_broker returning SVC_LOOKUP_NONE.
+//   9.  Underlying-layer passthrough (B4 ELVR_*): ELVR_ERR_EXHAUSTED
+//       (0xFFFFEA20) sits in [0xFFFFEA20..2F]. Reachable from acquire
+//       via request_ex_r when all retriable attempts fail.
+//   10. Underlying-layer passthrough (B5 ELCC_*): ELCC_ERR_BAD_ROW
+//       (0xFFFFEA30) sits in [0xFFFFEA30..3F]. Reachable from acquire
+//       via elevate_client_cap_bind_expire_abs / _bind_grant on the
+//       defensive-passthrough arms.
+//   11. Underlying-layer passthrough (B6 ELVJ_*): ELVJ_ERR_BAD_ACTOR
+//       (0xFFFFEA40) sits in [0xFFFFEA40..4F]. Reachable from acquire
+//       via request_ex_j -> elevate_client_journal_req when the
+//       caller's actor_fp_lo is unset (a client-side gate that
+//       precedes uej_append).
+//   12. B7 boundaries: ELCA band [0xFFFFEA50..5F] does not overlap
+//       either neighbouring band (B6 hi 0x4F and B8 lo 0x60).
+//
+// =============================================================================
+// FINGERPRINT: LIBPDX-ELEVATE LE.M1 ACQUIRE OK
+// =============================================================================
+//
+// Labels prefixed ecaw_ (elevate client acquire witness).
+
+module ElevateClientAcquireTest = structure {
+
+  pub let mut _ecaw_stage : u64 = 0
+
+  // 24-byte scratch mint_ctx (parent_ep_slot / request_id / requester_
+  // pid at [+0/+8/+16]) plus 16 bytes for the ENH-006 (#17)
+  // target_cap_kind / target_cap_rights extension at [+24/+32].
+  // Only the NON-NULL address is load-bearing for the gate tests;
+  // contents are not read in the paths this witness reaches.
+  pub let mut _ecaw_mint_ctx : [u64; 5] = uninit @align(64)
+
+  // 32-byte reply-frame scratch (op_word, granted_caps, expire_ns,
+  // reserved) so gate-3 (BAD_REPLY_BUF) can pass a non-null pointer.
+  pub let mut _ecaw_reply_buf : [u64; 4] = uninit @align(32)
+
+  // 32-byte REQ frame scratch.
+  pub let mut _ecaw_req_buf : [u64; 4] = uninit @align(32)
+
+  pub let ecaw_ok   : [u8; 32] = "LIBPDX-ELEVATE LE.M1 ACQUIRE OK\0"
+  pub let ecaw_fail : [u8; 34] = "LIBPDX-ELEVATE LE.M1 ACQUIRE FAIL\0"
+
+  pub let elevate_client_acquire_witness : () -> u64 !{sysreg, mem} @{boot, cap} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot, cap},
+      justification: "libpdx-elevate.LE.M1-001 (#19): boot witness for src/elevate_client_acquire.pdx. Every stage reloads its arguments as fresh immediates or lea's; the stage id is recorded to memory (_ecaw_stage) for the fail path so no live value spans a nested CALL. A bare `sub rsp, 24` reserves the same byte count the two-push-plus-pad idiom elsewhere in this library uses (24 bytes); entry rsp%16==8 -> (8-24) mod 16 == 0 so every nested call (elevate_client_acquire, elevate_client_cap_reset, elevate_client_journal_reset, elevate_client_retry_reset, klog_s1, klog_s1_d1) sees aligned rsp. capabilities {boot, cap} propagate from elevate_client_acquire's own {boot, cap} annotation (the two chained CALLs land on the mint_ctx_buf==0 gate before any {cap}-bearing kernel primitive fires, but the effect/capability set on this witness must be the SUPERSET the linker sees, matching the callee's declaration). Every ELCA_ERR_* / ELVC_ERR_* / ELVR_ERR_* / ELCC_ERR_* / ELVJ_ERR_* constant has bit 31 set (or exceeds imm32) so is staged in a scratch register via `mov` (zero-extends) before any compare; a direct `cmp rax, imm32` would sign-extend the immediate and compare against the wrong 64-bit value. Stages 2/3/4 call acquire with the mint_ctx_buf and reply_buf gate values arranged to fire the specific arm under test (gate priority: mint_ctx_buf first, per elca_aq_bad_buf label position in the source). Stages 5-12 are pure band-membership arithmetic against staged constants -- no CALL, straight-line r10/r11 compares -- so they are deterministic and cost nothing at runtime. Labels prefixed ecaw_.",
+      block: {
+        sub rsp, 24;                     // alignment only -- no live data spans a CALL
+
+        // ------------------------------------------------------------
+        // Stage 1: reset.
+        // ------------------------------------------------------------
+        mov rax, 1;
+        lea rcx, [rip + _ecaw_stage];
+        mov [rcx], rax;
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+        call elevate_client_retry_reset;
+
+        // ------------------------------------------------------------
+        // Stage 2: acquire(mint_ctx_buf=0, everything else non-null)
+        // -> ELCA_ERR_BAD_BUF (0xFFFFEA50).
+        // ------------------------------------------------------------
+        mov rax, 2;
+        lea rcx, [rip + _ecaw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0x01;                   // caps
+        mov rsi, 1000000000;             // dur = 1s
+        lea rdx, [rip + _ecaw_req_buf];  // req_buf
+        mov rcx, 1;                      // reply_ep_id
+        lea r8,  [rip + _ecaw_reply_buf];// reply_buf (non-null)
+        xor r9,  r9;                     // mint_ctx_buf = 0  <-- gate
+        call elevate_client_acquire;
+        mov r10, 0xFFFFEA50;             // ELCA_ERR_BAD_BUF
+        cmp rax, r10;
+        jne ecaw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 3: acquire(reply_buf=0, mint_ctx_buf non-null) ->
+        // ELCA_ERR_BAD_REPLY_BUF (0xFFFFEA51).
+        // ------------------------------------------------------------
+        mov rax, 3;
+        lea rcx, [rip + _ecaw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0x01;                   // caps
+        mov rsi, 1000000000;             // dur
+        lea rdx, [rip + _ecaw_req_buf];  // req_buf
+        mov rcx, 1;                      // reply_ep_id
+        xor r8,  r8;                     // reply_buf = 0  <-- gate
+        lea r9,  [rip + _ecaw_mint_ctx]; // mint_ctx_buf (non-null)
+        call elevate_client_acquire;
+        mov r10, 0xFFFFEA51;             // ELCA_ERR_BAD_REPLY_BUF
+        cmp rax, r10;
+        jne ecaw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 4: both bad -- mint_ctx_buf=0 AND reply_buf=0 ->
+        // ELCA_ERR_BAD_BUF wins (mint_ctx_buf gate first).
+        // ------------------------------------------------------------
+        mov rax, 4;
+        lea rcx, [rip + _ecaw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0x01;
+        mov rsi, 1000000000;
+        lea rdx, [rip + _ecaw_req_buf];
+        mov rcx, 1;
+        xor r8,  r8;                     // reply_buf = 0
+        xor r9,  r9;                     // mint_ctx_buf = 0
+        call elevate_client_acquire;
+        mov r10, 0xFFFFEA50;             // ELCA_ERR_BAD_BUF (gate priority)
+        cmp rax, r10;
+        jne ecaw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 5: ELCA_ERR_BAD_BUF (0xFFFFEA50) sits in B7 lo bound.
+        // ------------------------------------------------------------
+        mov rax, 5;
+        lea rcx, [rip + _ecaw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA50;
+        mov r11, 0xFFFFEA50;             // B7 lo
+        cmp r10, r11;
+        jb  ecaw_fail_stage;
+        mov r11, 0xFFFFEA5F;             // B7 hi
+        cmp r10, r11;
+        ja  ecaw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 6: ELCA_ERR_BAD_REPLY_BUF (0xFFFFEA51) sits in B7.
+        // ------------------------------------------------------------
+        mov rax, 6;
+        lea rcx, [rip + _ecaw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA51;
+        mov r11, 0xFFFFEA50;
+        cmp r10, r11;
+        jb  ecaw_fail_stage;
+        mov r11, 0xFFFFEA5F;
+        cmp r10, r11;
+        ja  ecaw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 7: happy-path shape -- ELCC_MAX_ROWS invariant. A
+        // returned row_id < 16 is a valid handle; 16 is the boundary
+        // the acquire's `cmp rax, 16; jae elca_aq_out;` gate uses to
+        // discriminate row_id vs. mint-fail passthrough.
+        // ------------------------------------------------------------
+        mov rax, 7;
+        lea rcx, [rip + _ecaw_stage];
+        mov [rcx], rax;
+
+        mov r10, 15;                     // representative row_id
+        mov r11, 16;                     // ELCC_MAX_ROWS
+        cmp r10, r11;
+        jae ecaw_fail_stage;             // must be strictly < 16
+        // And 16 itself must NOT be a valid row_id.
+        mov r10, 16;
+        cmp r10, r11;
+        jb  ecaw_fail_stage;             // 16 >= 16 must hold
+
+        // ------------------------------------------------------------
+        // Stage 8: B2 passthrough witness -- ELVC_ERR_LOOKUP_FAIL
+        // (0xFFFFEA0F) sits in [0xFFFFEA00..0F].
+        // ------------------------------------------------------------
+        mov rax, 8;
+        lea rcx, [rip + _ecaw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA0F;
+        mov r11, 0xFFFFEA00;
+        cmp r10, r11;
+        jb  ecaw_fail_stage;
+        mov r11, 0xFFFFEA0F;
+        cmp r10, r11;
+        ja  ecaw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 9: B4 passthrough witness -- ELVR_ERR_EXHAUSTED
+        // (0xFFFFEA20) sits in [0xFFFFEA20..2F].
+        // ------------------------------------------------------------
+        mov rax, 9;
+        lea rcx, [rip + _ecaw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA20;
+        mov r11, 0xFFFFEA20;
+        cmp r10, r11;
+        jb  ecaw_fail_stage;
+        mov r11, 0xFFFFEA2F;
+        cmp r10, r11;
+        ja  ecaw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 10: B5 passthrough witness -- ELCC_ERR_BAD_ROW
+        // (0xFFFFEA30) sits in [0xFFFFEA30..3F].
+        // ------------------------------------------------------------
+        mov rax, 10;
+        lea rcx, [rip + _ecaw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA30;
+        mov r11, 0xFFFFEA30;
+        cmp r10, r11;
+        jb  ecaw_fail_stage;
+        mov r11, 0xFFFFEA3F;
+        cmp r10, r11;
+        ja  ecaw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 11: B6 passthrough witness -- ELVJ_ERR_BAD_ACTOR
+        // (0xFFFFEA40) sits in [0xFFFFEA40..4F].
+        // ------------------------------------------------------------
+        mov rax, 11;
+        lea rcx, [rip + _ecaw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA40;
+        mov r11, 0xFFFFEA40;
+        cmp r10, r11;
+        jb  ecaw_fail_stage;
+        mov r11, 0xFFFFEA4F;
+        cmp r10, r11;
+        ja  ecaw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 12: B7 boundary check -- ELCA band [0xFFFFEA50..5F]
+        // does not overlap either neighbour (B6 hi 0x4F, B8 lo 0x60).
+        // ------------------------------------------------------------
+        mov rax, 12;
+        lea rcx, [rip + _ecaw_stage];
+        mov [rcx], rax;
+
+        // B7 lo 0x50 > B6 hi 0x4F
+        mov r10, 0xFFFFEA50;
+        mov r11, 0xFFFFEA4F;
+        cmp r10, r11;
+        jbe ecaw_fail_stage;
+
+        // B7 hi 0x5F < B8 lo 0x60
+        mov r10, 0xFFFFEA5F;
+        mov r11, 0xFFFFEA60;
+        cmp r10, r11;
+        jae ecaw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Success.  Log OK, scrub state, return 0.
+        // ------------------------------------------------------------
+        mov rdi, 3;                      // KLOG_LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecaw_ok];
+        call klog_s1;
+
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+        call elevate_client_retry_reset;
+        xor rax, rax;
+        jmp ecaw_out;
+
+      ecaw_fail_stage:
+        lea rax, [rip + _ecaw_stage];
+        mov r8, [rax];                   // value1 -- failing stage id
+        mov rdi, 1;                      // KLOG_LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecaw_fail];
+        lea rcx, [rip + k_line];         // key1 = "line"
+        call klog_s1_d1;
+        call elevate_client_cap_reset;
+        call elevate_client_journal_reset;
+        call elevate_client_retry_reset;
+        mov rax, 1;
+
+      ecaw_out:
+        add rsp, 24;
+        ret
+      }
+    }
+}

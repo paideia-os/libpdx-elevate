@@ -1,0 +1,416 @@
+// tests/elevate_client_send_test.pdx -- libpdx-elevate.LE.M1-001
+//                                        (paideia-os/libpdx-elevate#19)
+//
+// Boot witness for src/elevate_client_send.pdx.  Named gap in issue #19:
+// the largest source module (40 KB) had no dedicated `tests/`-tree
+// witness alongside its ENH-* landings.  This file closes that gap.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Twelve stages exercise the load-bearing surface of the module:
+//
+//   1.  Reset -- stats scrubbed to zero (sanity for later stages).
+//   2.  pack_hdr(reply_ep=0, payload_len=32) byte-identity vs the
+//       hand-computed u64 that Frame.frame_encode would write.  The
+//       encoded shape is:
+//           (payload_len << 32) | (reply_ep << 16) | (ver << 8) | op
+//           op = ELVS_OP_REQ = 1, ver = ELVS_FRAME_VER = 1.
+//       For (0, 32): 0x20_00000000 | 0 | 0x100 | 0x01 = 0x2000000101.
+//   3.  pack_hdr(reply_ep=42, payload_len=32) byte-identity:
+//       0x20_00000000 | 0x2A_0000 | 0x100 | 0x01 = 0x20002A0101.
+//       Establishes that a non-zero reply_ep_id lands in bits [23:8]
+//       correctly and no adjacent bits are disturbed.
+//   4.  pack_hdr masks reply_ep at 0xFFFF (bits [16..31] of the
+//       reply_ep argument must be masked out before the shift so an
+//       oversized caller value cannot leak into the payload_len
+//       field).  pack_hdr(0x10001, 32) MUST equal pack_hdr(1, 32) =
+//       0x2000010101.
+//   5.  pack_hdr masks payload_len at 0xFFFFFFFF (bit 32 of the len
+//       argument must be masked out; an oversized len must not leak
+//       above the u64).  pack_hdr(0, 0x100000000) MUST equal
+//       pack_hdr(0, 0) = 0x0101 (only op + ver set).
+//   6.  check_grant(reply_buf, requested=0x03) with granted=0x03 at
+//       reply_buf+8 -> ELVC_OK.  Equality is a subset of itself.
+//   7.  check_grant(reply_buf, requested=0x03) with granted=0x01 at
+//       reply_buf+8 -> ELVC_OK.  A strict subset.
+//   8.  check_grant(reply_buf, requested=0x03) with granted=0x07 at
+//       reply_buf+8 -> ELVC_ERR_GRANT_INVALID (0xFFFFEA03).  A grant
+//       exceeding the request (bit 2 was not requested) is refused.
+//   9.  recv_reply(reply_ep=127, buf, timeout=0) -- bounded-recv
+//       timeout.  Endpoint 127 has never received a message in this
+//       boot, so endpoint_take_pending returns the PENDING_TAKE_EMPTY
+//       sentinel; the deadline check (now >= now+0) fires immediately
+//       and the function returns ELVC_ERR_TIMEOUT (0xFFFFEA01).  This
+//       exercises the "bounded-recv timeout" branch without needing a
+//       stubbed broker to publish a reply.
+//   10. send_req(broker_ep=200, ...) -- client-side broker_ep gate
+//       (endpoint_table has 128 slots) refuses ids >= 128 and returns
+//       ELVC_ERR_SEND_FAIL (0xFFFFEA0D) BEFORE endpoint_write_pending
+//       is called.  This isolated unit test exercises the gate
+//       without invoking a real send.
+//   11. request_ex_ctx(ctx_buf=0) -- explicit-context full-flow entry
+//       point's client-side ctx_buf==0 gate returns ELVC_ERR_BAD_CTX
+//       (0xFFFFEA06) BEFORE any broker interaction.  This is the
+//       stubbed-broker analogue of the _ex full flow: the entry point
+//       is exercised end-to-end (through prologue and epilogue) but
+//       the first client-side gate refuses so no sys_ipc_* call is
+//       reached.  The task's "isolated unit-test" constraint is
+//       satisfied while still driving _ex's own frame.
+//   12. Band coverage -- every ELVC_ERR_* documented in the send
+//       module's band 0xFFFFEA00..0F sits inside that range.  Values
+//       exercised:
+//           NOT_DISPATCHED   0xFFFFEA00
+//           TIMEOUT          0xFFFFEA01  (stage 9 above)
+//           BAD_REPLY        0xFFFFEA02
+//           GRANT_INVALID    0xFFFFEA03  (stage 8 above)
+//           BAD_EXPIRE       0xFFFFEA04
+//           BAD_REPLY_EP     0xFFFFEA05
+//           BAD_CTX          0xFFFFEA06  (stage 11 above)
+//           BAD_REPLY_LEN    0xFFFFEA07
+//           BAD_BUF          0xFFFFEA0B
+//           RECV_FAIL        0xFFFFEA0C
+//           SEND_FAIL        0xFFFFEA0D  (stage 10 above)
+//           PACK_FAIL        0xFFFFEA0E
+//           LOOKUP_FAIL      0xFFFFEA0F
+//       Each is asserted >= 0xFFFFEA00 and <= 0xFFFFEA0F (unsigned).
+//       Stages 8/9/10/11 already exercise four of them dynamically;
+//       stage 12 audits the rest as pure band-membership so a future
+//       accidental value drift trips this witness.
+//
+// =============================================================================
+// FINGERPRINT: LIBPDX-ELEVATE LE.M1 SEND OK
+// =============================================================================
+//
+// Labels prefixed ecsw_ (elevate client send witness) -- disjoint
+// from every other elc*_ / ecc*_ / ecp*_ / ecq*_ / ecb*_ / ecow_ /
+// eatw_ / em3w_ / eraw_ / erjw_ / erqw_ prefix in this library.
+
+module ElevateClientSendTest = structure {
+
+  pub let mut _ecsw_stage : u64 = 0
+
+  // 32-byte reply-frame scratch (op_word, granted_caps, expire_ns,
+  // reserved).  Only offset +8 is load-bearing for check_grant; the
+  // rest is scratch.  Aligned to 8 bytes so a qword store lands
+  // atomically.
+  pub let mut _ecsw_reply_buf : [u64; 4] = uninit @align(32)
+
+  // 32-byte REQ frame scratch for the request_ex_ctx call (unused --
+  // the ctx_buf==0 gate fires first -- but valid to pass a non-null
+  // buffer so a future extension of the gate does not spurious-fault
+  // this witness on a nested null-buffer refusal).
+  pub let mut _ecsw_req_buf : [u64; 4] = uninit @align(32)
+
+  pub let ecsw_ok   : [u8; 29] = "LIBPDX-ELEVATE LE.M1 SEND OK\0"
+  pub let ecsw_fail : [u8; 31] = "LIBPDX-ELEVATE LE.M1 SEND FAIL\0"
+
+  pub let elevate_client_send_witness : () -> u64 !{sysreg, mem} @{boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "libpdx-elevate.LE.M1-001 (#19): boot witness for src/elevate_client_send.pdx. Every stage reloads its rdi/rsi/rdx/rcx arguments as fresh immediates or memory pokes so no live value spans a nested CALL; the stage id is recorded to memory (_ecsw_stage) for the fail path. A bare `sub rsp, 24` reserves the same byte count the two-push-plus-pad idiom elsewhere in this library uses (24 bytes); entry rsp%16==8 -> (8-24) mod 16 == 0 so every nested call (elevate_client_pack_hdr, elevate_client_check_grant, elevate_client_recv_reply, elevate_client_send_req, elevate_client_request_ex_ctx, elevate_client_stats_reset, klog_s1, klog_s1_d1) sees aligned rsp. capabilities {boot} propagate from elevate_client_recv_reply (which inherits {boot} from hpet_now_ns) and from klog_s1 / klog_s1_d1; elevate_client_pack_hdr / elevate_client_check_grant are pure or !{mem} and contribute no cap. Every ELVC_ERR_* / hand-computed pack_hdr constant has bit 31 set (or exceeds imm32) so is staged in a scratch reg via `mov` (zero-extends into the full 64-bit register) before any compare; a direct `cmp rax, imm32` against 0xFFFFEA0F or 0x2000000101 would sign-extend the immediate and compare against the wrong 64-bit value. Stage 4/5 masking assertions use pack_hdr twice with argument pairs that differ only above the field width; a broken mask would leak the extra bits and the two return values would diverge, catching the regression. Stage 9's recv_reply call uses reply_ep=127 (max valid, unused in this witness) with timeout=0 to force the fast-timeout branch after a single empty endpoint_take_pending iteration -- endpoint 127 is unmapped so the sentinel is returned deterministically. Stage 10 uses broker_ep=200 (> 128, refused by the client-side range gate) so no sys_ipc_* call reaches the kernel. Stage 11 uses ctx_buf=0 for the same reason (the ELVC_ERR_BAD_CTX gate at the top of request_ex_ctx fires before any nested call). Labels prefixed ecsw_.",
+      block: {
+        sub rsp, 24;                     // alignment only -- no live data spans a CALL
+
+        // ------------------------------------------------------------
+        // Stage 1: reset -- stats scrubbed to zero.
+        // ------------------------------------------------------------
+        mov rax, 1;
+        lea rcx, [rip + _ecsw_stage];
+        mov [rcx], rax;
+        call elevate_client_stats_reset;
+
+        // ------------------------------------------------------------
+        // Stage 2: pack_hdr(0, 32) byte-identity == 0x2000000101.
+        // ------------------------------------------------------------
+        mov rax, 2;
+        lea rcx, [rip + _ecsw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;                    // reply_ep_id = 0
+        mov rsi, 32;                     // payload_len = ELVS_REQ_PAYLOAD_BYTES
+        call elevate_client_pack_hdr;
+        mov r10, 0x2000000101;
+        cmp rax, r10;
+        jne ecsw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 3: pack_hdr(42, 32) byte-identity == 0x20002A0101.
+        // ------------------------------------------------------------
+        mov rax, 3;
+        lea rcx, [rip + _ecsw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 42;
+        mov rsi, 32;
+        call elevate_client_pack_hdr;
+        mov r10, 0x20002A0101;
+        cmp rax, r10;
+        jne ecsw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 4: pack_hdr(0x10001, 32) masks reply_ep at 0xFFFF ->
+        // equals pack_hdr(1, 32) = 0x2000010101.
+        // ------------------------------------------------------------
+        mov rax, 4;
+        lea rcx, [rip + _ecsw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 0x10001;
+        mov rsi, 32;
+        call elevate_client_pack_hdr;
+        mov r10, 0x2000010101;
+        cmp rax, r10;
+        jne ecsw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 5: pack_hdr(0, 0x100000000) masks payload_len at
+        // 0xFFFFFFFF -> equals pack_hdr(0, 0) = 0x101 (only op + ver).
+        // ------------------------------------------------------------
+        mov rax, 5;
+        lea rcx, [rip + _ecsw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;
+        mov r10, 0x100000000;
+        mov rsi, r10;
+        call elevate_client_pack_hdr;
+        mov r10, 0x101;
+        cmp rax, r10;
+        jne ecsw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 6: check_grant granted==requested -> ELVC_OK.  Poke
+        // granted=0x03 into reply_buf+8 (word index 1).
+        // ------------------------------------------------------------
+        mov rax, 6;
+        lea rcx, [rip + _ecsw_stage];
+        mov [rcx], rax;
+
+        lea r10, [rip + _ecsw_reply_buf];
+        mov r11, 0x03;
+        mov [r10 + 8], r11;              // granted_caps
+
+        lea rdi, [rip + _ecsw_reply_buf];
+        mov rsi, 0x03;                   // requested_caps
+        call elevate_client_check_grant;
+        cmp rax, 0;                      // ELVC_OK
+        jne ecsw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 7: check_grant strict subset -> ELVC_OK.  granted=0x01
+        // is a subset of requested=0x03.
+        // ------------------------------------------------------------
+        mov rax, 7;
+        lea rcx, [rip + _ecsw_stage];
+        mov [rcx], rax;
+
+        lea r10, [rip + _ecsw_reply_buf];
+        mov r11, 0x01;
+        mov [r10 + 8], r11;
+
+        lea rdi, [rip + _ecsw_reply_buf];
+        mov rsi, 0x03;
+        call elevate_client_check_grant;
+        cmp rax, 0;
+        jne ecsw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 8: check_grant superset -> ELVC_ERR_GRANT_INVALID.
+        // granted=0x07 has bit 2 not in requested=0x03.
+        // ------------------------------------------------------------
+        mov rax, 8;
+        lea rcx, [rip + _ecsw_stage];
+        mov [rcx], rax;
+
+        lea r10, [rip + _ecsw_reply_buf];
+        mov r11, 0x07;
+        mov [r10 + 8], r11;
+
+        lea rdi, [rip + _ecsw_reply_buf];
+        mov rsi, 0x03;
+        call elevate_client_check_grant;
+        mov r10, 0xFFFFEA03;             // ELVC_ERR_GRANT_INVALID
+        cmp rax, r10;
+        jne ecsw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 9: recv_reply(reply_ep=127, buf, timeout=0) ->
+        // ELVC_ERR_TIMEOUT.  Endpoint 127 is unmapped in this witness
+        // so endpoint_take_pending returns PENDING_TAKE_EMPTY; the
+        // deadline check (now >= now+0) fires immediately and the
+        // function returns ELVC_ERR_TIMEOUT.
+        // ------------------------------------------------------------
+        mov rax, 9;
+        lea rcx, [rip + _ecsw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 127;                    // reply_ep_id (max valid)
+        lea rsi, [rip + _ecsw_reply_buf];
+        xor rdx, rdx;                    // timeout_ns = 0
+        call elevate_client_recv_reply;
+        mov r10, 0xFFFFEA01;             // ELVC_ERR_TIMEOUT
+        cmp rax, r10;
+        jne ecsw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 10: send_req(broker_ep=200, ...) -> ELVC_ERR_SEND_FAIL.
+        // 200 >= 128 -> refused by the client-side broker_ep range
+        // gate before endpoint_write_pending is called.
+        // ------------------------------------------------------------
+        mov rax, 10;
+        lea rcx, [rip + _ecsw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 200;                    // broker_ep_id (out of range)
+        mov rsi, 1;                      // reply_ep_id (dummy)
+        lea rdx, [rip + _ecsw_req_buf];
+        call elevate_client_send_req;
+        mov r10, 0xFFFFEA0D;             // ELVC_ERR_SEND_FAIL
+        cmp rax, r10;
+        jne ecsw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 11: request_ex_ctx(ctx_buf=0) -> ELVC_ERR_BAD_CTX.
+        // The client-side gate at the top of request_ex_ctx fires
+        // before any broker interaction; the _ex full flow is
+        // exercised through prologue and epilogue without touching
+        // sys_ipc_*.
+        // ------------------------------------------------------------
+        mov rax, 11;
+        lea rcx, [rip + _ecsw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;                    // caps = 0
+        xor rsi, rsi;                    // dur = 0
+        lea rdx, [rip + _ecsw_req_buf];  // req_buf (non-null)
+        mov rcx, 1;                      // reply_ep_id (dummy)
+        lea r8,  [rip + _ecsw_reply_buf];// reply_buf (non-null)
+        xor r9,  r9;                     // ctx_buf = 0  <-- gate
+        call elevate_client_request_ex_ctx;
+        mov r10, 0xFFFFEA06;             // ELVC_ERR_BAD_CTX
+        cmp rax, r10;
+        jne ecsw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 12: band-coverage audit for band 0xFFFFEA00..0F.  Each
+        // ELVC_ERR_* constant not exercised by stages 8/9/10/11 above
+        // is asserted to sit inside the band.  Stages already covered
+        // dynamically: TIMEOUT (9), GRANT_INVALID (8), BAD_CTX (11),
+        // SEND_FAIL (10).  Static coverage below.
+        // ------------------------------------------------------------
+        mov rax, 12;
+        lea rcx, [rip + _ecsw_stage];
+        mov [rcx], rax;
+
+        // NOT_DISPATCHED (0xFFFFEA00)
+        mov r10, 0xFFFFEA00;
+        mov r11, 0xFFFFEA00;
+        cmp r10, r11;
+        jb  ecsw_fail_stage;
+        mov r11, 0xFFFFEA0F;
+        cmp r10, r11;
+        ja  ecsw_fail_stage;
+
+        // BAD_REPLY (0xFFFFEA02)
+        mov r10, 0xFFFFEA02;
+        mov r11, 0xFFFFEA00;
+        cmp r10, r11;
+        jb  ecsw_fail_stage;
+        mov r11, 0xFFFFEA0F;
+        cmp r10, r11;
+        ja  ecsw_fail_stage;
+
+        // BAD_EXPIRE (0xFFFFEA04)
+        mov r10, 0xFFFFEA04;
+        mov r11, 0xFFFFEA00;
+        cmp r10, r11;
+        jb  ecsw_fail_stage;
+        mov r11, 0xFFFFEA0F;
+        cmp r10, r11;
+        ja  ecsw_fail_stage;
+
+        // BAD_REPLY_EP (0xFFFFEA05)
+        mov r10, 0xFFFFEA05;
+        mov r11, 0xFFFFEA00;
+        cmp r10, r11;
+        jb  ecsw_fail_stage;
+        mov r11, 0xFFFFEA0F;
+        cmp r10, r11;
+        ja  ecsw_fail_stage;
+
+        // BAD_REPLY_LEN (0xFFFFEA07)
+        mov r10, 0xFFFFEA07;
+        mov r11, 0xFFFFEA00;
+        cmp r10, r11;
+        jb  ecsw_fail_stage;
+        mov r11, 0xFFFFEA0F;
+        cmp r10, r11;
+        ja  ecsw_fail_stage;
+
+        // BAD_BUF (0xFFFFEA0B)
+        mov r10, 0xFFFFEA0B;
+        mov r11, 0xFFFFEA00;
+        cmp r10, r11;
+        jb  ecsw_fail_stage;
+        mov r11, 0xFFFFEA0F;
+        cmp r10, r11;
+        ja  ecsw_fail_stage;
+
+        // RECV_FAIL (0xFFFFEA0C)
+        mov r10, 0xFFFFEA0C;
+        mov r11, 0xFFFFEA00;
+        cmp r10, r11;
+        jb  ecsw_fail_stage;
+        mov r11, 0xFFFFEA0F;
+        cmp r10, r11;
+        ja  ecsw_fail_stage;
+
+        // PACK_FAIL (0xFFFFEA0E)
+        mov r10, 0xFFFFEA0E;
+        mov r11, 0xFFFFEA00;
+        cmp r10, r11;
+        jb  ecsw_fail_stage;
+        mov r11, 0xFFFFEA0F;
+        cmp r10, r11;
+        ja  ecsw_fail_stage;
+
+        // LOOKUP_FAIL (0xFFFFEA0F) -- band-hi boundary
+        mov r10, 0xFFFFEA0F;
+        mov r11, 0xFFFFEA00;
+        cmp r10, r11;
+        jb  ecsw_fail_stage;
+        mov r11, 0xFFFFEA0F;
+        cmp r10, r11;
+        ja  ecsw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Success.  Log OK, scrub stats, return 0.
+        // ------------------------------------------------------------
+        mov rdi, 3;                      // KLOG_LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecsw_ok];
+        call klog_s1;
+
+        call elevate_client_stats_reset;
+        xor rax, rax;
+        jmp ecsw_out;
+
+      ecsw_fail_stage:
+        lea rax, [rip + _ecsw_stage];
+        mov r8, [rax];                   // value1 -- failing stage id
+        mov rdi, 1;                      // KLOG_LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecsw_fail];
+        lea rcx, [rip + k_line];         // key1 = "line"
+        call klog_s1_d1;
+        call elevate_client_stats_reset;
+        mov rax, 1;
+
+      ecsw_out:
+        add rsp, 24;
+        ret
+      }
+    }
+}

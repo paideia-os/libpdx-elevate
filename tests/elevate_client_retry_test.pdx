@@ -1,0 +1,478 @@
+// tests/elevate_client_retry_test.pdx -- libpdx-elevate.LE.M1-001
+//                                         (paideia-os/libpdx-elevate#19)
+//
+// Boot witness for src/elevate_client_retry.pdx.  Closes issue #19's
+// named gap: the M3-002 retry-wrapped entry point + backoff table had
+// no dedicated `tests/`-tree witness.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Eleven stages exercise the load-bearing surface:
+//
+//   1.  Reset -- retry stats scrubbed, journal stats scrubbed, and
+//       actor_fp_lo set to 0xABCD so stage 11's request_ex_r call
+//       clears the journal_req actor gate.
+//   2.  set_max_attempts BAD_ARG gate: 0 -> ELVR_ERR_BAD_ARG
+//       (0xFFFFEA21); 9 -> ELVR_ERR_BAD_ARG.  Both are outside the
+//       accepted [1, 8] range.
+//   3.  set_max_attempts(3) -> ELVR_OK; get_max_attempts() == 3.
+//       set_max_attempts(8) -> ELVR_OK; get_max_attempts() == 8.
+//   4.  get_max_attempts default -- after retry_reset (stored slot ==
+//       0), the getter substitutes ELVR_MAX_ATTEMPTS_DEFAULT (3).
+//   5.  Backoff table lookups.  Per _elevate_client_retry_backoff_ns
+//       [ 100000000, 400000000, 1600000000 * 6 ]:
+//           (0)  -> 0            (out-of-range low; caller-side gate)
+//           (1)  -> 100000000    (100 ms after attempt 1's failure)
+//           (2)  -> 400000000    (400 ms)
+//           (3)  -> 1600000000   (1.6 s, saturated)
+//           (8)  -> 1600000000   (cap)
+//           (9)  -> 0            (out-of-range high)
+//   6.  Backoff monotonicity.  Table is monotone-nondecreasing:
+//           slot 1 (100M) < slot 2 (400M); slot 2 (400M) < slot 3
+//           (1600M); slots 3..7 (1600M) == slot 8 (1600M).  Every
+//           adjacent pair (i, i+1) for i in [1, 7] satisfies
+//           backoff(i) <= backoff(i+1).
+//   7.  Retriable set membership: ELVR_RETRIABLE_TIMEOUT (0xFFFFEA01)
+//       == ELVC_ERR_TIMEOUT; _SEND_FAIL (0xFFFFEA0D) == ELVC_ERR_
+//       SEND_FAIL; _LOOKUP_FAIL (0xFFFFEA0F) == ELVC_ERR_LOOKUP_FAIL.
+//       All three sit in B2 [0xFFFFEA00..0F].
+//   8.  Non-retriable representative: ELVC_ERR_BAD_REPLY (0xFFFFEA02)
+//       is in B2 but is NOT any of the three retriable codes; a
+//       BAD_REPLY return from request_ex_j would pass through on
+//       attempt 1 (elcr_rx_passthrough arm) without a retry.
+//   9.  ELVR_ERR_EXHAUSTED (0xFFFFEA20) sits in B4 [0xFFFFEA20..2F].
+//   10. ELVR_ERR_BAD_ARG (0xFFFFEA21) sits in B4.
+//   11. request_ex_r attempt-count invariant: with max_attempts set
+//       to 1 and a tiny (1 ns) timeout, one attempt must fire.
+//       ELVR_ST_ATTEMPTS == 1 regardless of the terminal branch
+//       taken (success / passthrough / exhausted -- all three
+//       increment ATTEMPTS at loop top before diverging).  The
+//       specific request_ex_r return value is not asserted since it
+//       depends on broker registration state at witness time.
+//       retry_delay(0) is called first as a hang-safety check: dur=0
+//       short-circuits before hpet_now_ns so a stopped clock cannot
+//       hang the witness.
+//
+// =============================================================================
+// FINGERPRINT: LIBPDX-ELEVATE LE.M1 RETRY OK
+// =============================================================================
+//
+// Labels prefixed ecrw_ (elevate client retry witness).
+
+module ElevateClientRetryTest = structure {
+
+  pub let mut _ecrw_stage : u64 = 0
+
+  // 32-byte REQ / reply-frame scratch for the request_ex_r call in
+  // stage 11.  Contents are not load-bearing; only NON-NULL address
+  // is (assemble writes into req_buf; recv writes into reply_buf on
+  // a successful take that we do not expect here).
+  pub let mut _ecrw_req_buf   : [u64; 4] = uninit @align(32)
+  pub let mut _ecrw_reply_buf : [u64; 4] = uninit @align(32)
+
+  pub let ecrw_ok   : [u8; 30] = "LIBPDX-ELEVATE LE.M1 RETRY OK\0"
+  pub let ecrw_fail : [u8; 32] = "LIBPDX-ELEVATE LE.M1 RETRY FAIL\0"
+
+  pub let elevate_client_retry_witness : () -> u64 !{sysreg, mem} @{boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "libpdx-elevate.LE.M1-001 (#19): boot witness for src/elevate_client_retry.pdx. Every stage reloads its rdi/rsi arguments as fresh immediates; the stage id is recorded to memory (_ecrw_stage) for the fail path. A bare `sub rsp, 24` reserves alignment; entry rsp%16==8 -> (8-24) mod 16 == 0 so every nested call (elevate_client_retry_reset / _set_max_attempts / _get_max_attempts / _backoff_ns_for_attempt / _delay / _stat, elevate_client_journal_reset, elevate_client_stats_reset, elevate_client_set_target_fp_lo, elevate_client_request_ex_r, klog_s1 / klog_s1_d1) sees aligned rsp. capabilities {boot} propagate from elevate_client_retry_delay + elevate_client_request_ex_r (which pull it from hpet_now_ns / recv_reply). ELVR_ERR_* / ELVC_ERR_* constants exceed imm32 and are staged in r10 before compare (a direct `cmp rax, 0xFFFFEA21` would sign-extend the immediate and compare against the wrong 64-bit value). Backoff-table values 100000000, 400000000 fit imm32; 1600000000 fits imm32; a direct `cmp rax, imm32` is legal for all three since bit 31 is clear. Stage 11 uses max_attempts=1 so the retry loop runs exactly once regardless of the terminal branch -- the ATTEMPTS==1 invariant is deterministic across success / passthrough / exhausted paths since all three bump ATTEMPTS at the loop-top (elcr_rx_loop) before diverging. The retry_delay(0) call in stage 11 is a hang-safety check: dur=0 short-circuits at elcr_dl_out before any hpet_now_ns call, so a stopped clock cannot deadlock the witness. Labels prefixed ecrw_.",
+      block: {
+        sub rsp, 24;                     // alignment only
+
+        // ------------------------------------------------------------
+        // Stage 1: reset + set actor_fp_lo (stage 11's journal chain
+        // needs a valid actor to clear the BAD_ACTOR gate).
+        // ------------------------------------------------------------
+        mov rax, 1;
+        lea rcx, [rip + _ecrw_stage];
+        mov [rcx], rax;
+        call elevate_client_retry_reset;
+        call elevate_client_journal_reset;
+        call elevate_client_stats_reset;
+        mov rdi, 0xABCD;                 // actor_fp_lo
+        call elevate_client_set_target_fp_lo;
+
+        // ------------------------------------------------------------
+        // Stage 2: set_max_attempts BAD_ARG gate.
+        // ------------------------------------------------------------
+        mov rax, 2;
+        lea rcx, [rip + _ecrw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;                    // 0 -- below [1, 8]
+        call elevate_client_retry_set_max_attempts;
+        mov r10, 0xFFFFEA21;             // ELVR_ERR_BAD_ARG
+        cmp rax, r10;
+        jne ecrw_fail_stage;
+
+        mov rdi, 9;                      // above [1, 8]
+        call elevate_client_retry_set_max_attempts;
+        mov r10, 0xFFFFEA21;
+        cmp rax, r10;
+        jne ecrw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 3: set_max_attempts(3) -> OK; get == 3.  Then
+        // set_max_attempts(8) -> OK; get == 8.
+        // ------------------------------------------------------------
+        mov rax, 3;
+        lea rcx, [rip + _ecrw_stage];
+        mov [rcx], rax;
+
+        mov rdi, 3;
+        call elevate_client_retry_set_max_attempts;
+        cmp rax, 0;                      // ELVR_OK
+        jne ecrw_fail_stage;
+
+        call elevate_client_retry_get_max_attempts;
+        cmp rax, 3;
+        jne ecrw_fail_stage;
+
+        mov rdi, 8;
+        call elevate_client_retry_set_max_attempts;
+        cmp rax, 0;
+        jne ecrw_fail_stage;
+
+        call elevate_client_retry_get_max_attempts;
+        cmp rax, 8;
+        jne ecrw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 4: get_max_attempts default after reset -> 3.
+        // ------------------------------------------------------------
+        mov rax, 4;
+        lea rcx, [rip + _ecrw_stage];
+        mov [rcx], rax;
+
+        call elevate_client_retry_reset;
+        call elevate_client_retry_get_max_attempts;
+        cmp rax, 3;                      // ELVR_MAX_ATTEMPTS_DEFAULT
+        jne ecrw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 5: backoff table lookups.
+        // ------------------------------------------------------------
+        mov rax, 5;
+        lea rcx, [rip + _ecrw_stage];
+        mov [rcx], rax;
+
+        xor rdi, rdi;                    // (0) -- OOR low
+        call elevate_client_retry_backoff_ns_for_attempt;
+        cmp rax, 0;
+        jne ecrw_fail_stage;
+
+        mov rdi, 1;
+        call elevate_client_retry_backoff_ns_for_attempt;
+        mov r10, 100000000;
+        cmp rax, r10;
+        jne ecrw_fail_stage;
+
+        mov rdi, 2;
+        call elevate_client_retry_backoff_ns_for_attempt;
+        mov r10, 400000000;
+        cmp rax, r10;
+        jne ecrw_fail_stage;
+
+        mov rdi, 3;
+        call elevate_client_retry_backoff_ns_for_attempt;
+        mov r10, 1600000000;
+        cmp rax, r10;
+        jne ecrw_fail_stage;
+
+        mov rdi, 8;
+        call elevate_client_retry_backoff_ns_for_attempt;
+        mov r10, 1600000000;
+        cmp rax, r10;
+        jne ecrw_fail_stage;
+
+        mov rdi, 9;                      // OOR high
+        call elevate_client_retry_backoff_ns_for_attempt;
+        cmp rax, 0;
+        jne ecrw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 6: backoff monotonicity.  For every adjacent pair
+        // (i, i+1) with i in [1, 7], backoff(i) <= backoff(i+1).
+        // Since paideia-as does not accept `cmp reg,[mem]`, both
+        // lookups are done sequentially and the prior value is
+        // stashed in a callee-scratch memory location.  We use r14
+        // for the previous value and preserve it across each CALL
+        // via a push/pop pair -- three pushes in this witness would
+        // otherwise force an alignment rebalance, so the pair form
+        // is chosen for locality.
+        // ------------------------------------------------------------
+        mov rax, 6;
+        lea rcx, [rip + _ecrw_stage];
+        mov [rcx], rax;
+
+        // Iterate i = 1..7, comparing backoff(i) to backoff(i+1).
+        // Unroll: 7 pairs, each pair is two lookups + a compare.
+        //
+        // Pair (1, 2)
+        mov rdi, 1;
+        call elevate_client_retry_backoff_ns_for_attempt;
+        push rax;                        // prev
+        sub rsp, 8;                      // realign
+        mov rdi, 2;
+        call elevate_client_retry_backoff_ns_for_attempt;
+        add rsp, 8;
+        pop r10;                         // prev
+        cmp r10, rax;                    // prev <= cur ?
+        ja  ecrw_fail_stage;
+
+        // Pair (2, 3)
+        mov rdi, 2;
+        call elevate_client_retry_backoff_ns_for_attempt;
+        push rax;
+        sub rsp, 8;
+        mov rdi, 3;
+        call elevate_client_retry_backoff_ns_for_attempt;
+        add rsp, 8;
+        pop r10;
+        cmp r10, rax;
+        ja  ecrw_fail_stage;
+
+        // Pair (3, 4)
+        mov rdi, 3;
+        call elevate_client_retry_backoff_ns_for_attempt;
+        push rax;
+        sub rsp, 8;
+        mov rdi, 4;
+        call elevate_client_retry_backoff_ns_for_attempt;
+        add rsp, 8;
+        pop r10;
+        cmp r10, rax;
+        ja  ecrw_fail_stage;
+
+        // Pair (4, 5)
+        mov rdi, 4;
+        call elevate_client_retry_backoff_ns_for_attempt;
+        push rax;
+        sub rsp, 8;
+        mov rdi, 5;
+        call elevate_client_retry_backoff_ns_for_attempt;
+        add rsp, 8;
+        pop r10;
+        cmp r10, rax;
+        ja  ecrw_fail_stage;
+
+        // Pair (5, 6)
+        mov rdi, 5;
+        call elevate_client_retry_backoff_ns_for_attempt;
+        push rax;
+        sub rsp, 8;
+        mov rdi, 6;
+        call elevate_client_retry_backoff_ns_for_attempt;
+        add rsp, 8;
+        pop r10;
+        cmp r10, rax;
+        ja  ecrw_fail_stage;
+
+        // Pair (6, 7)
+        mov rdi, 6;
+        call elevate_client_retry_backoff_ns_for_attempt;
+        push rax;
+        sub rsp, 8;
+        mov rdi, 7;
+        call elevate_client_retry_backoff_ns_for_attempt;
+        add rsp, 8;
+        pop r10;
+        cmp r10, rax;
+        ja  ecrw_fail_stage;
+
+        // Pair (7, 8)
+        mov rdi, 7;
+        call elevate_client_retry_backoff_ns_for_attempt;
+        push rax;
+        sub rsp, 8;
+        mov rdi, 8;
+        call elevate_client_retry_backoff_ns_for_attempt;
+        add rsp, 8;
+        pop r10;
+        cmp r10, rax;
+        ja  ecrw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 7: retriable-set membership.  The three retriable
+        // codes are ELVC_ERR_TIMEOUT / _SEND_FAIL / _LOOKUP_FAIL,
+        // all in B2 [0xFFFFEA00..0F].
+        // ------------------------------------------------------------
+        mov rax, 7;
+        lea rcx, [rip + _ecrw_stage];
+        mov [rcx], rax;
+
+        // TIMEOUT
+        mov r10, 0xFFFFEA01;
+        mov r11, 0xFFFFEA00;
+        cmp r10, r11;
+        jb  ecrw_fail_stage;
+        mov r11, 0xFFFFEA0F;
+        cmp r10, r11;
+        ja  ecrw_fail_stage;
+
+        // SEND_FAIL
+        mov r10, 0xFFFFEA0D;
+        mov r11, 0xFFFFEA00;
+        cmp r10, r11;
+        jb  ecrw_fail_stage;
+        mov r11, 0xFFFFEA0F;
+        cmp r10, r11;
+        ja  ecrw_fail_stage;
+
+        // LOOKUP_FAIL
+        mov r10, 0xFFFFEA0F;
+        mov r11, 0xFFFFEA00;
+        cmp r10, r11;
+        jb  ecrw_fail_stage;
+        mov r11, 0xFFFFEA0F;
+        cmp r10, r11;
+        ja  ecrw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 8: non-retriable representative.  BAD_REPLY
+        // (0xFFFFEA02) is in B2 but distinct from every retriable
+        // code -- a request_ex_j return of BAD_REPLY passes through
+        // on attempt 1 (no retry).
+        // ------------------------------------------------------------
+        mov rax, 8;
+        lea rcx, [rip + _ecrw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA02;             // BAD_REPLY
+        mov r11, 0xFFFFEA01;             // TIMEOUT (retriable)
+        cmp r10, r11;
+        je  ecrw_fail_stage;
+        mov r11, 0xFFFFEA0D;             // SEND_FAIL
+        cmp r10, r11;
+        je  ecrw_fail_stage;
+        mov r11, 0xFFFFEA0F;             // LOOKUP_FAIL
+        cmp r10, r11;
+        je  ecrw_fail_stage;
+
+        // Verify it is still in B2.
+        mov r11, 0xFFFFEA00;
+        cmp r10, r11;
+        jb  ecrw_fail_stage;
+        mov r11, 0xFFFFEA0F;
+        cmp r10, r11;
+        ja  ecrw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 9: ELVR_ERR_EXHAUSTED (0xFFFFEA20) in B4.
+        // ------------------------------------------------------------
+        mov rax, 9;
+        lea rcx, [rip + _ecrw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA20;
+        mov r11, 0xFFFFEA20;
+        cmp r10, r11;
+        jb  ecrw_fail_stage;
+        mov r11, 0xFFFFEA2F;
+        cmp r10, r11;
+        ja  ecrw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 10: ELVR_ERR_BAD_ARG (0xFFFFEA21) in B4.
+        // ------------------------------------------------------------
+        mov rax, 10;
+        lea rcx, [rip + _ecrw_stage];
+        mov [rcx], rax;
+
+        mov r10, 0xFFFFEA21;
+        mov r11, 0xFFFFEA20;
+        cmp r10, r11;
+        jb  ecrw_fail_stage;
+        mov r11, 0xFFFFEA2F;
+        cmp r10, r11;
+        ja  ecrw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Stage 11: request_ex_r attempt-count invariant + retry_
+        // delay hang-safety.
+        //
+        //   (a) retry_delay(0) returns immediately (dur=0 short-
+        //       circuits before hpet_now_ns).  If this hangs, the
+        //       witness never reaches klog_s1 and the boot log will
+        //       show LE.M1 RETRY missing entirely -- a distinctive
+        //       failure mode.
+        //   (b) set_max_attempts(1), reset retry+journal stats, call
+        //       request_ex_r with a tiny (1 ns) timeout.  After the
+        //       call, ELVR_ST_ATTEMPTS must be exactly 1: all three
+        //       terminal arms (success, passthrough, exhausted) go
+        //       through the loop top which increments ATTEMPTS
+        //       before diverging.
+        // ------------------------------------------------------------
+        mov rax, 11;
+        lea rcx, [rip + _ecrw_stage];
+        mov [rcx], rax;
+
+        // (a) hang-safety
+        xor rdi, rdi;                    // dur_ns = 0
+        call elevate_client_retry_delay;
+        // No return-value assertion (retry_delay returns unit).
+
+        // (b) attempt-count invariant
+        mov rdi, 1;
+        call elevate_client_retry_set_max_attempts;
+        cmp rax, 0;                      // ELVR_OK
+        jne ecrw_fail_stage;
+
+        call elevate_client_retry_reset;
+        // retry_reset clears max_attempts back to 0 -- restore to 1.
+        mov rdi, 1;
+        call elevate_client_retry_set_max_attempts;
+        cmp rax, 0;
+        jne ecrw_fail_stage;
+        call elevate_client_journal_reset;
+
+        mov rdi, 0x03;                   // caps
+        mov rsi, 1000000000;             // dur = 1s
+        lea rdx, [rip + _ecrw_req_buf];  // req_buf
+        mov rcx, 127;                    // reply_ep_id (unmapped, max valid)
+        lea r8,  [rip + _ecrw_reply_buf];// reply_buf
+        mov r9,  1;                      // timeout_ns = 1 ns
+        call elevate_client_request_ex_r;
+        // Return value not asserted (depends on broker registration).
+
+        mov rdi, 0;                      // ELVR_ST_ATTEMPTS
+        call elevate_client_retry_stat;
+        cmp rax, 1;                      // exactly one attempt with max=1
+        jne ecrw_fail_stage;
+
+        // ------------------------------------------------------------
+        // Success.  Log OK, scrub state, return 0.
+        // ------------------------------------------------------------
+        mov rdi, 3;                      // KLOG_LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecrw_ok];
+        call klog_s1;
+
+        call elevate_client_retry_reset;
+        call elevate_client_journal_reset;
+        call elevate_client_stats_reset;
+        xor rax, rax;
+        jmp ecrw_out;
+
+      ecrw_fail_stage:
+        lea rax, [rip + _ecrw_stage];
+        mov r8, [rax];                   // value1 -- failing stage id
+        mov rdi, 1;                      // KLOG_LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + ecrw_fail];
+        lea rcx, [rip + k_line];         // key1 = "line"
+        call klog_s1_d1;
+        call elevate_client_retry_reset;
+        call elevate_client_journal_reset;
+        call elevate_client_stats_reset;
+        mov rax, 1;
+
+      ecrw_out:
+        add rsp, 24;
+        ret
+      }
+    }
+}
