@@ -10,6 +10,52 @@ covers.
 
 ## Unreleased
 
+### #22 — LE.M1-004 README/STATUS Callers list accuracy re-verification (2026-09-11)
+
+- Doc-only pass. No source, test, `caps.decl`, `deps.list`, or
+  `manifest.pdxsig` change. Refreshes the README Callers section and
+  the STATUS M6 close-out so the v1.1.0 signed release tag is not
+  cut over stale caller claims (ENH-007 timestamp was 2026-08-25).
+- Verification method: `raw.githubusercontent.com/paideia-os/<repo>/main/src/`
+  fetch + local grep per caller. GitHub's own `search/code` API
+  returned zero across the whole org for `elevate_client` (index
+  freshness artefact vs. known non-zero live occurrences), so this
+  pass avoids relying on it.
+- Result per caller:
+  - `rm@main` `src/elevate.pdx:234` — STILL emits
+    `call elevate_client_request;` (retired name per ENH-005 / #12).
+    UNCHANGED since 2026-08-25; blocker is in `rm`'s own repo.
+  - `pkg@main` `src/pkg_elevate.pdx:213` — now emits
+    `call elevate_client_request_norealize;` (pkg.ENH-008 / #33).
+    MIGRATED (name-only rename; disposition logic unchanged).
+  - `shell@main` — zero `call` instructions into any
+    `elevate_client_*` entry point across
+    `broker_bind.pdx`/`shell.pdx`/`session.pdx`/`exec.pdx`/
+    `dispatch.pdx`/`syscall.pdx`; every `elevate_client` mention
+    is a shape-reference comment. STILL NOT LINKED.
+  - `mount.pdxfs@main` `src/elevate.pdx` — fail-closed stub,
+    unchanged.
+  - `umount.pdxfs@main` `src/elevate.pdx` — existing
+    `elevate_request_force_unmount` stub unchanged, plus new
+    `elevate_request_system_unmount` stub landed (umount.LE-001 /
+    #22). Both fail-closed.
+  - `mkfs.pdxfs@main` `src/elevate_wire.pdx` — fail-closed stub,
+    unchanged.
+- Newly discovered caller: `mv@main` `src/elevate.pdx` (mv.M3-004 /
+  mv#11) opens the elevate hop by going DIRECTLY to
+  `sys_svc_lookup("svc.elevate-broker")` + `sys_ipc_send` rather
+  than through any `elevate_client_*` entry point (grep count in
+  the file: 0). Architecturally committed to a future
+  `libpdx-elevate.M3` swap per its own module header. Added to
+  README under a new "Candidate callers" subsection.
+- README Callers section now carries a 2026-09-11 verification
+  timestamp on every row plus a "candidate callers" subsection for
+  the mv discovery.
+- STATUS.md gains an `LE.M1-004 caller-list re-verification pass`
+  section under M6 close-out that mirrors the README table.
+- Unblocks LE.M1-003 (v1.1.0 signed release tag): YES. Tag itself
+  is a separate mirror-push step (`.plans/mirror-push.md`).
+
 ### #20 — LE.M1-002 explicit-context (ctx) variants for `_ex_j`, `_ex_r`, `acquire`
 
 - Three new ctx-carrying entry points -- structural extension of the

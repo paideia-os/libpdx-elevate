@@ -286,35 +286,47 @@ proceeding.
 
 ## Callers
 
-- **[rm](https://github.com/paideia-os/rm)** — *needs migration.* As of
-  the last verification pass, `src/elevate.pdx` (`RmElevate`,
-  rm.M3-004) called `elevate_client_request` for `/system/` and
-  cross-subtree targets and treated `ELVC_OK` **or** `ELVC_STUB` as
-  proceed. That name no longer exists (ENH-005, #12): `rm`'s build
-  breaks until it migrates to `elevate_client_request_ex` /
-  `elevate_client_acquire` (recommended — see the example below) or,
-  if it genuinely only wants the non-dispatching probe,
-  `elevate_client_request_norealize`. Tracked in rm's own repo per the
-  enhancement plan §6, not here.
-- **[pkg](https://github.com/paideia-os/pkg)** — *needs migration
-  (name only).* `src/pkg_elevate.pdx`
-  (`pkg_elevate_request_pdxfs_write_pkgs`, pkg.M3-004) called
-  `elevate_client_request` with `caps = 0x01` and a 60 s duration,
-  stashing the raw `ELVC_*` return for diagnostics — already
-  fail-closed (every non-zero return, `ELVC_STUB` included, routed to
-  `pi_err_parent`), so only the renamed call site needs updating, not
-  the disposition logic. Tracked in pkg's own repo.
-- **[shell](https://github.com/paideia-os/shell)** — *likely caller
-  (self-described elevate-integrated), still not linked.* At HEAD,
-  `src/broker_bind.pdx` names `svc.elevate-broker` in its service
-  list, and `src/shell.pdx`, `src/exec.pdx`, `src/session.pdx` mirror
-  this library's constants and idioms (`SH_KIND_ELEVATE_CHANNEL =
-  0x191`, and shell minted its own `*_STUB`-is-the-happy-path
-  sentinels from the pre-ENH-005 convention — worth revisiting once
-  shell actually links this library, per the enhancement plan §4). No
-  direct call into a `libpdx-elevate` entry point was found in the
-  shell sources; `elevate_client_request_ex_ctx` (ENH-006, #17) exists
-  for exactly this caller's eventual multi-job concurrency need.
+- **[rm](https://github.com/paideia-os/rm)** — *STILL needs migration
+  (unchanged since 2026-08-25).* Re-verified 2026-09-11 against
+  `rm@main` `src/elevate.pdx` (13302 bytes, `rm_check_and_request`,
+  rm.M3-004): the file still emits `call elevate_client_request;` at
+  the dispatch site (grep count: 4 mentions in the module; one live
+  `call` instruction), and still treats `ELVC_OK` or `ELVC_STUB` as
+  proceed. That entry-point name no longer exists in this library as
+  of ENH-005 (#12), so `rm`'s build breaks against v1.1.0 until it
+  either renames to `elevate_client_request_norealize` (if it wants
+  the non-dispatching probe) or, recommended, migrates to
+  `elevate_client_request_ex` / `elevate_client_acquire` (see the
+  v1.1.0 example below). Blocker is tracked in `rm`'s own repo per
+  the enhancement plan §6, not here.
+- **[pkg](https://github.com/paideia-os/pkg)** — *MIGRATED (name
+  rename only, disposition unchanged).* Re-verified 2026-09-11
+  against `pkg@main` `src/pkg_elevate.pdx` (14331 bytes,
+  `pkg_elevate_request_pdxfs_write_pkgs`, now tagged
+  pkg.ENH-008 / #33): the file now emits
+  `call elevate_client_request_norealize;` (the renamed probe from
+  ENH-005 / #12) with `caps = 0x01` and a 60 s duration. Return
+  disposition unchanged — every non-zero return still routes to
+  `pi_err_parent`, so this is a name-only migration. Not yet on the
+  credential-shaped API (`elevate_client_acquire` /
+  `elevate_client_require`); tracked in pkg's own repo.
+- **[shell](https://github.com/paideia-os/shell)** — *likely caller,
+  STILL not linked (unchanged since 2026-08-25).* Re-verified
+  2026-09-11 against `shell@main` across the six most-likely modules
+  (`src/broker_bind.pdx`, `src/shell.pdx`, `src/exec.pdx`,
+  `src/session.pdx`, `src/dispatch.pdx`, `src/syscall.pdx`): grep
+  count for `elevate_client` = 9, but ZERO of them are a `call`
+  instruction into any entry point of this library — every hit is a
+  documentation comment naming this library as the shape reference
+  (`shell.pdx` mirrors `elevate_client_stats_reset` / `_note` /
+  `_stat` idioms; `session.pdx` cites `elevate_client_lookup_broker`
+  as its SysV prologue template). `broker_bind.pdx` still names
+  `svc.elevate-broker` in its service list without dispatching.
+  Blocker: `shell` has not yet wired its own broker-endpoint cap slot
+  — track under shell's own issue tracker.
+  `elevate_client_request_ex_ctx` (ENH-006, #17) and the LE.M1-002
+  (#20) `_ex_j_ctx` / `_ex_r_ctx` / `_acquire_ctx` twins exist for
+  exactly this caller's eventual multi-job concurrency need.
 
 ### Structural consumers (fail-closed today, awaiting broker-cap plumbing)
 
@@ -352,13 +364,60 @@ points and their disposition logic are already in place.
 
 None of these three is *migrated* yet; they are architecturally
 committed callers whose refusal-path already routes through
-`libpdx-elevate`'s taxonomy.  A cross-repo change list matching
-broker-cap plumbing to their call sites is filed on the paideia-os
-side.
+`libpdx-elevate`'s taxonomy.  Re-verified 2026-09-11 against each
+repo's `@main` `src/`:
+
+- `mount.pdxfs@main` `src/elevate.pdx` (477 lines): still returns
+  `MOUNT_ELEV_DENY` unconditionally (`mov rax, 0; ret`); every
+  `elevate_client_acquire` mention is a comment describing the
+  future landing. Unchanged.
+- `umount.pdxfs@main` `src/elevate.pdx` (203 lines): two fail-closed
+  stub entry points now — the existing `elevate_request_force_unmount`
+  (umount.M3-002) plus a NEW `elevate_request_system_unmount`
+  landing tagged `umount.pdxfs.LE-001 (#22)`. Both return
+  `ELEV_DENY (0)` unconditionally; still no dispatch into this
+  library. Discovered this pass — added to the structural-consumer
+  set.
+- `mkfs.pdxfs@main` `src/elevate_wire.pdx` (314 lines): still
+  fail-closed. Every `elevate_client_acquire` /
+  `elevate_client_cap_bind_scope` / `elevate_client_require_scoped`
+  mention is a header-comment planning note for the M3 landing.
+  Unchanged.
+
+A cross-repo change list matching broker-cap plumbing to their call
+sites is filed on the paideia-os side.
+
+### Candidate callers (org-wide scan, 2026-09-11)
+
+A grep for `elev` filenames across every `paideia-os/*` src/ turned
+up ONE additional module not previously catalogued:
+
+- **[mv](https://github.com/paideia-os/mv)** — *architecturally
+  committed, not yet linking libpdx-elevate.* `mv@main`
+  `src/elevate.pdx` (367 lines, `mv.M3-004`, mv#11) opens the
+  elevate hop for cross-user-boundary moves by going DIRECTLY to
+  `sys_svc_lookup("svc.elevate-broker")` + `sys_ipc_send` rather
+  than through any `elevate_client_*` entry point (grep count for
+  `elevate_client` in the file: 0). Its own module header names
+  `libpdx-elevate.M3` as the intended eventual dispatch target
+  ("A future libpdx-elevate landing will swap to the full
+  protocol"). Tracked as a v1.1.x follow-up: file an mv-side
+  issue analogous to shell's when broker-cap plumbing is available
+  in mv's caps.decl.
+
+All other repos scanned (`cat`, `cp`, `doc`, `edit`, `fetch`, `line`,
+`ls`, `mkdir`, `pdxclock`, `pdxcurl`, `pdxdig`, `pdxpaint`, `remote`)
+carry no `elev*.pdx` module in their `src/` and no `elevate_client`
+symbol was surfaced by the file-listing scan.
 
 **What "verified" means above:** confirmed against each repo's source
-at the enhancement audit's timestamp (2026-08-25). A caller repo's own
-issue tracker is authoritative for whether it has migrated since.
+at the pass timestamp (2026-09-11) by fetching raw file content from
+`raw.githubusercontent.com/paideia-os/<repo>/main/src/` and grepping
+locally (GitHub's `search/code` API returned zero results across the
+whole org for the query, an index freshness artefact rather than a
+truthful zero — verified against known non-zero live occurrences).
+A caller repo's own issue tracker remains authoritative for whether
+it has migrated since this timestamp.
 
 ## Version
 

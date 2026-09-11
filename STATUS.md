@@ -587,11 +587,42 @@ Followup: v1.1.0+ lands the two PENDING dep swaps (libpdx-cap
 `_commit`) once libpdx-cap.M2 and libpdx-audit.M2 close.  Entry-point
 signatures unchanged; only status codes retire (`ELCC_NOTE_NO_NARROW`).
 
-Also open: `rm` and `pkg` migrating off the retired
-`elevate_client_request` name (ENH-005, their own repos/issues). The
+Also open: `rm` migrating off the retired `elevate_client_request`
+name (ENH-005, its own repo/issue) — see LE.M1-004 pass below for the
+verified state. `pkg` has completed its name-only migration to
+`elevate_client_request_norealize` as of pkg.ENH-008 (#33). The
 LE.M1-002 (#20) landing above closes the ENH-006 follow-up "ctx
 variants threaded all the way through the retry/journal/acquire
 stack"; a shell-scale concurrent witness that drives two flows under
 a single-threaded scheduler is the remaining stretch AC and is filed
 as a follow-up (requires user-space threading scaffolding this
 library does not yet expose).
+
+## LE.M1-004 caller-list re-verification pass (#22, 2026-09-11)
+
+Doc-only pass. The M6 close-out above catalogued caller state at the
+ENH-007 timestamp (2026-08-25); this LE.M1-004 pass re-runs the same
+grep-against-each-caller-repo discipline and refreshes the README's
+Callers section so the v1.1.0 signed manifest is not shipped over
+stale claims. Result per caller (mirrors README):
+
+| Caller | State (2026-09-11) | Evidence |
+| --- | --- | --- |
+| `rm` | UNCHANGED — still on retired `elevate_client_request` | `rm@main` `src/elevate.pdx:234` still emits `call elevate_client_request;`; build breaks against v1.1.0 |
+| `pkg` | MIGRATED (name rename only) | `pkg@main` `src/pkg_elevate.pdx:213` now emits `call elevate_client_request_norealize;` (pkg.ENH-008 / #33); disposition unchanged |
+| `shell` | UNCHANGED — likely caller, still not linked | 9 `elevate_client` mentions across `broker_bind.pdx` / `shell.pdx` / `session.pdx` / `exec.pdx` / `dispatch.pdx` / `syscall.pdx`; ZERO are `call` instructions (all are shape-reference comments) |
+| `mount.pdxfs` | UNCHANGED — fail-closed stub | `src/elevate.pdx` still `mov rax, 0; ret` |
+| `umount.pdxfs` | UNCHANGED — fail-closed stub + NEW stub | existing `elevate_request_force_unmount` still `ELEV_DENY`; NEW landing `elevate_request_system_unmount` (umount.pdxfs.LE-001 / #22) also `ELEV_DENY` |
+| `mkfs.pdxfs` | UNCHANGED — fail-closed stub | `src/elevate_wire.pdx` still fail-closed; `elevate_client_*` mentions are header planning notes |
+| `mv` (newly surfaced) | Architecturally-committed, not yet linking libpdx-elevate | `mv@main` `src/elevate.pdx` (mv.M3-004 / mv#11) goes directly to `sys_svc_lookup("svc.elevate-broker")` + `sys_ipc_send`; grep count for `elevate_client` in the file: 0 |
+
+Source: no changes. Files touched: `README.md` (Callers section
+rewrite + candidate-callers subsection), this section, and
+`CHANGELOG.md` Unreleased entry for #22. `caps.decl` / `deps.list` /
+`manifest.pdxsig` unchanged.
+
+Unblocks LE.M1-003 (v1.1.0 signed release tag): YES. The acceptance
+criterion "signed manifest should not carry stale caller claims" is
+satisfied by this pass — every caller row cites an at-HEAD grep
+result. The tag itself is a separate mirror-push step
+(`.plans/mirror-push.md`, not run by this pass).
