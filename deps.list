@@ -1,5 +1,13 @@
 # libpdx-elevate — shared-library dependencies (per design/tooling/plan.md §7)
 #
+# Version:  authoritative for v1.1.0 (2026-09-11 signed release cut,
+#           LE.M1-003 / #21).  Both PENDING lines below stay PENDING at
+#           v1.1.0 -- flipping either is a v1.1.x follow-up gated on
+#           LE.M2-001 (libpdx-cap.M2), LE.M2-002 (libpdx-audit
+#           audit_begin/output/commit trio -- filed as needing a thin
+#           !{mem}-only wrapper to avoid a v2.0 cap-manifest ripple),
+#           and LE.M6-001 (libpdx-audit#32 audit_file_append).
+#
 # Format:  <libname>  <version-constraint>  <status>  <notes>
 #
 # `status` is one of:

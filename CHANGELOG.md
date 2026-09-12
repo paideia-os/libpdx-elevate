@@ -10,6 +10,100 @@ covers.
 
 ## Unreleased
 
+_No pending entries.  v1.1.0 signed release cut on 2026-09-11 (see below);
+LE.M6-001 (#33) stays OPEN pending the libpdx-audit#32
+`audit_file_append` swap; LE.M6-002 (#34) remains deferred._
+
+---
+
+## [1.1.0] — 2026-09-11 — signed release cut (LE.M1-003, #21)
+
+First signed release since v1.0.0 (2026-08-22). This v1.1.0 tag
+subsumes the two retired unsigned landing markers v1.1.1 (LE.M3-001
+real-mint-args fix on top of the M6 enhancement wave + LE.M1-M3
+multilevel-chain foundations, 2026-09-02) and v1.1.2 (LE.M1-polish +
+LE.M2-hardening, 2026-09-02), plus the LE.M4-M7 follow-up landings
+that arrived on `main` between 2026-09-02 and 2026-09-11. Both marker
+tags were annotated-but-unsigned per the mirror-push runbook's
+"landing marker" convention; v1.1.0 is the first tag both `paideia-as
+release --sign` and the `pkgs.paideia-os` re-sign gate treat as a real
+release. Manifest body under `manifest.pdxsig` is hash-stable and
+signature-ready; the two `[signature.*]` blocks carry the
+`<MLDSA65-SIG:STUB-PENDING-V0.33-CRYPTO-KDF>` sentinel until the
+`paideia-as v0.33-crypto-kdf` tag becomes reachable through the
+toolchain (unchanged from the v1.0.0 discipline).
+
+Semver rationale (backward step 1.1.2 → 1.1.0): both prior 1.1.x
+labels were landing markers, never signed and never mirrored. v1.1.0
+is the AUTHORITATIVE first minor after v1.0.0. `.plans/mirror-push.md`
+was rewritten to bind `$VERSION` to whatever HEAD carries (rather
+than hard-coding `1.0.0`) precisely to accommodate this consolidation
+window.
+
+Coverage — every landing since v1.0.0 the manifest body hashes:
+
+| Wave | Issues | Content |
+| --- | --- | --- |
+| M6 enhancement wave | #11-#17 | Credential-shaped surface (`elevate_client_acquire`, `_require`, `_require_j`, `_require_scoped`); `_journal_op` per-op audit; `_request_ex_ctx` explicit-context primitive; `elevate_client_request` renamed to `_request_norealize` (source-breaking). |
+| R90-XREPO.011 client-side outcome | #18 | `elevate_client_classify_outcome` / `_request_outcome` — ALLOW/DENY/TIMEOUT enum over the ELV*_ERR_* taxonomy. |
+| LE.M1 unit-test coverage | #19 | Four new witnesses (send / acquire / journal / retry). |
+| LE.M1 ctx expansion | #20 | `_ex_j_ctx` / `_ex_r_ctx` / `_acquire_ctx` ctx-carrying twins; legacy `_ex_j` / `_ex_r` / `_acquire` refactored to thin wrappers over the ctx variants via `_elevate_client_build_default_ctx`. |
+| LE.M1 caller-list re-verification | #22 | README/STATUS Callers section refreshed against every downstream repo at HEAD (2026-09-11 timestamp). |
+| LE.M1 band collision defence | #37 | `tests/elevate_client_bands_test.pdx` witness — telescoping-band assertions over all nine status bands. |
+| LE.M2 audit mirror | #38 | `elevate_client_journal_req/_apr/_op` + `_cap_attest` + `_journal_revoke_cascade` mirror through `libpdx-audit`'s `!{mem} @{}` `audit_append_leaf` — additive; effect set preserved (no v2.0 cap-manifest ripple). |
+| LE.M3 multilevel-chain foundations | #26-#28 | `elevate_client_cap_derive` (v1.1.1 mint_ctx_ptr real-mint-args fix); parent-row shadow map (`_bind_parent`, `_get_parent`, `_get_depth`); `MAX_DELEGATION_DEPTH = 4`. |
+| LE.M4-001 per-cap-mask duration ceilings | #29 | `elevate_request_duration_valid_for(caps, dur)` + per-bit ceiling table + `ELV_ERR_DUR_EXCEEDS_CEILING`. |
+| LE.M4-002 idle-time reap | #30 | `elevate_client_cap_reap_expired` + `elevate_client_shutdown` + `ELVJ_EVT_REAP = 7`. |
+| LE.M5 attestation | #31, #32 | `elevate_client_cap_attest` + `ELVJ_EVT_ATTEST = 4`; `_bind_attestation_required` + `_get_attestation_required` + derive-gate. |
+| LE.M6-001 audit-sink call sites (STUB) | #33 | Four call sites wired to a bare-`ret` `_elevate_client_audit_file_append` helper; fail-CLOSED. Real transport swap when libpdx-audit#32 lands. Issue #33 STAYS OPEN. |
+| LE.M7-001/002 revoke cascade | #35, #36 | `elevate_client_cap_revoke_cascade` + `elevate_client_cap_drain_broker_exp` + `ELVJ_EVT_REVOKE_CASCADE = 5`. |
+| LE.M7 cascade-fail marker | #53 | `ELVJ_EVT_CASCADE_ABORT = 6` + `elevate_client_journal_cascade_abort`. |
+| LE.M1-polish | #40-#47 | Alignment fix in `_request_norealize`; test-fingerprint newline strip; `.pdxdoc` refresh; LE.M3 witness; `elcq_rs_/sc_` label collision fix; README callers subsection; STATUS followups rewrite; `ELCC_ERR_ZERO_GRANT` distinct sentinel. |
+| LE.M2-hardening | #48-#52 | `recv_reply` rdx clobber; `check_and_revoke` shadow-map scrub; `derive` bind-return propagation; `recv_reply` upper-bound gate; `acquire` `reply_buf` null gate. |
+
+Dependency status at v1.1.0 cut (both stay PENDING; see `deps.list`
+for the LE.M2-001 / LE.M2-002 swap sites):
+
+- `libpdx-cap >= 0.2.0` PENDING — `elevate_client_cap_narrow_stub`
+  swap awaits libpdx-cap.M2 `cap_narrow_rights`.
+- `libpdx-audit >= 1.2.0` PENDING (LE.M6-001, added 2026-09-11) —
+  file-sink `audit_file_append` awaits libpdx-audit#32; the four
+  LE.M6-001 call sites are wired to a STUB helper that fail-closes.
+- `libpdx-audit >= 1.1.2` PENDING (LE.M2-002) — the leaf-shape
+  `audit_append_leaf` mirror is source-compatible; the wider
+  `audit_begin` / `_record_output` / `_commit` swap would ripple
+  `!{mem, sysreg} @{cap, sched}` up through this library's public
+  surface and force a v2.0 cap-manifest break on every downstream
+  tool, so it stays deferred.
+
+Kernel substrate: unchanged from v1.0.0 (KIND_ELEVATE_CHANNEL = 0x191
+per paideia-os#1626; broker registration #1627; wire codec #1549;
+policy table #1550; user_events_journal #1544). Additionally consumes
+the post-v1.0.0 landings paideia-os#2117 (`sched_wait`), #2118
+(`elevate_channel_row_set_expire`), #2119 (`/system/policy` format +
+seed), #2121 (fail-closed policy), #2122 (broker daemon dispatch body)
+— all reachable at paideia-os HEAD.
+
+`caps.decl` v1.1.0 grants (union of v1.0.0's five entries plus the
+following, added incrementally through this window): `elevate_client_
+journal_op`, `elevate_client_cap_attest`, `elevate_client_cap_revoke_
+cascade`, `elevate_client_cap_reap_expired`, `elevate_client_shutdown`,
+`elevate_client_cap_drain_broker_exp`, `elevate_client_request_ex`,
+`elevate_client_request_ex_j`, `elevate_client_request_ex_r`,
+`elevate_client_require`, `elevate_client_require_j`, `elevate_client_
+require_scoped`, `elevate_client_request_ex_ctx` /
+`_request_ex_j_ctx` / `_request_ex_r_ctx`, `elevate_client_acquire` /
+`_acquire_ctx`. No `KIND_SUPERVISOR` anywhere; every cap either
+narrowed to a specific object (`broker_ep_id`, `reply_ep_id`,
+`row_id`, `uej`) or opaquely brokered through `svc.*` lookup.
+
+The remainder of this v1.1.0 section (below) preserves the per-wave
+landing prose verbatim from the pre-cut CHANGELOG state, so an
+auditor can walk from "what the tag covers" to "why each landing
+went in" without leaving the file.
+
+---
+
 ### #33 — LE.M6-001 signed audit sink to `/system/audit/elevate.log` (PARTIAL, STUB — 2026-09-11)
 
 - Named gap partially closed: every audit record today flows via
@@ -703,7 +797,14 @@ API surface.
   all three already being live production surface and already
   documented in `doc/libpdx-elevate.pdxdoc`'s STATUS CODES section.
 
-## 1.1.2 — 2026-09-02 — LE.M1-polish + LE.M2-hardening (13 fixes across encoder, tests, docs, correctness gaps)
+### v1.1.2 marker wave (retired, folded into v1.1.0) — 2026-09-02 — LE.M1-polish + LE.M2-hardening (13 fixes across encoder, tests, docs, correctness gaps)
+
+_This section documents the wave that landed on `main` under the
+unsigned annotated tag `v1.1.2` on 2026-09-02.  The tag was a landing
+marker per `.plans/mirror-push.md`'s convention, never dual-signed and
+never mirrored.  The v1.1.0 signed release (above) supersedes it; the
+prose is retained verbatim so an auditor can trace individual issue
+landings without leaving the file._
 
 v1.1.2 bundles two follow-up waves on top of v1.1.1 into a single
 patch bump.  The polish wave (LE.M1-polish, issues #40-#47, eight
@@ -715,7 +816,7 @@ derive paths.  None of the fixes is source-breaking to a correctly-
 written v1.1.1 consumer.  Everything from the v1.1.1-unreleased state
 carries forward unchanged.
 
-### LE.M1-polish — eight fixes (issues #40-#47)
+#### LE.M1-polish — eight fixes (issues #40-#47)
 
 - **#40 (G1)** — Alignment fix in
   `elevate_client_request_norealize` (`src/elevate_client.pdx`
@@ -819,7 +920,7 @@ carries forward unchanged.
   #50 (G4) derive rollback path: bind_grant's ZERO_GRANT return
   triggers the child-row revoke + shadow scrub.
 
-### LE.M2-hardening — five correctness fixes (issues #48-#52)
+#### LE.M2-hardening — five correctness fixes (issues #48-#52)
 
 - **#48 G2 — recv_reply rdx clobber (`src/elevate_client_send.pdx`)**
   `elevate_client_recv_reply` pre-fix computed
@@ -888,7 +989,7 @@ carries forward unchanged.
   mint_ctx_buf) so the consumer can tell "you forgot the context"
   from "you forgot the reply buffer".
 
-### Error-band footprint added by this wave
+#### Error-band footprint added by this wave
 
 - `0xFFFFEA07 ELVC_ERR_BAD_REPLY_LEN` — LE.M2-hardening #51 (G8).
   First use of the 0x07..0x0B gap between the transport error codes
@@ -899,14 +1000,21 @@ carries forward unchanged.
   Extension band, distinguishing `bind_grant(row, 0)` from
   `bind_grant(bad_row, mask)`; 0x74..0x7F remain reserved.
 
-### Dependency deltas
+#### Dependency deltas
 
 None.  `libpdx-cap` (still PENDING, blocks M2-001) and `libpdx-audit`
 (still PENDING, blocks M2-002) statuses unchanged from v1.1.1.
 
 ---
 
-## Unreleased — v1.1.1 (LE.M3-001 real-mint-args pass on top of the v1.1.0 wave, no signed tag yet)
+### v1.1.1 marker wave (retired, folded into v1.1.0) — 2026-09-02 — LE.M3-001 real-mint-args pass on top of the M6 + LE.M1-M3 wave
+
+_This section documents the wave that landed on `main` under the
+unsigned annotated tag `v1.1.1` on 2026-09-02.  Like v1.1.2 above,
+this tag was a landing marker and never dual-signed.  The v1.1.0
+signed release (top of this file) supersedes it; the prose is
+retained verbatim so an auditor can trace individual issue landings
+without leaving the file._
 
 v1.1.1 is a PATCH over the v1.1.0-unreleased state on `main`.  It
 carries one narrow behavioural fix — `elevate_client_cap_derive` now
@@ -947,7 +1055,7 @@ complete state.  Cutting the v1.1.0 tag + signed manifest is a
 separate release step (`.plans/mirror-push.md`), not part of this
 wave.
 
-### LE.M1-M3 landings (this pass, 2026-09-02)
+#### LE.M1-M3 landings (2026-09-02)
 
 Follow-up enhancement wave filed under milestones LE.M1-polish,
 LE.M2-hardening, LE.M3-multilevel.  Scope was narrowed to the
@@ -987,7 +1095,7 @@ surface a need. #31 and #32 (M5) have since landed — see the
 - #35 LE.M7-001 `elevate_client_cap_revoke_cascade` over child chain
 - #36 LE.M7-002 broker-triggered revoke propagation via `drain_broker_exp`
 
-### Error-band footprint added by this pass
+#### Error-band footprint added by this pass
 
 - `0xFFFFEA3B..0xFFFFEA3F` fill out the last five slots of the
   `ElevateClientCap` band with LE.M3 codes (see per-code table in
@@ -997,7 +1105,7 @@ surface a need. #31 and #32 (M5) have since landed — see the
   alongside `0xFFFFEA71 ELCC_ERR_CYCLE_DETECTED`.  Remainder reserved
   for the eventual M7 revoke-cascade codes.
 
-### Dependency deltas
+#### Dependency deltas
 
 - `libpdx-cap` — status unchanged (PENDING, blocking M2-001).
 - `libpdx-audit` — status unchanged (PENDING, blocking M2-002).  This

@@ -1,4 +1,4 @@
-.pdxdoc  libpdx-elevate  1.1.2
+.pdxdoc  libpdx-elevate  1.1.0
 .audience  tool-author, security-auditor, kernel-integrator
 .format-version  1
 .rendered-by  doc (§5.3 of design/tooling/r49-r50-plan.md)

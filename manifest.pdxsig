@@ -1,4 +1,4 @@
-# manifest.pdxsig — libpdx-elevate v1.0.0
+# manifest.pdxsig — libpdx-elevate v1.1.0
 #
 # Dual-signed release manifest per D4 (design/tooling/plan.md §6).  Two
 # ML-DSA-65 signatures cover the manifest body: (a) the author key of the
@@ -14,57 +14,174 @@
 # stub marker below; the manifest body itself is stable and any tool
 # that resigns against v0.33-crypto will produce a message digest
 # identical to the one recorded here.
+#
+# ---
+#
+# v1.1.0 (2026-09-11) — first signed release since v1.0.0 (2026-08-22).
+# This tag subsumes the two retired unsigned landing markers v1.1.1 and
+# v1.1.2 (annotated-but-unsigned per `.plans/mirror-push.md`'s landing-
+# marker convention) plus the LE.M4-M7 landings that arrived on `main`
+# between 2026-09-02 and 2026-09-11.  See CHANGELOG.md's `[1.1.0]`
+# section for the full wave/issue breakdown and the STATUS.md M6
+# close-out section for release-artefact status.
 
 [manifest]
 schema-version        = 1
 tool-name             = libpdx-elevate
 tool-kind             = shared-library
-version               = 1.0.0
-released              = 2026-08-22
+version               = 1.1.0
+released              = 2026-09-11
 source-repo           = https://github.com/paideia-os/libpdx-elevate
-source-commit         = 796fe888cd384dfefc3d088652c1b02d3538f186
-source-tree-hash-sha256 = 1e53491dd382d66e9817b2956074a5150ffd52b5f066b750efbcc9253add6e6b
+source-commit         = 6d74d970b706e663ef40fe3192a706a4240e11e8
+source-tree-hash-sha256 = eb25f2f4d84bda651b2c0472878b0f360bf1978a69d948fe4874134c454f9042
 license               = MIT
+supersedes            = 1.0.0
+subsumes-markers      = v1.1.1, v1.1.2   # retired unsigned landing tags
+
+# source-tree-hash-sha256 canonicalisation: sha256 over the byte string
+# produced by `sha256sum <path>` lines for every `.pdx` file under `src/`
+# and `tests/`, sorted lexicographically by path (LF line endings, one
+# entry per line, `<sha256-hex>  <path>\n`).  A per-file table follows
+# under `[artifacts]` so an auditor can re-verify without recomputing
+# the tree hash inline.
 
 [artifacts]
-# Enumerated .pdx sources, hashed individually.  A future paideia-as
-# build step producing an elaborated binary (bin/libpdx-elevate.pdxlib)
-# would append a `binary-hash-sha256` line here; the source hashes
-# stay authoritative for the source-audit path.
-src/elevate_client.pdx           = sha256:d7ba5fae8090d9422dbf7233b71fd6ba7267e618e58b47107c2f3a6a5a57cf29
-src/elevate_client_cap.pdx       = sha256:dcf8ce33db195f083b2b193aef81279eaf539770c59148aa8021d644acdd93b5
-src/elevate_client_journal.pdx   = sha256:3cf3bfa33dc8be9ac130278edc3ba9d1ead5e85ac102a839caec7f73a8ecce19
-src/elevate_client_policy.pdx    = sha256:399db1eb2a422b3f4bc234ad6f8f88eb884f25bb5ce99121798eda5355d3a487
-src/elevate_client_retry.pdx     = sha256:e65923907c9c15459fff49bbf20aa37d9aaafefa49de5dc7be5be7a57f1c272e
-src/elevate_client_send.pdx      = sha256:4dbd04458f653ff88dcb23b0dd2cd4c54de85d4ca01fb99336c8c52c859299ef
-src/elevate_request.pdx          = sha256:2b315119c9dce6b66a8d52ff64b5a0fb012332727b394972aad65f74a2c743a3
-tests/elevate_client_cap_test.pdx    = sha256:0997a61c39763466e459946be8a0ef89ee0f8d783df3e31eae96935847f2b1a2
-tests/elevate_client_policy_test.pdx = sha256:9754c2ad013ec29edc3d33e005a328b99c79c2fa5b07e298c0e27b33aaccec4d
+# Enumerated .pdx sources + witnesses, hashed individually.  A future
+# paideia-as build step producing an elaborated binary
+# (bin/libpdx-elevate.pdxlib) would append a `binary-hash-sha256` line
+# here; the source hashes stay authoritative for the source-audit path.
+src/elevate_client.pdx              = sha256:5900dbafcfbddd9df1fe63efa7a03b7ed23275309a548cff4f6d1caaa0068275
+src/elevate_client_acquire.pdx      = sha256:cc466529ba363e730fc54ad439fa9be3ead9bee5d8c9ce96d181ce40d5cc6d83
+src/elevate_client_cap.pdx          = sha256:7b710221ca13887dba6595025a06f235781358e2a5fab65642d11baef17df3a6
+src/elevate_client_journal.pdx      = sha256:afbcb1f47f4f9a1281b5c99c4d7b6300dc3b2f2ac12c48d8db77655aba7559b3
+src/elevate_client_outcome.pdx      = sha256:2963827362b9c18d5c6af838d928e3fab55656f277b6705ef4a159df986910cc
+src/elevate_client_policy.pdx       = sha256:0868bd45e8e03e7418fa5c4770568b37fc056d187429d49e0ba5be60dd6dfdbc
+src/elevate_client_require.pdx      = sha256:5c7ceca10459d67100993ec153f72e15324a40191a3593e6ee11ed6c52abd94d
+src/elevate_client_retry.pdx        = sha256:344bc4b3bd1d51bfe34e6820f21ee2caf4c1be7c291a216eeed7cabcc6ede6db
+src/elevate_client_send.pdx         = sha256:904b94cc7243544ddc7a2705a009d2c23144eac997bab565cdac092194884409
+src/elevate_request.pdx             = sha256:2c7a420023892d1889f502ec05ff7bd42c125278456e76830b07656d23973c03
+tests/elevate_client_acquire_test.pdx           = sha256:8d8d2294dbb30a4d5e89438cd44480a9de8a52a6bdd0395a6f819ee871d33b3a
+tests/elevate_client_attest_test.pdx            = sha256:27a6dad52022bc2d38dd0c16a2a8a0a55a73afdf81f4274de8965d2dd6c2d3d1
+tests/elevate_client_audit_sink_test.pdx        = sha256:c069c616f507b0073140e96461943149e1a079528225cad047a97940d30c9f82
+tests/elevate_client_bands_test.pdx             = sha256:d56d46ae78af7021a6d64cac42b635908059c40d728a8b36d971a1609ac6f629
+tests/elevate_client_cap_m3_test.pdx            = sha256:cf3b46add809748b1a438b7000311a060571c08265435e6eb786ba0c01067565
+tests/elevate_client_cap_test.pdx               = sha256:3665ca8964ee45c1209c4dde282ee4a11f75eb4d9ccb57aebff8800c4abba9b5
+tests/elevate_client_ctx_expansion_test.pdx     = sha256:136dcf7c7ed404e31cddd0da9d304e81e17b5d265598ee94624e824079f1be8f
+tests/elevate_client_journal_test.pdx           = sha256:1f7baceab9bc81d8c2de227178f469da37ed7b442e5d4f993936450d52259203
+tests/elevate_client_outcome_test.pdx           = sha256:a0ce91a1756b3593a9d7617c9026216719173559368a1e3281ce2293269d363a
+tests/elevate_client_policy_test.pdx            = sha256:d6a29ba8b37841b127be3433d24645c0ad272e6005d57333fda0de25ff1952d1
+tests/elevate_client_reap_test.pdx              = sha256:0972951030ea4165acc861cc489ba9e493343b2a72c685ea99dea44c0baaea6b
+tests/elevate_client_require_test.pdx           = sha256:475bf6ea769a6d9e28016de92f1e81fd143ac71ee2ec0d685999642fc3a68290
+tests/elevate_client_retry_test.pdx             = sha256:296b9a17f573c5ed0da43bb840fa9bc6f2cd9466422275a79fa80fd0433a61c4
+tests/elevate_client_revoke_cascade_test.pdx    = sha256:4265969e2ec71d76c7005980fef2e2d1ad5bb77cf13c750009842a91a2392931
+tests/elevate_client_send_test.pdx              = sha256:b69ef5a70f89d4cca1c8f0ae4a351cc8450f77c183cb347382295100dd0ee0ef
+tests/elevate_request_ceiling_test.pdx          = sha256:2657301982b4ae8a0aed2e47e4efd2142ee3059f60e34cf6e3cc517082830bb9
+
+[entry-points]
+# Every public callable this v1.1.0 signed manifest covers.  The
+# `caps.decl` file below stanzas each of these with its floor cap set;
+# the manifest hash of `caps.decl` (see [cap-manifest]) is the
+# canonical binding.  Listed here so a mirror-side tool auditing "does
+# my consumer request a v1.1.0-known entry point?" does not have to
+# parse the `caps.decl` DSL.
+#
+# --- v1.0.0 carryover (M1-M5) ---
+elevate_client_lookup_broker        = src/elevate_client.pdx
+elevate_client_send_req             = src/elevate_client_send.pdx
+elevate_client_recv_reply           = src/elevate_client_send.pdx
+elevate_client_check_grant          = src/elevate_client_send.pdx
+elevate_client_request_ex           = src/elevate_client_send.pdx
+elevate_client_request_ex_j         = src/elevate_client_journal.pdx
+elevate_client_request_ex_r         = src/elevate_client_retry.pdx
+elevate_client_journal_req          = src/elevate_client_journal.pdx
+elevate_client_journal_apr          = src/elevate_client_journal.pdx
+elevate_client_cap_mint             = src/elevate_client_cap.pdx
+elevate_client_cap_bind_expire      = src/elevate_client_cap.pdx
+elevate_client_cap_expired          = src/elevate_client_cap.pdx
+elevate_client_cap_check_and_revoke = src/elevate_client_cap.pdx
+elevate_client_cap_narrow_stub      = src/elevate_client_cap.pdx
+# --- ENH-005 rename (source-breaking) ---
+elevate_client_request_norealize    = src/elevate_client.pdx        # was elevate_client_request
+# --- ENH-001..004: credential-shaped surface ---
+elevate_client_acquire              = src/elevate_client_acquire.pdx
+elevate_client_require              = src/elevate_client_require.pdx
+elevate_client_require_j            = src/elevate_client_require.pdx
+elevate_client_require_scoped       = src/elevate_client_require.pdx
+elevate_client_journal_op           = src/elevate_client_journal.pdx
+elevate_client_cap_bind_expire_abs  = src/elevate_client_cap.pdx
+elevate_client_cap_bind_grant       = src/elevate_client_cap.pdx
+elevate_client_cap_get_grant        = src/elevate_client_cap.pdx
+elevate_client_cap_bind_scope       = src/elevate_client_cap.pdx
+elevate_client_cap_get_scope        = src/elevate_client_cap.pdx
+elevate_client_cap_bind_budget      = src/elevate_client_cap.pdx
+elevate_client_cap_get_budget_remaining = src/elevate_client_cap.pdx
+elevate_client_cap_consume_budget   = src/elevate_client_cap.pdx
+# --- ENH-006 + LE.M1-002: explicit-context (ctx) surface ---
+elevate_client_request_ex_ctx       = src/elevate_client_send.pdx
+elevate_client_request_ex_j_ctx     = src/elevate_client_journal.pdx
+elevate_client_request_ex_r_ctx     = src/elevate_client_retry.pdx
+elevate_client_acquire_ctx          = src/elevate_client_acquire.pdx
+# --- R90-XREPO.011.M1-006: outcome reduction ---
+elevate_client_classify_outcome     = src/elevate_client_outcome.pdx
+elevate_client_request_outcome      = src/elevate_client_outcome.pdx
+# --- LE.M3-001/002/003: multilevel-chain foundations ---
+elevate_client_cap_derive           = src/elevate_client_cap.pdx
+elevate_client_cap_bind_parent      = src/elevate_client_cap.pdx
+elevate_client_cap_get_parent       = src/elevate_client_cap.pdx
+elevate_client_cap_get_depth        = src/elevate_client_cap.pdx
+# --- LE.M4-001: per-cap-mask duration ceilings ---
+elevate_request_duration_valid_for  = src/elevate_request.pdx
+# --- LE.M4-002: idle-time reap + optional teardown helper ---
+elevate_client_cap_reap_expired     = src/elevate_client_cap.pdx
+elevate_client_shutdown             = src/elevate_client_cap.pdx
+elevate_client_journal_reap         = src/elevate_client_journal.pdx
+# --- LE.M5-001/002: attestation ---
+elevate_client_cap_attest           = src/elevate_client_cap.pdx
+elevate_client_cap_bind_attestation_required = src/elevate_client_cap.pdx
+elevate_client_cap_get_attestation_required  = src/elevate_client_cap.pdx
+elevate_client_cap_bind_last_audit  = src/elevate_client_cap.pdx
+elevate_client_cap_get_last_audit_seq  = src/elevate_client_cap.pdx
+elevate_client_cap_get_last_audit_kind = src/elevate_client_cap.pdx
+# --- LE.M6-001: file-sink STUB (fail-CLOSED) ---
+# _elevate_client_audit_file_append is private-by-convention (leading
+# underscore) and is NOT re-exported as an entry point.  Its four call
+# sites (_journal_req/_apr/_op + _cap_attest) already appear above.
+# --- LE.M7-001/002 + #53: revoke cascade + broker-triggered propagation + cascade-abort marker ---
+elevate_client_cap_revoke_cascade      = src/elevate_client_cap.pdx
+elevate_client_cap_drain_broker_exp    = src/elevate_client_send.pdx
+elevate_client_journal_revoke_cascade  = src/elevate_client_journal.pdx
+elevate_client_journal_cascade_abort   = src/elevate_client_journal.pdx
 
 [cap-manifest]
 # Hash over caps.decl.  The raw-file hash below is authoritative for
-# v1.0.0 — the file has LF-only line endings and no trailing
+# v1.1.0 — the file has LF-only line endings and no trailing
 # whitespace, so the canonical form (per canonicalise-manifest.sh,
 # landing in paideia-as v0.33) equals the raw file byte-for-byte.
 # A canonicalisation-form field is kept below for the release-sign
 # tool to verify at push time.
 caps.decl.file       = caps.decl
-caps.decl.sha256     = sha256:41164da73a61c4235ce03bf0d31e9362c3370c12262bc17deeff5cbad387bf0c
-caps.decl.canonical  = sha256:41164da73a61c4235ce03bf0d31e9362c3370c12262bc17deeff5cbad387bf0c
+caps.decl.sha256     = sha256:36456bd533b7b88f1ee74507468e4ea732ebc728ce3798cca1e1c3ef65fbc276
+caps.decl.canonical  = sha256:36456bd533b7b88f1ee74507468e4ea732ebc728ce3798cca1e1c3ef65fbc276
 
 [deps]
 deps.list.file       = deps.list
-deps.list.sha256     = sha256:e2e80822028f1f6845618d14bcb1fda3b18384cdc9b2b07f461efe450ca357d6
-deps.list.canonical  = sha256:e2e80822028f1f6845618d14bcb1fda3b18384cdc9b2b07f461efe450ca357d6
+deps.list.sha256     = sha256:cf74808c928e3532ccb3c40b39e21c57fa5fbabeb1ab9037b91019ed40ce5a92
+deps.list.canonical  = sha256:cf74808c928e3532ccb3c40b39e21c57fa5fbabeb1ab9037b91019ed40ce5a92
+# Both PENDING lines stay PENDING at v1.1.0:
+#   - libpdx-cap  >=0.2.0  (LE.M2-001 swap site, cap_narrow_rights)
+#   - libpdx-audit >=1.1.2 (LE.M2-002 swap site, audit_begin/output/commit
+#                           trio) + libpdx-audit >=1.2.0 (LE.M6-001 swap
+#                           site, audit_file_append via libpdx-audit#32).
+# Flipping either is a v1.1.x follow-up, not a v1.1.0 blocker.
 
 [changelog]
-CHANGELOG.md.sha256  = sha256:117a449bd246be93c8e95891abc4cfb066b83e3cfe12f7514b4928a2b423410d
+CHANGELOG.md.sha256  = sha256:55dc83ffe53b58296bbafbc5ac7e0a9e7519a7317c2f4b54ab144cccf6f9e54b
 
 [docs]
-doc/libpdx-elevate.pdxdoc.sha256 = sha256:86c09beaa0a1856a3f80dd66e9e6f0f03648c9b64463cd53f3493bd528e02eda
+doc/libpdx-elevate.pdxdoc.sha256 = sha256:25558b5b75ee30be5bb26819964b4839a82ab4ccba07e63a2f975d5bd99a5b5a
 
 [kernel-substrate]
-# The paideia-os kernel primitives libpdx-elevate v1.0 links against.
+# The paideia-os kernel primitives libpdx-elevate v1.1.0 links against.
 # Substrate change bumps require re-signing (major or minor per SemVer);
 # see CHANGELOG.md §"Known deferred paths" for the swap sites.
 paideia-os-issue-1626   = KIND_ELEVATE_CHANNEL = 0x191
@@ -72,6 +189,12 @@ paideia-os-issue-1627   = svc.elevate-broker registration + policy wiring
 paideia-os-issue-1549   = elevate wire codec (elv_pack_req)
 paideia-os-issue-1550   = elevate policy table (ep_check, ep_hit_row)
 paideia-os-issue-1544   = user_events_journal (uej_append, UEJ_KIND_ELEVATE=5)
+# --- Additional substrate landed post-v1.0.0 and consumed at v1.1.0 ---
+paideia-os-issue-2117   = sched_wait (retires the elevate_client_retry_delay busy-poll)
+paideia-os-issue-2118   = elevate_channel_row_set_expire (row [+32] slot)
+paideia-os-issue-2119   = /system/policy on-disk format + seed
+paideia-os-issue-2121   = fail-closed policy directive
+paideia-os-issue-2122   = broker daemon dispatch body (elevate_broker consumes REQ, emits APR)
 paideia-as-toolchain    = >=v0.33-crypto-kdf (for release --sign)
 
 [signature.author]

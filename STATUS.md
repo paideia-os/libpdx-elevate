@@ -2,16 +2,15 @@
 
 **Wave:** R49 shared library
 **Current milestone:** M5 (signed 1.0 release) — complete; M6
-(enhancement wave, v1.1.0) — complete, unreleased (no signed tag cut yet);
-LE.M1-M3 (multilevel-chain foundations, v1.1.0 continuation) —
-complete on main (see per-ticket table in `CHANGELOG.md`), unreleased;
-v1.1.1 PATCH (LE.M3-001 real-mint-args pass) — complete on `main`,
-supersedes the v1.1.0 label (which is retired without a signed tag);
-LE.M5 (#31, #32, attestation) and LE.M7-001/002 (#35, #36, revoke
-cascade + broker propagation) — complete on `main`, unreleased
-**Version:** 1.0.0 (2026-08-22) tagged; v1.1.1 (v1.1.0-wave +
-LE.M3-001 real-mint-args fix) landed on `main`, tag/signing pending a
-release pass
+(enhancement wave) — complete; LE.M1-M3 (multilevel-chain foundations)
+— complete; LE.M4-001/002 (per-cap ceilings + idle reap), LE.M5-001/002
+(attestation), LE.M7-001/002 (revoke cascade + broker propagation) —
+complete; LE.M6-001 (audit-file sink) — STUB landed, follow-up gated
+on libpdx-audit#32; **LE.M1-003 v1.1.0 signed release cut on
+2026-09-11 (#21)** — consolidates the retired v1.1.1 / v1.1.2 landing
+markers into the first authoritative post-v1.0.0 signed tag
+**Version:** 1.1.0 (2026-09-11) tagged; 1.0.0 (2026-08-22) tagged;
+v1.1.1 / v1.1.2 landing markers retired and subsumed by v1.1.0
 
 See `design/tooling/r49-r50-plan.md` §5.14 in paideia-os for the full
 M1–M5 breakdown, `.plans/enhancement-plan.md` for the M6 (post-1.0.0)
@@ -684,10 +683,40 @@ target client-side state machines that stand up without a live APR.
 - Actual mirror push (blocked on `pkgs.paideia-os` mirror repo
   existing).  Runbook is ready.
 
-## M6 close-out (ENH-007, #14)
+## M6 close-out (ENH-007, #14; LE.M1-003 v1.1.0 signed release cut, #21, 2026-09-11)
 
-All seven M6 issues (#11–#17) are LANDED as of this pass. What v1.1.0
-adds, in one place:
+All seven M6 issues (#11–#17) LANDED at the 2026-08-25 ENH-007 pass;
+the LE.M1-003 close-out pass on 2026-09-11 (#21) cuts the signed
+`v1.1.0` tag over the M6 wave + every LE.M1-M7 landing since v1.0.0.
+Signed release status:
+
+- **Release tag:** `v1.1.0` — tagged 2026-09-11 on the M6 close-out /
+  LE.M6-001 STUB landing commit (`git rev-parse HEAD` at cut time,
+  freeze commit recorded in `manifest.pdxsig` `source-commit`).
+- **Manifest:** `manifest.pdxsig` regenerated — 26 per-file `.pdx`
+  hashes (10 src + 16 tests), plus `caps.decl` / `deps.list` /
+  `CHANGELOG.md` / `doc/libpdx-elevate.pdxdoc` canonical hashes, plus
+  the whole-tree hash under `[manifest] source-tree-hash-sha256`.
+- **Signatures:** `[signature.author]` and `[signature.paideia-root]`
+  carry the 42-byte sentinel `<MLDSA65-SIG:STUB-PENDING-V0.33-CRYPTO-KDF>`
+  — `paideia-as v0.33-crypto-kdf` is not reachable through the
+  toolchain today. Manifest body is hash-stable, so a subsequent
+  `paideia-as release --sign` populates the two SIG-BYTES blocks
+  in place without any body edit (§8 of `.plans/mirror-push.md`).
+- **Retired markers:** `v1.1.1` (2026-09-02, LE.M3-001 real-mint-args
+  fix) and `v1.1.2` (2026-09-02, LE.M1-polish + LE.M2-hardening) were
+  annotated-but-unsigned landing tags. Both are folded into v1.1.0's
+  scope; the CHANGELOG preserves their prose verbatim as sub-sections
+  under `## [1.1.0]`.
+- **Consumer impact:** every downstream repo pinning `libpdx-elevate`
+  at a signed manifest may now pin `v1.1.0`. Cascade unblocks — see
+  the LE cascade issues on the paideia-os org for the follow-ups.
+- **Dependency status at cut:** both PENDING entries in `deps.list`
+  stay PENDING (see `deps.list` for the LE.M2-001 / LE.M2-002 /
+  LE.M6-001 swap sites). Flipping either is a v1.1.x follow-up, not
+  a v1.1.0 blocker.
+
+What v1.1.0 adds, in one place:
 
 | Issue | Landed |
 | --- | --- |

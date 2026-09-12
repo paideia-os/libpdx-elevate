@@ -1,6 +1,11 @@
 # libpdx-elevate — capability manifest (D4 per design/tooling/plan.md §6)
 #
-# Version:      1.0.0
+# Version:      1.1.0 (2026-09-11 signed release cut, LE.M1-003 / #21).
+#               v1.0.0 (2026-08-22) covered the M1-M5 entry set; this
+#               v1.1.0 pass adds every M6 + LE.M1-M7 entry point that
+#               landed on `main` between 2026-08-25 and 2026-09-11 (see
+#               the CHANGELOG's [1.1.0] section for the wave-by-wave
+#               list; per-entry cap sets are itemised below).
 # Kind:         shared library (paideia-as .pdx sources; no bin/, no lib/*.so)
 # Consumer:     any tool that requests a cap from svc.elevate-broker via the
 #               client-side helper set in src/elevate_client*.pdx.
@@ -181,5 +186,7 @@
 #
 # 3. When libpdx-cap.M2 lands and elevate_client_cap_narrow_stub is
 #    replaced with a real cap_narrow_rights call, one new line will be
-#    added here:  KIND_ELEVATE_CHANNEL(narrow, row_id).  Bumped in the
-#    v1.1.0 manifest, not here.
+#    added here:  KIND_ELEVATE_CHANNEL(narrow, row_id).  Deferred to
+#    the v1.1.x follow-up that flips LE.M2-001 to LANDED (this v1.1.0
+#    cut leaves the PENDING entry in `deps.list` untouched -- see the
+#    dep-status note at the top of `deps.list` for the swap-site trail).
